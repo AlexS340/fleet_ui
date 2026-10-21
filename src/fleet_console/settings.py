@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Iterable
+import configparser
 import os
 from pathlib import Path
+import re
 
 from pydantic import BaseModel, Field
 import yaml
@@ -16,6 +18,10 @@ OVERLAY_DIR = REPO_ROOT / "overlay" / "configs"  # свои группы Hydra �
 KNOWN_ISSUES = REPO_ROOT / "known_issues.yaml"
 # Секреты, которые уходят только в окружение подпроцессов fleet; в exp.yaml, resolved.yaml и логи не попадают.
 SECRET_NAMES = ("MLSC_TOKEN", "AWS_ACCESS_KEY_ID_gcvmfleet", "AWS_SECRET_ACCESS_KEY_gcvmfleet")
+# Ключи S3 fleet читает как AWS_ACCESS_KEY_ID_<профиль>; сервис берёт их из профиля ~/.aws/credentials.
+AWS_CREDENTIALS = Path("~/.aws/credentials").expanduser()
+AWS_SECRET_RE = re.compile(r"^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)_(.+)$")
+AWS_FIELDS = {"ACCESS_KEY_ID": "aws_access_key_id", "SECRET_ACCESS_KEY": "aws_secret_access_key"}
 
 SETTINGS_HEADER = (
     "# Настройки Fleet Console. Правятся здесь или на странице «Настройки».\n"
@@ -145,18 +151,33 @@ class Settings(BaseModel):
         paths.settings_file.write_text(SETTINGS_HEADER + body, encoding="utf-8")
 
 
-def read_secret(paths: Paths, name: str) -> str | None:
-    """Секрет из окружения сервиса, иначе из secrets.env (строка NAME=value, можно с export)."""
+def read_secret(paths: Paths, name: str, aws_credentials: Path = AWS_CREDENTIALS) -> str | None:
+    """Секрет из окружения сервиса, иначе из secrets.env (NAME=value, можно с export), для ключей S3 — из ~/.aws/credentials."""
     value = os.environ.get(name, "").strip()
     if value:
         return value
-    if not paths.secrets_env.is_file():
+    if paths.secrets_env.is_file():
+        for raw in paths.secrets_env.read_text(encoding="utf-8").splitlines():
+            line = raw.strip().removeprefix("export ")
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].strip().strip("\"'") or None
+    return read_aws_credential(name, aws_credentials)
+
+
+def read_aws_credential(name: str, path: Path = AWS_CREDENTIALS) -> str | None:
+    """AWS_ACCESS_KEY_ID_gcvmfleet → поле aws_access_key_id профиля [gcvmfleet] в ~/.aws/credentials."""
+    match = AWS_SECRET_RE.match(name)
+    if match is None or not path.is_file():
         return None
-    for raw in paths.secrets_env.read_text(encoding="utf-8").splitlines():
-        line = raw.strip().removeprefix("export ")
-        if line.startswith(f"{name}="):
-            return line.split("=", 1)[1].strip().strip("\"'") or None
-    return None
+    field, profile = AWS_FIELDS[match.group(1)], match.group(2)
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+    except configparser.Error:
+        return None
+    if not parser.has_section(profile):
+        return None
+    return parser.get(profile, field, fallback="").strip() or None
 
 
 def secrets_env(paths: Paths, names: Iterable[str] = SECRET_NAMES) -> dict[str, str]:

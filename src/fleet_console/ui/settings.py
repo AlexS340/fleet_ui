@@ -26,7 +26,9 @@ def settings_page(ctx: AppContext) -> None:
             requeue = ui.number("Раундов requeue упавших", value=s.bench.requeue_rounds, min=0, max=3, precision=0)
             attention = ui.number("Автогашение без ответа, мин (0 — нет)", value=s.bench.attention_minutes, min=0, precision=0)
             poll = ui.number("Опрос прогона, с", value=s.bench.poll_seconds, min=5, precision=0)
-        ui.label(f"Данные сервиса: {ctx.paths.home} · секреты: окружение или {ctx.paths.secrets_env.name} (MLSC_TOKEN, AWS_*_gcvmfleet)").classes("text-sm opacity-70")
+        ui.label(
+            f"Данные сервиса: {ctx.paths.home} · MLSC_TOKEN — окружение или {ctx.paths.secrets_env.name}; ключи S3 — профиль gcvmfleet в ~/.aws/credentials"
+        ).classes("text-sm opacity-70")
 
         def save() -> None:
             s.fleet_remote = remote.value.strip()

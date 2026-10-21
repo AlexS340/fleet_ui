@@ -105,7 +105,10 @@ def run_checks(
     checks: list[Check] = []
     missing = [n for n in SECRET_NAMES if not secrets.get(n)]
     checks.append(
-        Check("secrets", "MLSC_TOKEN и S3-креды", "fail" if missing else "ok", "нет: " + ", ".join(missing) if missing else "в окружении сервиса или secrets.env")
+        Check(
+            "secrets", "MLSC_TOKEN и S3-креды", "fail" if missing else "ok",
+            "нет: " + ", ".join(missing) + " (окружение сервиса, secrets.env или профиль gcvmfleet в ~/.aws/credentials)" if missing else "есть",
+        )
     )
     if not kube.allowed:
         checks.append(Check("kube", "Kube context", "fail", kube.error or "context не разрешён"))
