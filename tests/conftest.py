@@ -1,5 +1,7 @@
 """Общие фикстуры: временный «удалённый» репозиторий fleet без сети."""
 
+pytest_plugins = ["nicegui.testing.user_plugin"]
+
 from pathlib import Path
 import subprocess
 
