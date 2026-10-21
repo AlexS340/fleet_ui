@@ -27,7 +27,7 @@ STEPS = {
     "check": "mlsc.check_llm_works",
     "stop": "mlsc.stop_llm",
 }
-GPU_RE = re.compile(r"(\d+)gpu")
+GPU_RE = re.compile(r"(\d+)gpu|gpu(\d+)")  # a100plus.8gpu.… или ${mlsc.instance_types.gpu8} из рецептов fleet
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -39,7 +39,7 @@ def make_run_id(model_name: str, now: datetime) -> str:
 
 def gpu_in(instance_type: str | None) -> int | None:
     match = GPU_RE.search(instance_type or "")
-    return int(match.group(1)) if match else None
+    return int(match.group(1) or match.group(2)) if match else None
 
 
 def recipe_summary(worktree: Path, recipe: str, _seen: frozenset[str] = frozenset()) -> dict[str, Any]:

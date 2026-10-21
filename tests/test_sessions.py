@@ -83,7 +83,7 @@ def h(tmp_path: Path) -> Harness:
 
 def test_compose_helpers(tmp_path: Path, h: Harness) -> None:
     assert make_run_id("GLM-5.3-Flash", T0) == "console-glm-5-3-flash-20261021-120000"
-    assert gpu_in("a100plus.8gpu.80vG.96C.1456G") == 8 and gpu_in("cpu.48C") is None
+    assert gpu_in("a100plus.8gpu.80vG.96C.1456G") == 8 and gpu_in("${mlsc.instance_types.gpu1}") == 1 and gpu_in("cpu.48C") is None
     summary = recipe_summary(h.revision.worktree, "glm")
     assert summary["served_model_name"] == "GLM-5.3-Flash" and summary["gpu_per_instance"] == 8 and summary["image"] == "fleet-vllm:0.24.0"
     assert recipe_summary(h.revision.worktree, "missing") == {}
