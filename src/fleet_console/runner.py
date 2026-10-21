@@ -120,14 +120,21 @@ class SubprocessRunner:
             if log:
                 log.write(f"$ {shlex.join(argv)}\n")
             assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip("\n")
-                lines.append(line)
-                if log:
-                    log.write(line + "\n")
-                    log.flush()
-                if on_line:
-                    on_line(line)
+            # git и uv рисуют прогресс через \r: считаем его разделителем строк, иначе одна строка на весь clone.
+            buffer = b""
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while True:
+                    cut = min((i for i in (buffer.find(b"\n"), buffer.find(b"\r")) if i >= 0), default=-1)
+                    if cut < 0:
+                        break
+                    raw, buffer = buffer[:cut], buffer[cut + 1 :]
+                    _emit(raw.decode(errors="replace"), lines, log, on_line)
+            if buffer:
+                _emit(buffer.decode(errors="replace"), lines, log, on_line)
             code = await proc.wait()
             if log:
                 log.write(f"→ код {code}\n")
@@ -135,6 +142,18 @@ class SubprocessRunner:
             if log:
                 log.close()
         return Result(tuple(argv), code, "\n".join(lines), "")
+
+
+def _emit(line: str, lines: list[str], log, on_line: LineHook | None) -> None:
+    line = line.rstrip()
+    if not line:
+        return
+    lines.append(line)
+    if log:
+        log.write(line + "\n")
+        log.flush()
+    if on_line:
+        on_line(line)
 
 
 Handler = Callable[[tuple[str, ...]], Result | Awaitable[Result]]

@@ -44,3 +44,10 @@ async def test_fake_runner_prefix_and_calls(tmp_path: Path) -> None:
 def test_command_error_message() -> None:
     err = CommandError(Result(("git", "x"), 2, "", "line1\nline2"))
     assert "git x → код 2" in str(err) and "line2" in str(err)
+
+
+async def test_stream_splits_carriage_returns(tmp_path: Path) -> None:
+    seen: list[str] = []
+    code = "import sys; sys.stdout.write('Counting 1%\\rCounting 2%\\rCounting 100%\\ndone\\n')"
+    result = await SubprocessRunner().stream([sys.executable, "-c", code], log_path=tmp_path / "p.log", on_line=seen.append)
+    assert result.ok and seen == ["Counting 1%", "Counting 2%", "Counting 100%", "done"]

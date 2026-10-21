@@ -58,3 +58,14 @@ async def test_worktree_lifecycle(mirror: Mirror) -> None:
     assert not await mirror.is_clean(path)
     await mirror.worktree_remove(sha)
     assert not path.exists() and mirror.worktrees() == []
+
+
+async def test_partial_clone_is_redone(remote_repo: Path, paths: Paths) -> None:
+    partial = paths.mirror
+    partial.mkdir(parents=True)
+    (partial / "HEAD").write_text("ref: refs/heads/master\n")
+    m = Mirror(SubprocessRunner(), paths, str(remote_repo))
+    assert not m.exists() and m.last_fetch_at() is None
+    assert await m.ensure() is True
+    assert m.exists() and (partial / "config").exists()
+    assert [b.name for b in await m.branches()] == ["master", "feat/x"]

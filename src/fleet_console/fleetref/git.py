@@ -62,8 +62,13 @@ class Mirror:
     def path(self) -> Path:
         return self.paths.mirror
 
+    @property
+    def marker(self) -> Path:
+        """Ставится после успешного clone и каждого fetch; HEAD появляется в начале клонирования."""
+        return self.path / "fleet-console.last_fetch"
+
     def exists(self) -> bool:
-        return (self.path / "HEAD").exists()
+        return self.marker.exists()
 
     async def _git(self, *args: str) -> Result:
         return _check(await self.runner.run(["git", f"--git-dir={self.path}", *args]))
@@ -74,23 +79,24 @@ class Mirror:
         if self.exists():
             return False
         self.paths.ensure()
+        if self.path.exists():
+            shutil.rmtree(self.path)  # недоклонированное зеркало от прошлого запуска
         log = self.paths.logs / "clone.log"
         result = await self.runner.stream(
             ["git", "clone", "--mirror", "--progress", self.remote, str(self.path)], log_path=log, on_line=on_line
         )
         _check(result)
+        self.marker.touch()
         return True
 
     async def fetch(self) -> None:
         await self._git("fetch", "--prune", "--quiet")
-        (self.path / "fleet-console.last_fetch").touch()
+        self.marker.touch()
 
     def last_fetch_at(self) -> datetime | None:
-        marker = self.path / "fleet-console.last_fetch"
-        probe = marker if marker.exists() else (self.path / "HEAD" if self.exists() else None)
-        if probe is None:
+        if not self.exists():
             return None
-        return datetime.fromtimestamp(probe.stat().st_mtime, tz=timezone.utc)
+        return datetime.fromtimestamp(self.marker.stat().st_mtime, tz=timezone.utc)
 
     # --- ветки и коммиты -----------------------------------------------------
     async def branches(self) -> list[Branch]:
