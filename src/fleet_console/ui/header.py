@@ -16,22 +16,24 @@ STATUS_WORDS = {"green": "работает", "yellow": "переподключе
 
 def build_header(ctx: AppContext) -> None:
     """Шапка страницы. Refreshable создаётся на каждую страницу: общий на модуль копил бы контейнеры чужих клиентов."""
+    # Диалоги чипов живут в этом контейнере, а не внутри refreshable: иначе таймер refresh сносил бы их через 2 с.
+    holder = ui.element("div")
 
     @ui.refreshable
     def status_row() -> None:
         ks = ctx.kube_status
         ok = ks.allowed and ks.ready and not ks.missing_permissions
         kube_color = "positive" if ok else ("negative" if ks.error else "grey-7")
-        _chip(f"{ks.context or 'context?'} · {ctx.settings.namespace}", kube_color, lambda: _kube_dialog(ctx))
+        _chip(f"{ks.context or 'context?'} · {ctx.settings.namespace}", kube_color, lambda: _kube_dialog(ctx, holder))
         for fwd in ctx.supervisor.forwards:
             st = ctx.supervisor.state(fwd.name)
-            _chip(fwd.title, STATUS_COLORS[st.status], lambda name=fwd.name: _forward_dialog(ctx, name))
+            _chip(fwd.title, STATUS_COLORS[st.status], lambda name=fwd.name: _forward_dialog(ctx, name, holder))
         guard = ctx.guard
         if guard.reasons:  # чип виден только пока есть что беречь
             ok = guard.active or not guard.supported
-            _chip(f"без сна · {len(guard.reasons)}", "positive" if ok else "negative", lambda: _guard_dialog(ctx))
+            _chip(f"без сна · {len(guard.reasons)}", "positive" if ok else "negative", lambda: _guard_dialog(ctx, holder))
             if guard.battery and not guard.battery.on_ac:
-                _chip(f"батарея {guard.battery.percent}%", "warning", lambda: _guard_dialog(ctx))
+                _chip(f"батарея {guard.battery.percent}%", "warning", lambda: _guard_dialog(ctx, holder))
         ui.link(_cluster_text(ctx), "/cluster").classes("text-white")
         ui.link("Модели", "/models").classes("text-white")
         ui.label(_fetch_text(ctx)).classes("text-sm text-white opacity-80 hidden sm:inline")  # на узком экране шапка в 2 строки
@@ -85,9 +87,9 @@ async def _fetch(ctx: AppContext) -> None:
         ui.notify(str(exc), type="negative", multi_line=True)
 
 
-def _kube_dialog(ctx: AppContext) -> None:
+def _kube_dialog(ctx: AppContext, holder: ui.element) -> None:
     ks = ctx.kube_status
-    with ui.dialog() as dialog, ui.card().classes("min-w-80"):
+    with holder, ui.dialog() as dialog, ui.card().classes("min-w-80"):
         ui.label("Кластер").classes("text-lg")
         ui.label(f"context: {ks.context or '—'}")
         ui.label(f"сервер: {ks.server or '—'}")
@@ -106,15 +108,15 @@ def _kube_dialog(ctx: AppContext) -> None:
         async def recheck() -> None:
             await ctx.refresh_kube(with_permissions=True)
             dialog.close()
-            _kube_dialog(ctx)
+            _kube_dialog(ctx, holder)
 
         ui.button("Перепроверить", on_click=recheck).props("flat no-caps")
     dialog.open()
 
 
-def _guard_dialog(ctx: AppContext) -> None:
+def _guard_dialog(ctx: AppContext, holder: ui.element) -> None:
     g = ctx.guard
-    with ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-xl"):
+    with holder, ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-xl"):
         ui.label("Защита от сна").classes("text-lg")
         ui.label(g.status()).classes("text-positive" if g.active else "")
         for text in g.reasons.values():
@@ -134,10 +136,10 @@ def _guard_dialog(ctx: AppContext) -> None:
     dialog.open()
 
 
-def _forward_dialog(ctx: AppContext, name: str) -> None:
+def _forward_dialog(ctx: AppContext, name: str, holder: ui.element) -> None:
     fwd = ctx.supervisor.forward(name)
     st = ctx.supervisor.state(name)
-    with ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-2xl"):
+    with holder, ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-2xl"):
         ui.label(f"Проброс: {fwd.title}").classes("text-lg")
         ui.label(f"{STATUS_WORDS[st.status]}{' — ' + st.note if st.note else ''}").classes("text-" + STATUS_COLORS[st.status])
         ui.label(shlex.join(fwd.argv)).classes("font-mono text-sm whitespace-pre-wrap")
