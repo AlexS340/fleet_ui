@@ -14,6 +14,7 @@ from fleet_console.context import AppContext
 from fleet_console.observe import Source
 from fleet_console.observe.argo import argo_ui_url
 from fleet_console.observe.submitter import ROOT
+from fleet_console.ui.common import confirm_dialog
 from fleet_console.ui.header import build_header
 
 LINK_SLOT = '<q-td :props="props"><a :href="props.value" target="_blank" class="text-primary">Argo UI</a></q-td>'
@@ -277,7 +278,7 @@ def _run_dialog(ctx: AppContext, row: dict, on_change) -> None:  # noqa: ANN001 
     dialog.open()
 
 
-def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change) -> None:  # noqa: ANN001
+def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change) -> None:
     """Свой прогон: лимит агентов, реплики модели, остановка, «забыть». Всё разрушительное — через подтверждение."""
     run_id = own.run_id
     version = next((v for v in ctx.observer.mlsc.data or [] if own.owns_version(v.version_id, v.application)), None)
@@ -340,34 +341,10 @@ def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change)
         ui.button("Забыть", on_click=forget).props("flat no-caps")
 
 
-def _confirm(title: str, lines: list[str], action, after) -> None:  # noqa: ANN001
-    """Диалог со сводкой перед разрушительным действием; ошибка остаётся в диалоге."""
-    with ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-xl"):
-        ui.label(title).classes("text-lg")
-        for line in lines:
-            ui.label(line).classes("text-sm")
-        status = ui.label().classes("text-sm whitespace-pre-wrap")
-
-        async def run() -> None:
-            status.set_text("выполняю…")
-            status.classes(remove="text-negative")
-            try:
-                await action()
-            except Exception as exc:  # noqa: BLE001 — текст ошибки kubectl показываем как есть
-                status.set_text(str(exc))
-                status.classes("text-negative")
-                return
-            dialog.close()
-            after()
-            ui.notify("Готово")
-
-        with ui.row().classes("gap-2"):
-            ui.button("Выполнить", on_click=run).props("unelevated no-caps color=negative")
-            ui.button("Отмена", on_click=dialog.close).props("flat no-caps")
-    dialog.open()
+_confirm = confirm_dialog
 
 
-def _stop_dialog(ctx: AppContext, run_id: str, row: dict, version, on_change) -> None:  # noqa: ANN001
+def _stop_dialog(ctx: AppContext, run_id: str, row: dict, version, on_change) -> None:
     active = int(row.get("running", 0) or 0) + int(row.get("pending", 0) or 0)
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
         ui.label(f"Остановить прогон {run_id}?").classes("text-lg break-all")

@@ -3,6 +3,7 @@ from pathlib import Path
 import cluster_samples
 from fleet_console.connect.kube import KubeStatus
 from fleet_console.context import AppContext
+from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import FakeRunner
 from fleet_console.settings import Paths, Settings
@@ -35,8 +36,11 @@ class ScriptedKube:
 def _ctx(tmp_path: Path) -> AppContext:
     paths = Paths(tmp_path / "home").ensure()
     settings = Settings()
-    observer = ClusterObserver(FakeRunner(), settings, mlsc_token=lambda: None)
-    return AppContext(settings, paths, Store(paths.db), ScriptedKube(), FakeManager(make_worktree(tmp_path / "wt")), FakeSupervisor(), observer)  # type: ignore[arg-type]
+    store = Store(paths.db)
+    runner = FakeRunner()
+    observer = ClusterObserver(runner, settings, mlsc_token=lambda: None)
+    sessions = SessionManager(store, runner, paths, settings, token=lambda: None, mlsc_pod=observer.mlsc_pod, platform="linux")
+    return AppContext(settings, paths, store, ScriptedKube(), FakeManager(make_worktree(tmp_path / "wt")), FakeSupervisor(), observer, sessions=sessions)  # type: ignore[arg-type]
 
 
 async def test_permissions_persist_and_recheck_until_green(tmp_path: Path) -> None:

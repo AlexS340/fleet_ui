@@ -1,0 +1,31 @@
+# Сессия модели Fleet Console: только шаги MLSC (подъём, проверка, гашение), без бенча.
+#
+# Повторяет defaults experiment_template.yaml fleet: группы harbor нужны как заглушки, иначе
+# system: cluster не резолвит ${harbor_dataset.benchmark} даже для --print-config (проверено
+# 2026-10-21). На шаги mlsc.* они не влияют. Группы ревизии подключаются через
+# -o hydra.searchpath=[file://<worktree>/examples/harbor_new/configs]; сервис подставляет
+# mlsc/model, harbor/agent, harbor/dataset, experiment.*, mlsc.version_id_file, mlsc.pod_name,
+# output_dir и main.run=[…] overrides — точную команду каждой стадии видно в карточке сессии.
+defaults:
+  - system: cluster
+  - mlsc/common@mlsc
+  - mlsc/model: ???
+  - harbor/job: default
+  - harbor/agent: ???
+  - harbor/dataset: ???
+  - harbor/source: composed
+  - execution: production
+  - _self_
+
+output_dir: ???
+
+experiment:
+  run_id: ???
+  model_name: ${mlsc.served_model_name}
+  jobs: ???
+  agents_per_replica: 1
+  workflow_prefix: h-${harbor_dataset.benchmark}
+  inference: litellm
+
+main:
+  run: ???

@@ -16,8 +16,9 @@ from fleet_console.fleetref.git import Branch, Commit, CommitInfo
 from fleet_console.fleetref.manager import PrepareError, Progress, ReadyRevision
 from fleet_console.fleetref.profile import CONFIGS_REL, Profile
 from fleet_console.guard import SleepGuard
+from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
-from fleet_console.runner import FakeRunner
+from fleet_console.runner import FakeRunner, Result
 from fleet_console.settings import Paths, Settings
 from fleet_console.store import Store
 
@@ -43,7 +44,7 @@ class FakeProc:
         self.returncode = -9
 
 
-async def fake_spawner(argv, log_path) -> FakeProc:  # noqa: ANN001
+async def fake_spawner(argv, log_path) -> FakeProc:
     return FakeProc()
 
 
@@ -130,7 +131,7 @@ class FakeManager:
         profile = Profile(
             sha=info.sha,
             layout="harbor_new",
-            groups={"mlsc/model": ["glm"]},
+            groups={"mlsc/model": ["glm"], "harbor/agent": ["terminus2"], "harbor/dataset": ["cowork"]},
             cli_flags=["--print-config"],
             print_config=True,
             steps=["mlsc.create_job", "system.materialize"],
@@ -155,21 +156,38 @@ def make_worktree(root: Path) -> Path:
     return root
 
 
+def fake_fleet(argv: tuple[str, ...]) -> Result:
+    """`uv run … fleet`: create_job пишет version_id, остальное просто успешно."""
+    overrides = {b.split("=", 1)[0]: b.split("=", 1)[1] for a, b in zip(argv, argv[1:]) if a == "-o" and "=" in b}
+    if overrides.get("main.run") == "[mlsc.create_job]" and "--print-config" not in argv:
+        Path(overrides["mlsc.version_id_file"]).write_text("777\n", encoding="utf-8")
+    return Result(argv, 0, "mlsc:\n  served_model_name: GLM\n" if "--print-config" in argv else "ok\n")
+
+
 def make_context() -> AppContext:
     root = Path(tempfile.mkdtemp(prefix="fleet-console-ui-test-"))
     paths = Paths(root / "home").ensure()
     settings = Settings()
+    store = Store(paths.db)
     kubectl = FakeRunner()
     cluster_samples.install(kubectl, settings.namespace)
+    kubectl.on("uv", "run", result=fake_fleet)
+    kubectl.on("osascript")
+    manager = FakeManager(make_worktree(root / "wt"))
+    observer = ClusterObserver(kubectl, settings, mlsc_token=lambda: "token")
+    sessions = SessionManager(store, kubectl, paths, settings, token=lambda: "token", mlsc_pod=observer.mlsc_pod, platform="linux")
+    # профиль «ревизии» FakeManager — в кеш, чтобы SessionManager.spec находил заглушки harbor
+    store.upsert_revision(SHA_MASTER, Profile(sha=SHA_MASTER, layout="harbor_new", groups={"mlsc/model": ["glm"], "harbor/agent": ["terminus2"], "harbor/dataset": ["cowork"]}).to_dict(), "master")
     return AppContext(
         settings=settings,
         paths=paths,
-        store=Store(paths.db),
+        store=store,
         kube=FakeKube(),  # type: ignore[arg-type]
-        manager=FakeManager(make_worktree(root / "wt")),  # type: ignore[arg-type]
+        manager=manager,  # type: ignore[arg-type]
         supervisor=FakeSupervisor(),  # type: ignore[arg-type]
-        observer=ClusterObserver(kubectl, settings, mlsc_token=lambda: "token"),
+        observer=observer,
         http=fake_gateway.client(),
         port_picker=lambda preferred: preferred,  # порт из настроек, без проверки занятости
         guard=SleepGuard(kubectl, fake_spawner, platform="darwin", pid=1),
+        sessions=sessions,
     )

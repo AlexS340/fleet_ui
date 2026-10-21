@@ -19,6 +19,7 @@ from fleet_console.control.mlsc import set_planned_state
 from fleet_console.fleetref.git import Mirror
 from fleet_console.fleetref.manager import PrepareError, RevisionManager
 from fleet_console.guard import SleepGuard
+from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import CommandError, Runner, SubprocessRunner
 from fleet_console.settings import Paths, Settings, default_home, read_secret
@@ -28,6 +29,7 @@ BASTION = "bastion"
 KUBE_POLL_SEC = 30.0
 KUBE_RETRY_SEC = 5.0  # пока API-сервер не ответил (ssh ещё поднимается) — опрашиваем чаще
 GUARD_POLL_SEC = 15.0
+SESSIONS_POLL_SEC = 30.0
 
 
 @dataclass
@@ -44,6 +46,7 @@ class AppContext:
     gateways: dict[str, Gateway] = field(default_factory=dict)  # открытые пробросы к шлюзам по ключу
     port_picker: Callable[[int], int] = free_port
     guard: SleepGuard = field(default_factory=SleepGuard)
+    sessions: SessionManager = field(default=None)  # type: ignore[assignment] — задаётся в build_context и в тестах
     _tasks: list[asyncio.Task] = field(default_factory=list)
 
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
@@ -98,14 +101,15 @@ class AppContext:
             asyncio.create_task(self._mirror_init(), name="mirror"),
             asyncio.create_task(self.observer.loop(), name="observer"),
             asyncio.create_task(self._guard_loop(), name="guard"),
+            asyncio.create_task(self._sessions_loop(), name="sessions"),
         ]
         if self.settings.auto_fetch_minutes > 0:
             self._tasks.append(asyncio.create_task(self._fetch_loop(), name="auto-fetch"))
 
     async def shutdown(self) -> None:
-        for task in self._tasks:
+        for task in [*self._tasks, *self.sessions.tasks.values()]:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, *self.sessions.tasks.values(), return_exceptions=True)
         await self.supervisor.stop()
         await self.guard.stop()
         await self.http.aclose()
@@ -152,15 +156,28 @@ class AppContext:
         self.store.event("stop_run", run_id, "ok" if report.ok else "error", "; ".join(report.steps + report.failed))
         return report
 
+    # --- сессии моделей --------------------------------------------------
+    async def _sessions_loop(self) -> None:
+        await self.sessions.resume()
+        while True:
+            await asyncio.sleep(SESSIONS_POLL_SEC)
+            try:
+                await self.sessions.tick()
+            except Exception as exc:  # noqa: BLE001 — таймер не должен умереть из-за одной ошибки kubectl
+                self.store.event("sessions_tick", "-", "error", str(exc))
+
     # --- защита от сна ---------------------------------------------------
     def sleep_reasons(self) -> dict[str, str]:
-        """Почему Mac не должен спать: свои прогоны с идущими задачами (с сессиями моделей — и они)."""
+        """Почему Mac не должен спать: свои прогоны с идущими задачами и живые сессии моделей."""
         own = self.store.own_runs()
-        return {
+        reasons = {
             r.run_name: f"прогон {r.run_name}: задач идёт {r.active}"
             for r in (self.observer.runs.data or [])
             if r.run_name in own and r.active
         }
+        for s in self.sessions.sessions(active_only=True):
+            reasons[f"session:{s.id}"] = f"сессия {s.model or s.recipe}: {s.status}"
+        return reasons
 
     async def _guard_loop(self) -> None:
         while True:
@@ -222,4 +239,7 @@ def build_context(home: Path | None = None) -> AppContext:
     manager = RevisionManager(mirror, store, runner, paths, settings, sync_gate=sync_gate)
     observer = ClusterObserver(runner, settings, mlsc_token=lambda: read_secret(paths, "MLSC_TOKEN"))
     guard = SleepGuard(runner, subprocess_spawner, log_path=paths.logs / "caffeinate.log")
-    return AppContext(settings, paths, store, kube, manager, supervisor, observer, guard=guard)
+    sessions = SessionManager(
+        store, runner, paths, settings, token=lambda: read_secret(paths, "MLSC_TOKEN"), mlsc_pod=observer.mlsc_pod
+    )
+    return AppContext(settings, paths, store, kube, manager, supervisor, observer, guard=guard, sessions=sessions)

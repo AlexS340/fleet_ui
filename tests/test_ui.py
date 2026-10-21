@@ -138,3 +138,27 @@ async def test_header_shows_sleep_guard(user: User) -> None:
         await user.should_see("Защита от сна включена")
     finally:
         await fakes.CTX.guard.update({})
+
+
+async def test_models_page_sessions(user: User) -> None:
+    await user.open("/models")
+    await user.should_see("Сессии моделей")
+    user.find("Поднять модель").click()
+    await user.should_see("Сначала подготовьте совместимую ревизию")
+    user.find("Закрыть").click()
+    await fakes.CTX.manager.prepare("master")
+    user.find("Поднять модель").click()
+    await user.should_see("Рецепт mlsc/model")
+    await user.should_see("в рецепте: served_model_name GLM")
+    user.find("Запустить подъём").click()
+    await user.should_see("Занять GPU под модель?")
+    await user.should_see("стадии: preflight → mlsc.create_job")
+    user.find("Да, поднять").click()
+    await user.should_see("подъём начат")
+    await asyncio.gather(*fakes.CTX.sessions.tasks.values())
+    session = fakes.CTX.sessions.sessions()[0]
+    assert session.status == "ready" and session.version_id == 777 and session.id.startswith("console-glm-")
+    assert [s.stage for s in fakes.CTX.sessions.stages(session.id)] == ["preflight", "create_job", "start_llm", "check"]
+    assert "session:" + session.id in fakes.CTX.sleep_reasons()
+    await fakes.CTX.sessions.stop(session.id)
+    assert fakes.CTX.sessions.get(session.id).status == "stopped"

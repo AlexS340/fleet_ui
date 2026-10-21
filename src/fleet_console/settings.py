@@ -52,8 +52,13 @@ class Paths:
         """KEY=value построчно; запасной источник токенов, когда их нет в окружении сервиса."""
         return self.home / "secrets.env"
 
+    @property
+    def runs(self) -> Path:
+        """Каталоги прогонов и сессий моделей: конфиг, resolved.yaml, version_id, логи стадий."""
+        return self.home / "runs"
+
     def ensure(self) -> "Paths":
-        for d in (self.home, self.worktrees, self.logs):
+        for d in (self.home, self.worktrees, self.logs, self.runs):
             d.mkdir(parents=True, exist_ok=True)
         return self
 
@@ -96,6 +101,9 @@ class Settings(BaseModel):
     auto_fetch_minutes: int = 0
     worktree_ttl_days: int = 14
     ui_port: int = 8080
+    # Сессии моделей: время жизни по умолчанию и льготный интервал после уведомления до гашения.
+    session_ttl_minutes: int = 120
+    session_grace_minutes: int = 10
 
     @classmethod
     def load(cls, paths: Paths) -> "Settings":

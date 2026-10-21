@@ -1,5 +1,5 @@
 """Журнал сервиса в SQLite."""
 
-from fleet_console.store.db import Revision, Store
+from fleet_console.store.db import Revision, Session, Stage, Store
 
-__all__ = ["Revision", "Store"]
+__all__ = ["Revision", "Session", "Stage", "Store"]
