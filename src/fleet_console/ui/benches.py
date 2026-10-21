@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 from typing import Any
 
 from nicegui import ui
@@ -150,6 +151,11 @@ async def benches_page(ctx: AppContext) -> None:
 
     render()
     ui.timer(3.0, render)
+
+
+def _facts_table(rows: list[dict[str, str]]) -> ui.table:
+    columns = [{"name": "k", "field": "k", "align": "left", "style": "width: 11rem; white-space: nowrap"}, {"name": "v", "field": "v", "align": "left"}]
+    return ui.table(columns=columns, rows=rows).props("dense flat hide-header wrap-cells").classes("w-full")
 
 
 # --- форма запуска -------------------------------------------------------------
@@ -359,9 +365,7 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                     ui.label(draft.resolve_error).classes("text-negative text-sm whitespace-pre-wrap font-mono")
                 else:
                     rows = [{"k": k, "v": v} for k, v in draft.preview.rows()]
-                    ui.table(columns=[{"name": "k", "field": "k", "align": "left"}, {"name": "v", "field": "v", "align": "left"}], rows=rows).props("dense flat hide-header").classes(
-                        "w-full"
-                    )
+                    _facts_table(rows)
                 edits = manual_edits(draft.spec.run_dir, draft.spec.worktree, draft.spec.overlay, draft.spec.exp.read_text(encoding="utf-8")) if draft.spec else []
                 if draft.manual or edits:
                     ui.label("ручные правки: " + (", ".join(name for name, _ in edits) or "exp.yaml")).classes("text-xs text-warning")
@@ -405,10 +409,16 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
 
             confirm_dialog("Запустить прогон?", lines, start, after, button="Да, запустить")
 
+        def discard_draft() -> None:
+            """Форма закрыта без запуска: каталог черновика (exp.yaml, resolved.yaml) больше не нужен."""
+            if draft.spec is not None and ctx.store.get_bench(draft.spec.run_id) is None and draft.spec.run_dir.is_dir():
+                shutil.rmtree(draft.spec.run_dir, ignore_errors=True)
+
         preset_select.on_value_change(lambda e: apply_preset(e.value))
         for element in (model_select, dataset_select, jobs, apr):
             element.on_value_change(lambda _: refresh_gpu())
         accept.on_value_change(lambda _: refresh_start())
+        dialog.on("hide", lambda _: discard_draft())
         refresh_gpu()
     dialog.open()
 
@@ -543,7 +553,7 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         rows = [{"k": k, "v": v} for k, v in preview.rows()] if run.preview_json != "{}" else []
         rows += [{"k": "Идентификаторы", "v": f"run_id {run.id} · лейбл Argo fleet/run-name={run.id}" + (f" · MLSC version_id {run.version_id}" if run.version_id is not None else "")}]
         with ui.expansion("Что и где запущено", value=run.active).classes("w-full"):
-            ui.table(columns=[{"name": "k", "field": "k", "align": "left"}, {"name": "v", "field": "v", "align": "left"}], rows=rows).props("dense flat hide-header").classes("w-full")
+            _facts_table(rows)
         base = ctx.settings.argo_ui_url
         with ui.row().classes("gap-3 flex-wrap text-sm"):
             ui.link("Argo UI по прогону", argo_ui_url(base, ctx.settings.namespace, run.id), new_tab=True)

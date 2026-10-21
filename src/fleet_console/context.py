@@ -216,6 +216,7 @@ class AppContext:
         try:
             await self.manager.ensure_mirror()
             await self.manager.gc_worktrees()
+            await self.manager.restore()  # последняя ревизия снова «текущая»: формы прогона и сессии работают сразу
         except PrepareError:
             pass  # текст ошибки уже в manager.progress.error, UI его покажет
 

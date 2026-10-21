@@ -98,3 +98,13 @@ async def test_fetch_and_gc(manager: RevisionManager) -> None:
     assert await manager.gc_worktrees() == []  # свежий
     assert await manager.gc_worktrees(ttl_days=0) == [ready.info.sha]
     assert manager.mirror.worktrees() == [] and manager.store.get_revision(ready.info.sha) is None
+
+
+async def test_restore_last_revision_after_restart(manager: RevisionManager) -> None:
+    await manager.ensure_mirror()
+    assert await manager.restore() is None  # ничего не готовили
+    ready = await manager.prepare("master")
+    manager.current = None  # «перезапуск»
+    restored = await manager.restore()
+    assert restored is not None and restored.info.sha == ready.info.sha and restored.from_cache and manager.current is restored
+    assert await manager.restore() is restored  # повторно — без работы

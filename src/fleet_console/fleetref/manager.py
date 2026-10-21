@@ -162,6 +162,22 @@ class RevisionManager:
             self.current = ReadyRevision(ref, info, worktree, profile, from_cache=cached is not None)
             return self.current
 
+    async def restore(self) -> ReadyRevision | None:
+        """После перезапуска сервиса: вернуть последнюю использованную ревизию, если её worktree и профиль на месте.
+
+        Иначе форма прогона и сессии отказывали, пока не нажмёшь «Подготовить ревизию» (грабли Ф2).
+        """
+        if self.current is not None or self.progress.busy:
+            return self.current
+        for rev in self.store.revisions():
+            if not self.is_ready(rev.sha):
+                continue
+            try:
+                return await self.prepare(rev.ref or rev.sha)
+            except PrepareError:
+                return None
+        return None
+
     async def gc_worktrees(self, ttl_days: int | None = None) -> list[str]:
         """Удалить worktree, не использовавшиеся дольше TTL (активных прогонов в Ф0 нет)."""
         ttl = timedelta(days=self.settings.worktree_ttl_days if ttl_days is None else ttl_days)
