@@ -20,6 +20,14 @@ PHASES = {
 }
 
 
+def _title(ref: str, sha: str) -> str:
+    """«master @ 378874ba», а для ссылки-SHA — просто «378874ba»."""
+    short = sha[:8]
+    if not ref or ref == sha or sha.startswith(ref) or ref.startswith(short):
+        return short
+    return f"{ref} @ {short}"
+
+
 async def revision_page(ctx: AppContext) -> None:
     build_header(ctx)
     state = {"ref": "", "info": ""}
@@ -34,7 +42,7 @@ async def revision_page(ctx: AppContext) -> None:
         p = ctx.manager.progress
         if p.busy:
             ui.linear_progress(show_value=False).props("indeterminate").classes("w-full")
-            what = f"{p.ref} {p.sha[:8]}".strip()
+            what = _title(p.ref, p.sha) if p.sha else p.ref
             ui.label((what + ": " if what else "") + PHASES.get(p.phase, p.phase)).classes("text-sm")
             tail = list(p.log)[-8:]
             if tail:
@@ -49,7 +57,7 @@ async def revision_page(ctx: AppContext) -> None:
             return
         pr = r.profile
         with ui.column().classes("w-full gap-2"):
-            ui.label(f"Готово: {r.ref} @ {r.info.short}" + (" (из кеша)" if r.from_cache else "")).classes("text-lg")
+            ui.label(f"Готово: {_title(r.ref, r.info.sha)}" + (" (из кеша)" if r.from_cache else "")).classes("text-lg")
             facts = [
                 f"Harbor {pr.harbor_version or '?'}",
                 f"образ раннера {pr.agent_image or '?'}",
@@ -122,10 +130,8 @@ async def revision_page(ctx: AppContext) -> None:
             ref_input = ui.input("или SHA / тег", on_change=lambda e: on_commit(e.value.strip() or commit_select.value))
             ref_input.classes("min-w-[12rem]")
             prepare_button = ui.button("Подготовить ревизию", on_click=prepare).props("unelevated no-caps")
-        if not ctx.manager.mirror.exists():
-            ui.label("Зеркало fleet ещё не склонировано — ветки появятся сами, когда клонирование закончится.").classes(
-                "text-sm opacity-80"
-            )
+        mirror_note = ui.label("Зеркало fleet ещё не склонировано — ветки появятся сами, когда клонирование закончится.")
+        mirror_note.classes("text-sm opacity-80").set_visibility(not ctx.manager.mirror.exists())
         info_view()
         progress_view()
         result_view()
@@ -135,6 +141,7 @@ async def revision_page(ctx: AppContext) -> None:
         names = [b.name for b in branches]
         options = {b.name: f"{b.name} · {b.date:%d.%m} · {b.author}" for b in branches}
         branch_select.set_options(options, value="master" if "master" in names else (names[0] if names else None))
+        mirror_note.set_visibility(False)
         state["loaded"] = True
 
     async def tick() -> None:

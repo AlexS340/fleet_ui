@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import shlex
 from typing import Protocol
 
@@ -64,8 +65,14 @@ class Runner(Protocol):
     ) -> Result: ...
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
 def _merged_env(extra: Mapping[str, str] | None) -> dict[str, str]:
+    """Окружение дочерней команды: без VIRTUAL_ENV (сервис сам живёт в venv uv, дочернему uv это мешает) и без цветов."""
     env = dict(os.environ)
+    env.pop("VIRTUAL_ENV", None)
+    env.setdefault("NO_COLOR", "1")
     if extra:
         env.update(extra)
     return env
@@ -145,7 +152,7 @@ class SubprocessRunner:
 
 
 def _emit(line: str, lines: list[str], log, on_line: LineHook | None) -> None:
-    line = line.rstrip()
+    line = ANSI.sub("", line).rstrip()
     if not line:
         return
     lines.append(line)

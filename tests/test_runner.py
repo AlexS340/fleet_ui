@@ -51,3 +51,15 @@ async def test_stream_splits_carriage_returns(tmp_path: Path) -> None:
     code = "import sys; sys.stdout.write('Counting 1%\\rCounting 2%\\rCounting 100%\\ndone\\n')"
     result = await SubprocessRunner().stream([sys.executable, "-c", code], log_path=tmp_path / "p.log", on_line=seen.append)
     assert result.ok and seen == ["Counting 1%", "Counting 2%", "Counting 100%", "done"]
+
+
+async def test_child_env_drops_virtual_env_and_colors(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("VIRTUAL_ENV", "/some/venv")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    code = "import os; print(os.environ.get('VIRTUAL_ENV', 'unset'), os.environ.get('NO_COLOR'))"
+    result = await SubprocessRunner().run([sys.executable, "-c", code])
+    assert result.stdout.split() == ["unset", "1"]
+    seen: list[str] = []
+    code = "print('\\x1b[1m\\x1b[33mwarning\\x1b[39m: plain')"
+    await SubprocessRunner().stream([sys.executable, "-c", code], on_line=seen.append)
+    assert seen == ["warning: plain"]

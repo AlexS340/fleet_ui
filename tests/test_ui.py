@@ -35,7 +35,7 @@ async def test_prepare_shows_profile_and_catalog(user: User) -> None:
     await asyncio.sleep(0.05)
     await user.should_see("отстаёт от master на 3")
     user.find("Подготовить ревизию").click()
-    await user.should_see("Готово: " + fakes.SHA_FEAT)
+    await user.should_see("Готово: " + fakes.SHA_FEAT[:8])
     await user.should_see("Harbor 0.22.0")
     await user.should_see("Модели · mlsc/model")
     await user.should_see("Рецепт GLM-5.3-Flash на 8 GPU.")
