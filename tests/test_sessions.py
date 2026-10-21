@@ -175,3 +175,11 @@ async def test_resume_after_restart(h: Harness) -> None:
     assert h.mgr.get(ready.id).status == "ready" and h.steps == ["start_llm", "check"]  # без повторного create_job
     assert h.mgr.get(no_version.id).status == "failed" and "version_id" in h.mgr.get(no_version.id).error
     assert h.mgr.get(stopping.id).status == "attention"
+
+
+async def test_start_without_model_name_takes_served_model_name_from_recipe(h: Harness) -> None:
+    session = await h.mgr.start(h.revision, recipe="glm", model_name="", replicas=1)
+    await h.mgr.tasks[session.id]
+    assert h.mgr.get(session.id).model == "GLM-5.3-Flash"
+    assert session.id.startswith("console-glm-")  # id по рецепту, как и раньше
+    assert "mlsc.served_model_name=" not in h.commands(session.id)["create_job"]  # имя из рецепта не переопределяется

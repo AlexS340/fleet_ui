@@ -48,8 +48,12 @@ async def write_agent_limit(runner: Runner, namespace: str, pod: str, run_id: st
 
 
 async def kill_submitter(runner: Runner, namespace: str, pod: str, run_id: str) -> Command:
-    """Убить процесс submit_workflows.py этого прогона; если его нет — не ошибка."""
-    pattern = f"submit_workflows.py {ROOT}/{run_id}/"
+    """Убить процесс submit_workflows.py этого прогона; если его нет — не ошибка.
+
+    `[.]` в шаблоне: иначе `pkill -f` находит собственный `sh -c`, в чьей командной строке тот же текст,
+    и убивает его раньше `true` (код 143) — на живом кластере так и вышло.
+    """
+    pattern = f"submit_workflows[.]py {ROOT}/{run_id}/"
     argv = ["kubectl", "exec", "-n", namespace, pod, "--", "sh", "-c", f"pkill -f {shlex.quote(pattern)}; true"]
     result = await runner.run(argv, timeout=30)
     if not result.ok:

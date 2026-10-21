@@ -18,7 +18,7 @@ import sys
 
 from fleet_console.fleetref.manager import ReadyRevision
 from fleet_console.fleetref.profile import DUMMY_ENV
-from fleet_console.models.compose import SessionSpec, make_run_id, write_config
+from fleet_console.models.compose import SessionSpec, make_run_id, recipe_summary, write_config
 from fleet_console.runner import Runner
 from fleet_console.settings import Paths, Settings
 from fleet_console.store import Session, Store
@@ -133,9 +133,11 @@ class SessionManager:
             run_id, revision.worktree, run_dir, recipe, replicas, inference, agent, dataset, await self.mlsc_pod(), model_name, tuple(extra)
         )
         ttl = ttl_minutes or self.settings.session_ttl_minutes
+        # Пустое имя — served_model_name из рецепта: под ним модель видна в litellm, карточке и песочнице.
+        model = model_name or str(recipe_summary(revision.worktree, recipe).get("served_model_name") or "")
         session = Session(
             id=run_id, recipe=recipe, status="starting", created_at=_iso(now), ref=revision.ref, sha=revision.info.sha,
-            worktree=str(revision.worktree), model=model_name, replicas=replicas, inference=inference, ttl_minutes=ttl,
+            worktree=str(revision.worktree), model=model, replicas=replicas, inference=inference, ttl_minutes=ttl,
             stage="preflight", dir=str(run_dir),
         )
         self.store.create_session(session)

@@ -35,7 +35,7 @@ async def test_workflows_listing_termination_and_submitter_kill() -> None:
     assert [c.ok for c in commands] == [True, False, True] and '"shutdown":"Terminate"' in commands[0].argv[-1]
     assert "not found" in commands[1].output
     cmd = await kill_submitter(fake, NS, POD, "run-a")
-    assert "pkill -f 'submit_workflows.py /manifests/harbor_run/run-a/'" in cmd.argv[-1]
+    assert "pkill -f 'submit_workflows[.]py /manifests/harbor_run/run-a/'" in cmd.argv[-1]
 
 
 async def test_stop_run_reports_each_step() -> None:
