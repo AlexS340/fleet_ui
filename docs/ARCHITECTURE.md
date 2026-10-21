@@ -92,17 +92,17 @@ flowchart LR
 1. В настройках задаётся remote fleet (gitverse по ssh). При первом запуске сервис делает `git clone --mirror` в `~/.fleet-console/fleet.git`.
 2. Кнопка «Актуализировать» выполняет `git fetch --prune` и показывает время последнего fetch. Авто-fetch по таймеру — опция, выключен по умолчанию.
 3. В UI выбирается ветка (список по дате последнего коммита, с автором), затем коммит из последних 50 с сообщениями. Можно вставить SHA или тег руками.
-4. Для выбранного SHA сервис создаёт `git worktree add --detach worktrees/<sha>` и выполняет там `uv sync --frozen`. Кеш uv общий, повторная синхронизация быстрая.
+4. Для выбранного SHA сервис создаёт `git worktree add --detach worktrees/<sha>` и выполняет там `uv sync --frozen`. Кеш uv общий, повторная синхронизация быстрая. Проверено 2026-10-21: `git clone --mirror` — 52 МБ; `git -C fleet.git worktree add --detach` из bare-зеркала работает, `status --porcelain` пуст; `uv.lock` есть во всех 87 ветках; `uv sync --frozen` на master — 24 с при тёплом кеше, `.venv` 578 МБ. Нужны ssh до `gitverse.ru:2222` (helpctl и benchboard — `git+ssh`, работает напрямую) и HTTPS до `pypi-mirror.gitverse.ru`, который из домашней сети отвечает только через SOCKS бастиона: `HTTPS_PROXY=socks5h://127.0.0.1:1080`. Python: в `pyproject.toml` fleet `python-preference = "only-managed"`, нужный 3.12 у uv уже установлен.
 5. По worktree строится профиль возможностей ревизии (ниже) и каталог конфигов. Оба кешируются по SHA.
 6. При запуске ветка разрешается в SHA, и этот SHA записывается в журнал прогона. Дальнейший fetch уже идущий прогон не затрагивает.
 
-**Почему worktree, а не импорт библиотеки.** Зависимости fleet (harbor, benchboard, hera) остаются в его собственном venv и не конфликтуют с сервисом. Разные прогоны могут одновременно идти на разных ревизиях: например, один на `master`, другой на ветке со Strands. Все вызовы идут как `uv run --project worktrees/<sha> fleet …` с cwd = worktree: fleet читает `dind_runner.py` и реестр датасетов по относительным путям.
+**Почему worktree, а не импорт библиотеки.** Зависимости fleet (harbor, benchboard, hera) остаются в его собственном venv и не конфликтуют с сервисом. Разные прогоны могут одновременно идти на разных ревизиях: например, один на `master`, другой на ветке со Strands. Все вызовы идут как `uv run --project worktrees/<sha> --no-sync fleet …` с cwd = worktree: fleet читает `dind_runner.py` и реестр датасетов по относительным путям (`--no-sync` обязателен, иначе `uv run` синхронизирует окружение на каждый вызов).
 
-**Профиль возможностей ревизии.** Ревизии fleet расходятся: в одних шаг монитора лежит в `mlsc.monitor`, в других в `ops.monitor`, флага `--print-config` может не быть. Поэтому для каждого SHA сервис один раз собирает:
+**Профиль возможностей ревизии.** Ревизии fleet расходятся (проверено по 87 веткам origin на 2026-10-21): у 61 ветки вообще нет каталога `examples/harbor_new/configs` — там старая раскладка `examples/harbor`; у 20 веток в `fleet/main.py` нет флага `--print-config`; наборы `mode/` отличаются (в 8 ветках нет `measure.yaml`, кое-где есть `retry_infra_tui.yaml` или `openrouter.yaml`); Harbor везде 0.22.0, кроме одной ветки с 0.23.0. Шага `ops.monitor` ни в одной ветке нет — монитор везде `mlsc.monitor`. Поэтому для каждого SHA сервис один раз собирает:
 
-- списки групп `mlsc/model`, `harbor/agent`, `harbor/dataset`, `datasets/`, `mode/`;
-- какие секции-шаги существуют в итоговом конфиге (`mlsc.create_job`, `system.materialize` и т. д.);
-- поддерживаемые флаги CLI;
+- списки групп: `mlsc/model`, `harbor/{job,agent,dataset,source,suite,jobs,additional_job}`, `execution/`, `mode/`, `system/`, а также реестр `datasets/` (это не Hydra-группа, а каталог `HarborDatasetRegistry.from_directory`) и корневые `config.yaml`, `experiment_template.yaml`, `exp_*.yaml`;
+- какие секции-шаги существуют в итоговом конфиге: `--print-config` на `experiment_template.yaml` с первым элементом каждой обязательной группы и заглушками для `oc.env` (`FLEET_DATASETS_ROOT`, `MLSC_TOKEN`, `AWS_ACCESS_KEY_ID_gcvmfleet`, `AWS_SECRET_ACCESS_KEY_gcvmfleet`, `USER` — `resolve=True` без них падает); на master это 12 секций `system.*` и 10 `mlsc.*` с `_target_`, ~1.7 с;
+- поддерживаемые флаги CLI (парсинг `fleet --help`; на master: `-w`, `-o`, `--tui/--no-tui`, `--argo-host`, `--force-stop-llm`, `--backend`, `--print-config`);
 - версию Harbor из `pyproject.toml` и дефолтный `system.agent_image`.
 
 Логические стадии сервиса мапятся на шаги, которые реально есть в ревизии. Нет нужного шага — пресет помечается несовместимым с этой ревизией, и UI объясняет почему.
@@ -121,7 +121,7 @@ flowchart LR
 
 **Три источника конфигов:**
 
-- **Каталог ревизии** — группы из `examples/harbor_new/configs` worktree. У каждого элемента UI показывает путь и шапку-комментарий файла: в fleet они содержательные.
+- **Каталог ревизии** — группы из `examples/harbor_new/configs` worktree. У каждого элемента UI показывает путь и шапку-комментарий файла: в fleet они содержательные. Проверено на master: шапки есть в `mlsc/model` (8 из 9), `harbor/agent` (10/10), `harbor/dataset` (9/9), `mode` (12/12), `execution` (2/2), но не в `datasets/` (0 из 20) — там UI показывает `benchmark` и `source.tasks_root` из тела файла. Строку директивы `# @package …` из шапки надо исключать.
 - **Overlay сервиса** — свои группы в репозитории сервиса (`overlay/configs/...`): профили агентов вроде `terminus2_cowork`, рецепты моделей, маппинги датасетов вроде `cowork_bench_r10`. Имена не должны совпадать с именами из fleet — это проверяет preflight.
 - **Пресеты** — YAML в `presets/`, версионированные в git сервиса. Пресет ссылается на группы по имени и задаёт только то, что отличается от дефолтов.
 
@@ -313,7 +313,8 @@ Fleet это позволяет: подъём и гашение модели —
 
 **Что проверить на прототипе:**
 
-- [ ] точные имена и порты сервисов шлюзов (`kubectl get svc -n litellm-argo`, `-n vllm-proxy`) и нужен ли litellm ключ;
+- [x] имена сервисов шлюзов (2026-10-21): litellm — `litellm-argo/service/litellm` (headless, 80; это и есть `http://litellm.litellm-argo` из `system/cluster.yaml`) и `litellm-argo/service/litellm-fleet` (ClusterIP, 80); nginx — сервиса `vllm-proxy` в namespace `vllm-proxy` нет, есть `vllm-proxy/service/nginx-vllm-proxy-test` (80; deployment `nginx-vllm-proxy` смасштабирован в 0, работает `-test`) и headless `argo/service/vllm-proxy` (80). Адрес `http://vllm-proxy.vllm-proxy:80` выше взят из `docs/REFACTORING_CONCEPTS.md` fleet и в кластере не подтверждён;
+- [ ] нужен ли ключ litellm;
 - [ ] что шаги `mlsc.*` собираются из минимального `exp.yaml` без групп harbor; иначе подставлять заглушки;
 - [ ] как сервису отличать свои MLSC-приложения от чужих: в `mlsc/job_base.yaml` master имя приложения задано шаблоном `gigacode-fleet-egbulychev ${experiment.run_id}`, префикс лучше переопределять своим.
 
@@ -362,12 +363,12 @@ Fleet это позволяет: подъём и гашение модели —
 | Источник | Что показываем | Как читаем |
 | --- | --- | --- |
 | Argo Workflows | прогоны и фазы задач (идут, успешно, упали), список упавших, ссылки в Argo UI | CRD `workflows.argoproj.io` через Kubernetes API по лейблу `fleet/run-name`; без port-forward |
-| MLSC | приложения и версии, желаемые и фактические инстансы, лог упавшего воркера | `kubectl exec` в под в namespace `vllm-proxy`, как делает fleet, с `MLSC_TOKEN` |
+| MLSC | приложения и версии, желаемые и фактические инстансы, лог упавшего воркера | `kubectl exec` в под деплоймента `litellm-noauth` в namespace `vllm-proxy`, как делает fleet, с `MLSC_TOKEN` |
 | Шлюз nginx | сколько реплик модели реально в маршруте | ConfigMap `nginx-model-upstreams-runtime` |
 | Submitter-под | лимит агентов, число манифестов в очереди, `run_logs.txt` | `kubectl exec` в `fleet-submitter-python` |
 | Kubernetes | узлы пула `type=bench`, их allocatable, поды в Pending | Kubernetes API |
 | S3 | сколько результатов уже лежит по прогону | листинг `s3_base_directory` по запросу |
-| Benchboard | итог замера | ссылка |
+| Benchboard | итог замера | ссылка; сервис `fleet/service/benchboard:80`, ingress нет — нужен port-forward |
 
 **Свои и чужие.** Свои — прогоны и сессии из журнала сервиса: их `run_id`, `version_id` и префикс имени MLSC-приложения известны. Всё остальное — чужое и показывается только на чтение. Прогоны, запущенные до сервиса руками, можно «усыновить»: указать `run_id` и файл `version_id`, после чего ими можно управлять.
 
@@ -377,25 +378,28 @@ Fleet это позволяет: подъём и гашение модели —
 
 ## Подключение к кластеру
 
-Сервис работает с моим kubeconfig и сам держит все нужные пробросы портов. Port-forward до Argo — это `kubectl port-forward`, он идёт через API-сервер Kubernetes, а не через ssh. Поэтому autossh к нему неприменим, но тот же принцип автоперезапуска сервис реализует сам.
+Сервис работает с моим kubeconfig и сам держит все нужные пробросы портов. Проверено 2026-10-21: сам API-сервер доступен только через ssh-сессию к бастиону. Kube context `internal` смотрит на `https://127.0.0.1:8443`, а этот порт открывает `ssh fleetbastion` из `~/.ssh/config` (`ProxyJump ecs3`, `LocalForward 8443 192.168.100.17:5443`, `DynamicForward 1080`). Та же сессия даёт SOCKS-прокси `127.0.0.1:1080`, без которого из домашней сети недоступны `pypi-mirror.gitverse.ru` (индекс по умолчанию в `pyproject.toml` fleet, нужен для `uv sync` worktree) и ingress-хосты `*.sberai-rnd.ru` (Argo UI). Поэтому ssh-сессия к бастиону — проброс №0 в супервизоре: принцип autossh применим именно к ней, а `kubectl port-forward` до Argo и шлюзов идут уже поверх неё через API-сервер.
 
 **Kube context.** При старте сервис:
 
-1. читает текущий context и сверяет его со списком разрешённых в настройках — чтобы не запустить прогон в чужой кластер;
-2. делает `kubectl auth can-i` на нужные действия: чтение и patch workflows, exec в submitter-под и под MLSC, чтение ConfigMap, port-forward к сервисам;
-3. находит актуальный под для вызовов MLSC по деплойменту, а не по захардкоженному имени;
+1. читает текущий context и сверяет его со списком разрешённых в настройках — чтобы не запустить прогон в чужой кластер (сейчас единственный context `internal`, кластер `internalCluster`, namespace в контексте не задан — берётся `system.namespace` = `swe-bench-v2-20260308`; сервер Kubernetes v1.33.5, локальный kubectl 1.37 предупреждает о version skew — безвредно);
+2. делает `kubectl auth can-i` на нужные действия: чтение и patch workflows, exec в submitter-под и под MLSC, чтение ConfigMap, port-forward к сервисам (проверено: все нужные права есть, включая `delete workflows` и `create token`);
+3. находит актуальный под для вызовов MLSC по деплойменту `litellm-noauth` в namespace `vllm-proxy`, а не по захардкоженному имени (в `mlsc/common.yaml` master записан `litellm-noauth-6588c4c7cf-sbhpg`; на 2026-10-21 он совпадает с живым подом);
 4. постоянно показывает context и namespace в шапке UI. Протухший токен kubeconfig — понятная ошибка «переавторизуйтесь», а не красные таблицы.
 
 **Супервизор пробросов.** Каждый проброс — запись с целью (namespace/service:port), локальным портом и проверкой здоровья:
 
 | Проброс | Зачем | Проверка |
 | --- | --- | --- |
-| Argo Server (`service/argo-workflows-server`, 2746) | Argo UI и шаги fleet, которым нужен Argo API | HTTP-запрос к API Argo |
+| ssh-сессия к бастиону (`ssh -N fleetbastion`: API-сервер на 8443, SOCKS на 1080) | всё остальное: kubectl, `uv sync`, ingress-хосты | `kubectl get --raw /readyz` = `ok` |
+| Argo Server (`-n argo service/argo-workflows-server`, 2746) | Argo UI и шаги fleet, которым нужен Argo API (`mlsc.monitor` через hera; сервис его не вызывает) | `GET /` = 200; API без токена отвечает 401 — это тоже «жив» |
 | Шлюз моделей litellm или nginx | песочница и свои скрипты к vLLM | `GET /v1/models` |
 
 Процесс перезапускается, если он завершился, если проверка не прошла два раза подряд или если замечен выход Mac из сна. Пауза между попытками растёт экспоненциально до потолка. Статус каждого проброса виден в шапке: зелёный, жёлтый (переподключение) или красный.
 
-Наблюдение за задачами идёт через Kubernetes API и от проброса до Argo не зависит. Упавший проброс ломает только Argo UI и песочницу, но не идущие прогоны.
+Наблюдение за задачами идёт через Kubernetes API и от проброса до Argo не зависит. Упавший проброс ломает только Argo UI и песочницу, но не идущие прогоны. Упавшая ssh-сессия к бастиону ломает всё, поэтому её статус в шапке главный.
+
+**Auth Argo.** Argo Server запущен с `--auth-mode=client`: и UI, и API требуют Bearer-токен Kubernetes; без него `/api/v1/version` отвечает 401, корень UI отдаёт 200. Fleet читает токен из `ARGO_TOKEN` (с префиксом `Bearer `), получить его можно командой `kubectl -n argo create token argo-server --duration 24h` (в `argo` есть и SA `argo-workflows-api-client-fleet` — какой из них нужен, вопрос Ф1). Namespace `swe-bench-v2-20260308` в README и шаблонах fleet для этого проброса указан ошибочно: там живёт только `workflow-controller`, сервер Argo — в namespace `argo`. Argo UI также доступен по ingress `https://fleet-argo.sberai-rnd.ru`, но только через SOCKS бастиона.
 
 **Режим сервера.** На сервере сервис работает как systemd user unit или в tmux и слушает `127.0.0.1:8080`. С Mac к UI ходим через ssh-туннель, и вот здесь autossh как раз нужен: туннель переживёт смену Wi-Fi и сон ноутбука.
 
@@ -452,7 +456,7 @@ autossh -M 0 -N -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -L 8080:127.0
 
 | Что | Выбор | Почему |
 | --- | --- | --- |
-| UI | NiceGUI | формы, таблицы, диалоги и живое обновление по websocket на чистом Python |
+| UI | NiceGUI | формы, таблицы, диалоги и живое обновление по websocket на чистом Python; 3.18.0 с PyPI (PyPI с Mac доступен напрямую, зеркало gitverse сервису не нужно) |
 | Фоновые циклы | asyncio в том же процессе | один процесс, без очередей и брокеров |
 | Хранилище | SQLite | журнал прогонов, сессий, аудита в одном файле |
 | Kubernetes | официальный клиент `kubernetes` + `kubectl` для exec и port-forward | клиент для чтения и patch, `kubectl` там, где так делает и fleet |
@@ -534,6 +538,30 @@ fleet-console/
 - [ ] Есть ли у MLSC своё время жизни приложения — страховка на случай сна Mac?
 - [ ] Работает ли override `main.run=[…]` со списком в CLI fleet?
 - [ ] Собираются ли шаги `mlsc.*` из `exp.yaml` без групп harbor?
-- [ ] Имена и порты сервисов litellm и nginx, нужен ли ключ litellm?
+- [x] Имена и порты сервисов litellm и nginx — см. «Модель без бенча» (2026-10-21).
+- [ ] Нужен ли ключ litellm?
+- [ ] Токен Argo для UI: SA `argo-server` в `argo` (как в fleet) или `argo-workflows-api-client-fleet`? Проверить `kubectl -n argo create token …` на Ф1.
+- [ ] Нужен ли сервису проброс до Argo вообще: сам он читает CRD через Kubernetes API, а Argo UI доступен и по ingress через SOCKS бастиона.
 - [ ] Безопасен ли повторный `submitter_launch` и как остановить сабмиттер одного прогона — достаточно ли лимита 0?
 - [ ] Пригодно ли S3-зеркало `harbor_datasets` для локальной материализации?
+
+### Закрытые вопросы Ф0 (проверено 2026-10-21)
+
+Всё ниже снято командами только на чтение: `kubectl get/describe/auth can-i`, `git` в `/Users/afsautin/repos/fleet` и в scratch-копии, `fleet --print-config` на локальном `.venv` fleet без `uv sync`. Единственное, что поднималось, — `ssh -N fleetbastion` и `kubectl port-forward` до Argo на время проверки.
+
+| Вопрос | Ответ | Как проверено |
+| --- | --- | --- |
+| Как сервис попадает в кластер | только через `ssh fleetbastion` (`LocalForward 8443`, `DynamicForward 1080`); без него `kubectl` даёт `connection refused` | `kubectl config view --minify`, `~/.ssh/config`, `kubectl get --raw /readyz` после `ssh -N fleetbastion` |
+| Где Argo Server и как к нему ходить | `-n argo service/argo-workflows-server:2746`, `--auth-mode=client`; без токена API 401, UI `/` 200; ingress `https://fleet-argo.sberai-rnd.ru` только через SOCKS | `kubectl get svc -A`, args деплоймента, `curl` через port-forward и через `--socks5-hostname 127.0.0.1:1080` |
+| Права kubeconfig | все нужные: get/list/watch/patch/delete workflows, pods/exec в `swe-bench-v2-20260308` и `vllm-proxy`, configmaps в `vllm-proxy`, portforward в `swe-bench-v2-20260308`, `vllm-proxy`, `litellm-argo`, `argo`, get nodes, create token | `kubectl auth can-i …` |
+| Под MLSC | deployment `litellm-noauth` в `vllm-proxy`, под `litellm-noauth-6588c4c7cf-sbhpg` = значение в `mlsc/common.yaml` master | `kubectl -n vllm-proxy get deploy,pods` |
+| Submitter-под и пул узлов | `fleet-submitter-python` Running (29 дней); 45 узлов `type=bench`; 205 workflows в namespace, лейбл `fleet/run-name` на месте | `kubectl -n swe-bench-v2-20260308 get pods`, `get nodes -l type=bench`, `get workflows` |
+| Зеркало и worktree | `git clone --mirror` 52 МБ; worktree из bare-репозитория создаётся, чистый | scratch-копия в `/private/tmp/…/wtprobe` |
+| `uv sync --frozen` в worktree | 24 с при тёплом кеше, `.venv` 578 МБ; `git+ssh` к `gitverse.ru:2222` работает напрямую; `pypi-mirror.gitverse.ru` — только через SOCKS бастиона (напрямую TLS-таймаут) | `uv sync --frozen` с `HTTPS_PROXY=socks5h://127.0.0.1:1080` и без |
+| `--print-config` | есть на master и в 67 из 87 веток; работает офлайн при заглушках `oc.env`; ~1.7 с | `fleet … --print-config` на `config.yaml` и `experiment_template.yaml` |
+| Секции-шаги в итоговом конфиге master | `system.{materialize,topology_saver,task_artifacts_upload,runtime_upload,task_loader,workflow_builder,submitter,manifest_runner,pod_upload,submitter_launch,requeue_failed,measure_run}`, `mlsc.{create_job,start_llm,check_llm_works,wait_first_litellm_job,wait_first_nginx_model,stop_llm,create_agent_limit,autoscale_agents_start,autoscale_agents_stop,monitor}`; `main.run` — список строк | разбор `resolved.yaml` |
+| Расхождение ревизий | 61 из 87 веток без `examples/harbor_new/configs`; 20 без `--print-config`; `ops.monitor` нигде нет; Harbor 0.22.0 везде кроме одной ветки (0.23.0); `uv.lock` есть везде | `git cat-file -e`, `git grep` по `origin/*` |
+| Каталог и шапки | шапки есть во всех группах формы, нет в `datasets/`; `# @package` в первой строке у 37 файлов | `head -1` по файлам групп |
+| Точка входа CLI | `fleet = "fleet.main:main"`, `fleet CONFIG -o k=v --print-config`; вызывать `uv run --project <wt> --no-sync fleet` | `pyproject.toml`, `fleet --help` |
+| Стек сервиса | uv 0.12, NiceGUI 3.18.0, Python 3.12.14 (uv-managed) резолвятся с PyPI за 2,5 с | `uv lock` в scratch-проекте |
+
