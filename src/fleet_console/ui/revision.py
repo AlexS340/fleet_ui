@@ -34,7 +34,8 @@ async def revision_page(ctx: AppContext) -> None:
         p = ctx.manager.progress
         if p.busy:
             ui.linear_progress(show_value=False).props("indeterminate").classes("w-full")
-            ui.label(f"{p.ref} {p.sha[:8]}: {PHASES.get(p.phase, p.phase)}".strip()).classes("text-sm")
+            what = f"{p.ref} {p.sha[:8]}".strip()
+            ui.label((what + ": " if what else "") + PHASES.get(p.phase, p.phase)).classes("text-sm")
             tail = list(p.log)[-8:]
             if tail:
                 ui.label("\n".join(tail)).classes("whitespace-pre-wrap font-mono text-xs opacity-80 w-full")
@@ -122,17 +123,28 @@ async def revision_page(ctx: AppContext) -> None:
             ref_input.classes("min-w-[12rem]")
             prepare_button = ui.button("Подготовить ревизию", on_click=prepare).props("unelevated no-caps")
         if not ctx.manager.mirror.exists():
-            ui.label("Зеркало fleet ещё не склонировано — ход клонирования ниже.").classes("text-sm opacity-80")
+            ui.label("Зеркало fleet ещё не склонировано — ветки появятся сами, когда клонирование закончится.").classes(
+                "text-sm opacity-80"
+            )
         info_view()
         progress_view()
         result_view()
 
-    if ctx.manager.mirror.exists():
+    async def load_branches() -> None:
         branches = await ctx.manager.branches()
         names = [b.name for b in branches]
         options = {b.name: f"{b.name} · {b.date:%d.%m} · {b.author}" for b in branches}
         branch_select.set_options(options, value="master" if "master" in names else (names[0] if names else None))
-    ui.timer(1.0, progress_view.refresh)
+        state["loaded"] = True
+
+    async def tick() -> None:
+        progress_view.refresh()
+        if not state.get("loaded") and ctx.manager.mirror.exists() and not ctx.manager.progress.busy:
+            await load_branches()  # зеркало появилось после открытия страницы
+
+    if ctx.manager.mirror.exists():
+        await load_branches()
+    ui.timer(1.0, tick)
 
 
 def _catalog(ctx: AppContext, worktree: Path) -> None:
