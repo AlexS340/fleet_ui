@@ -2,6 +2,8 @@
 
 import json
 
+from fleet_console.runner import Result
+
 ARGO_TEXT = (
     "wf-a-1\tRunning\trun-a\tGLM\t2026-10-21T05:00:00Z\t\n"
     "wf-a-2\tSucceeded\trun-a\tGLM\t2026-10-21T04:00:00Z\t2026-10-21T04:30:00Z\n"
@@ -38,6 +40,25 @@ upstream Qwen3 {
 
 SUBMITTER_TEXT = "run-a\t40\t12\t30\t5\t1\t1761022800\nrun-b\t\t0\t0\t90\t0\t1760950800\n"
 
+TASKS_TEXT = (
+    "h-cowork-b01-x\tSucceeded\tterminus-2-cowork-tasks-t1-0\tcowork/terminus-2/results/t1-0\t2026-10-21T05:00:00Z\t2026-10-21T05:20:00Z\t\n"
+    "h-cowork-b01-y\tFailed\tterminus-2-cowork-tasks-t2-0\tcowork/terminus-2/results/t2-0\t2026-10-21T05:00:00Z\t2026-10-21T05:05:00Z\tpod failed\n"
+    "h-cowork-b02-z\tRunning\tterminus-2-cowork-tasks-t3-0\tcowork/terminus-2/results/t3-0\t2026-10-21T05:30:00Z\t\t\n"
+)
+
+S3_LS = (
+    "2026-10-21 05:19:00        120 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t1-0/harbor_job.yaml\n"
+    "2026-10-21 05:19:00       2048 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t1-0/try1/runner.log\n"
+    "2026-10-21 05:19:00          0 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t1-0/try1/COMPLETED\n"
+    "2026-10-21 05:04:00        512 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t2-0/try1/runner.log\n"
+    "2026-10-21 05:04:00          0 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t2-0/try1/FAILED\n"
+    "2026-10-21 05:09:00        640 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t2-0/try2/runner.log\n"
+    "2026-10-21 05:09:00       1000 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t2-0/try2/polar_trajectories/polar_trajectories.tar.gz\n"
+    "2026-10-21 05:09:00          0 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t2-0/try2/FAILED\n"
+    "2026-10-21 05:30:00        100 swe-bench-v2-20260308/GLM/run-a/cowork/terminus-2/results/t3-0/harbor_job.yaml\n"
+    "2026-10-21 04:00:00       9000 swe-bench-v2-20260308/GLM/run-a/scripts/dind_runner.py\n"
+)
+
 NODES_TEXT = (
     "bench-1\t\tTrue\t95500m\t1456Gi\n"
     "bench-2\t\tTrue\t96\t1500000000Ki\n"
@@ -56,3 +77,11 @@ def install(fake, namespace: str = "swe-bench-v2-20260308") -> None:
     fake.on("kubectl", "exec", "-n", namespace, "fleet-submitter-python", "--", "tail", stdout="[1/3] submitted wf-a-1\n")
     fake.on("kubectl", "get", "nodes", stdout=NODES_TEXT)
     fake.on("kubectl", "-n", namespace, "get", "pods", stdout="pod/x\npod/y\n")
+    fake.on("kubectl", "get", "workflows", "-n", namespace, "-l", stdout=TASKS_TEXT)
+    fake.on("kubectl", "logs", "-n", namespace, stdout="[pod/h-cowork-b02-z-123/main] harbor run started\n")
+    def s3_ls(argv: tuple[str, ...]) -> Result:  # ключи под запрошенным префиксом прогона
+        key = argv[-1].removeprefix("s3://").partition("/")[2].strip("/")
+        return Result(argv, 0, S3_LS.replace("swe-bench-v2-20260308/GLM/run-a/", key + "/"))
+
+    fake.on("aws", "s3", "ls", "--recursive", result=s3_ls)
+    fake.on("sh", "-c", stdout="runner log line 1\nrunner log line 2\n")  # aws s3 cp <uri> - | head -c N

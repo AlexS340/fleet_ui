@@ -224,6 +224,23 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.should_see("замер (Benchboard) · код 0")
     await user.should_see("Замер заново")
     await user.should_see("Журнал")
+    await user.should_see("Benchboard")
+    # задачи: workflows Argo + результаты в S3 (попытки tryN, флаги), фильтр «только упавшие»
+    await user.should_see("workflows: 3 · задач в S3: 3, COMPLETED 1, FAILED 1")
+    tasks_table = user.find(marker="bench-tasks").elements.pop()
+    assert [r["task"] for r in tasks_table.rows] == ["t1-0", "t2-0", "t3-0"]
+    assert tasks_table.rows[1]["phase"] == "упал" and tasks_table.rows[1]["result"] == "2 · FAILED" and tasks_table.rows[1]["duration"] == "0:05:00"
+    assert tasks_table.rows[2]["result"] == "0 · попыток нет" and tasks_table.rows[0]["result"] == "1 · COMPLETED"
+    user.find("только упавшие").click()
+    assert [r["task"] for r in tasks_table.rows] == ["t2-0"]
+    user.find(marker="bench-tasks").trigger("rowClick", [None, tasks_table.rows[0]])
+    await user.should_see("S3: попыток 2 · итог FAILED")
+    await user.should_see("polar_trajectories/polar_trajectories.tar.gz")
+    await user.should_see("pod failed")
+    user.find("показать").click()
+    await user.should_see("runner log line 2")
+    user.find("Лог упавшего воркера модели").click()
+    await user.should_see("MLSC: последний упавший воркер")
 
 
 async def test_benches_page_full_config_and_manual_edit(user: User) -> None:

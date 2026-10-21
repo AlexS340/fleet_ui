@@ -130,6 +130,11 @@ class Settings(BaseModel):
     session_grace_minutes: int = 10
     # Локальный корень датасетов Harbor (FLEET_DATASETS_ROOT для fleet); пусто — из окружения сервиса.
     datasets_root: str = ""
+    # S3 результатов и датасетов: endpoint и регион как у boto3-клиентов fleet (fleet/s3_upload.py); сервис ходит через `aws` CLI.
+    s3_endpoint: str = "https://obs.ru-moscow-1.hc.sbercloud.ru"
+    s3_region: str = "ru-moscow-1"
+    # Benchboard: прогон после замера виден в каталоге по модели и run_id; прямых ссылок на прогон у него нет.
+    benchboard_url: str = "https://fleet-benchboard.sberai-rnd.ru"
     bench: Bench = Field(default_factory=Bench)
 
     def datasets_root_path(self) -> Path | None:

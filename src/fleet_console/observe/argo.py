@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fleet_console.observe._time import parse_k8s_time
 from fleet_console.runner import CommandError, Runner
@@ -100,3 +100,74 @@ async def list_runs(runner: Runner, namespace: str) -> list[Run]:
 
 def argo_ui_url(base: str, namespace: str, run_name: str) -> str:
     return f"{base.rstrip('/')}/workflows/{namespace}?label=fleet%2Frun-name%3D{run_name}"
+
+
+# --- задачи одного прогона ------------------------------------------------------------
+
+TASK_JSONPATH = (
+    'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.status.phase}{"\\t"}'
+    "{.metadata.labels['fleet/results-instance']}{\"\\t\"}{.metadata.annotations['fleet/results-rel']}{\"\\t\"}"
+    '{.status.startedAt}{"\\t"}{.status.finishedAt}{"\\t"}{.status.message}{"\\n"}{end}'
+)
+POD_WORKFLOW_LABEL = "workflows.argoproj.io/workflow"
+
+
+@dataclass(frozen=True)
+class TaskWorkflow:
+    """Workflow одной задачи: лейбл fleet/results-instance и аннотация fleet/results-rel (папка результатов в S3)."""
+
+    name: str
+    phase: str
+    instance: str
+    results_rel: str
+    started: datetime | None
+    finished: datetime | None
+    message: str = ""
+
+    @property
+    def task(self) -> str:
+        return self.results_rel.rsplit("/", 1)[-1] or self.instance or self.name
+
+    @property
+    def failed(self) -> bool:
+        return self.phase in ("Failed", "Error")
+
+    @property
+    def active(self) -> bool:
+        return self.phase in ("Running", "Pending", "")
+
+    def duration(self, now: datetime) -> timedelta | None:
+        if self.started is None:
+            return None
+        return (self.finished or now) - self.started
+
+
+def parse_tasks(text: str) -> list[TaskWorkflow]:
+    out = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        name, phase, instance, rel, started, finished, message = (line.split("\t") + [""] * 7)[:7]
+        out.append(TaskWorkflow(name, phase, instance, rel, parse_k8s_time(started), parse_k8s_time(finished), message))
+    return sorted(out, key=lambda t: (t.task, t.started.isoformat() if t.started else ""))
+
+
+async def list_tasks(runner: Runner, namespace: str, run_name: str) -> list[TaskWorkflow]:
+    argv = ["kubectl", "get", "workflows", "-n", namespace, "-l", f"fleet/run-name={run_name}", "-o", TASK_JSONPATH]
+    result = await runner.run(argv, timeout=60)
+    if not result.ok:
+        raise CommandError(result)
+    return parse_tasks(result.stdout)
+
+
+async def pod_logs(runner: Runner, namespace: str, workflow: str, container: str = "main", lines: int = 200) -> str:
+    """Хвост лога контейнера пода задачи (пока под жив; в production он удаляется сразу после завершения)."""
+    argv = ["kubectl", "logs", "-n", namespace, "-l", f"{POD_WORKFLOW_LABEL}={workflow}", "-c", container, "--tail", str(lines), "--prefix"]
+    result = await runner.run(argv, timeout=60)
+    if not result.ok:
+        raise CommandError(result)
+    return result.stdout
+
+
+def workflow_url(base: str, namespace: str, name: str) -> str:
+    return f"{base.rstrip('/')}/workflows/{namespace}/{name}"

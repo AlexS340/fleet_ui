@@ -110,3 +110,17 @@ async def get_configuration(runner: Runner, namespace: str, pod: str, base_url: 
         return json.loads(result.stdout)
     except ValueError as exc:
         raise RuntimeError(f"MLSC вернул не JSON: {result.stdout[:200]!r}") from exc
+
+
+async def get_last_failed_log(runner: Runner, namespace: str, pod: str, base_url: str, token: str, version_id: int) -> str:
+    """Единственный лог, который отдаёт MLSC API: последний упавший воркер версии (как вкладка LLM в TUI fleet)."""
+    url = base_url.rstrip("/") + f"/api/v1/service/get_last_failed_log?application_version_id={int(version_id)}"
+    script = f'curl -sSf -k -H "Authorization: Bearer $(cat)" {shlex.quote(url)}'
+    result = await runner.run(["kubectl", "exec", "-i", "-n", namespace, pod, "--", "sh", "-c", script], stdin=token.strip(), timeout=60)
+    if not result.ok:
+        raise CommandError(result)
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError(f"MLSC вернул не JSON: {result.stdout[:200]!r}") from exc
+    return str((data or {}).get("log") or "") if isinstance(data, dict) else ""

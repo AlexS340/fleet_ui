@@ -7,7 +7,8 @@ harbor_job) → «Полный конфиг» (exp.yaml, файлы defaults с 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 from typing import Any
@@ -40,7 +41,8 @@ from fleet_console.context import AppContext
 from fleet_console.fleetref.manager import ReadyRevision
 from fleet_console.fleetref.profile import CONFIGS_REL, list_groups
 from fleet_console.models.compose import recipe_summary
-from fleet_console.observe.argo import argo_ui_url
+from fleet_console.observe.argo import TaskWorkflow, argo_ui_url, workflow_url
+from fleet_console.observe.s3 import S3Object, TaskResult, scan_results
 from fleet_console.presets import DatasetRef, compatibility, load_presets
 from fleet_console.runs import STAGE_TITLES, BenchError, dataset_of
 from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
@@ -59,6 +61,15 @@ COLUMNS = [
     {"name": "limit", "label": "Лимит", "field": "limit", "align": "right"},
     {"name": "started", "label": "Начат", "field": "started", "align": "left"},
 ]
+TASK_COLUMNS = [
+    {"name": "task", "label": "Задача", "field": "task", "align": "left", "sortable": True},
+    {"name": "phase", "label": "Argo", "field": "phase", "align": "left", "sortable": True},
+    {"name": "result", "label": "S3: попытки · итог", "field": "result", "align": "left"},
+    {"name": "duration", "label": "Длительность", "field": "duration", "align": "right"},
+    {"name": "name", "label": "Workflow", "field": "name", "align": "left"},
+]
+PHASE_TEXT = {"Running": "идёт", "Pending": "ждёт", "": "ждёт", "Succeeded": "успех", "Failed": "упал", "Error": "ошибка"}
+RESULT_TEXT = {"completed": "COMPLETED", "failed": "FAILED", "no_flag": "без флага", "no_attempt": "попыток нет"}
 CUSTOM_DATASET = "__custom__"
 OWN_MODEL_PREFIX = "recipe:"
 SESSION_PREFIX = "session:"
@@ -683,9 +694,14 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         base = ctx.settings.argo_ui_url
         with ui.row().classes("gap-3 flex-wrap text-sm"):
             ui.link("Argo UI по прогону", argo_ui_url(base, ctx.settings.namespace, run.id), new_tab=True)
+            if run.status == "done":
+                ui.link("Benchboard", ctx.settings.benchboard_url, new_tab=True)
+                hint("Прямых ссылок на прогон у Benchboard нет: ищите в каталоге по модели и run_id.")
             if preview.s3:
                 ui.label(f"S3: {preview.s3}").classes("opacity-70 break-all")
             ui.label(f"каталог: {run.dir}").classes("opacity-70 break-all")
+        for line in ctx.benches.measure_summary(run.id):
+            ui.label("замер: " + line).classes("text-sm")
         with ui.row().classes("items-end gap-2 flex-wrap"):
             if run.status == "running":
                 ui.button("Остановить прогон", on_click=lambda: _stop_dialog(ctx, run, refresh)).props("flat no-caps color=negative")
@@ -699,6 +715,7 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
                 ui.button("Замер заново", on_click=lambda: do(ctx.benches.measure(run.id))).props("flat no-caps")
             if run.active:
                 ui.label("лимит и реплики — в карточке прогона на странице «Кластер»").classes("text-xs opacity-60")
+        _tasks_section(ctx, run, preview.s3)
         ui.label("Стадии").classes("mt-2")
         stages = ctx.benches.stages(run.id)
         if not stages:
@@ -716,6 +733,183 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
                 ui.label("\n".join(f"{_when(e.ts)} {e.action} {e.result} {e.details}" for e in events)).classes("font-mono text-xs whitespace-pre-wrap")
         ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
     dialog.open()
+
+
+def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> None:
+    """Таблица задач прогона: фазы workflows Argo и результаты в S3 (попытки tryN, флаг COMPLETED/FAILED)."""
+    state: dict[str, Any] = {"rows": [], "results": {}, "tasks": {}}
+    ui.label("Задачи").classes("mt-2")
+    with ui.row().classes("items-center gap-3 flex-wrap"):
+        only_failed = ui.checkbox("только упавшие").props("dense")
+        ui.button("Обновить", on_click=lambda: load()).props("flat dense no-caps")
+        if s3_base:
+            ui.button("Файлы в S3", on_click=lambda: _s3_dialog(ctx, run, s3_base)).props("flat dense no-caps")
+        if run.version_id is not None or run.session_id:
+            ui.button("Лог упавшего воркера модели", on_click=lambda: _text_dialog(ctx, f"MLSC: последний упавший воркер · {run.id}", ctx.benches.model_log(run.id))).props(
+                "flat dense no-caps"
+            )
+            hint("MLSC API отдаёт один лог на версию — последнего упавшего воркера (как вкладка LLM в TUI fleet); логов живых реплик у него нет.")
+    note = ui.label("читаю workflows…").classes("text-xs opacity-70")
+    table = ui.table(columns=TASK_COLUMNS, rows=[], row_key="task").classes("w-full").props("dense flat").mark("bench-tasks")
+    table.on("rowClick", lambda e: _task_dialog(ctx, run, s3_base, e.args[1], state))
+
+    def render() -> None:
+        table.rows = [r for r in state["rows"] if not only_failed.value or r["failed"]]
+        table.update()
+
+    async def load() -> None:
+        now = datetime.now(timezone.utc)
+        try:
+            tasks = await ctx.benches.task_workflows(run.id)
+        except Exception as exc:  # noqa: BLE001 — kubectl недоступен: показываем причину
+            note.set_text(f"Argo: {exc}")
+            tasks = []
+        state["tasks"] = {t.task: t for t in tasks}
+        state["rows"] = _task_rows(tasks, {}, now)
+        render()
+        note.set_text(f"workflows: {len(tasks)} · S3: читаю…" if s3_base else f"workflows: {len(tasks)}")
+        if not s3_base:
+            return
+        try:
+            results = scan_results(await ctx.benches.s3_objects(run.id))
+        except Exception as exc:  # noqa: BLE001 — нет ключей или aws: таблица остаётся по Argo
+            note.set_text(f"workflows: {len(tasks)} · S3: {exc}")
+            return
+        state["results"] = results
+        state["rows"] = _task_rows(tasks, results, now)
+        render()
+        done = sum(1 for r in results.values() if r.status == "completed")
+        note.set_text(f"workflows: {len(tasks)} · задач в S3: {len(results)}, COMPLETED {done}, FAILED {sum(1 for r in results.values() if r.status == 'failed')}")
+
+    only_failed.on_value_change(lambda _: render())
+    ui.timer(0, load, once=True)
+
+
+def _task_rows(tasks: list[TaskWorkflow], results: dict[str, TaskResult], now: datetime) -> list[dict[str, Any]]:
+    by_task: dict[str, dict[str, Any]] = {}
+    for t in tasks:  # несколько workflows одной задачи (повторный сабмит) — последняя по времени
+        d = t.duration(now)
+        by_task[t.task] = {
+            "task": t.task, "phase": PHASE_TEXT.get(t.phase, t.phase), "name": t.name, "rel": t.results_rel, "duration": _hms(d), "failed": t.failed,
+            "message": t.message, "active": t.active, "result": "",
+        }
+    for rel, r in results.items():
+        row = by_task.setdefault(r.task, {"task": r.task, "phase": "—", "name": "", "rel": rel, "duration": "", "failed": False, "message": "", "active": False})
+        row["rel"] = row["rel"] or rel
+        row["result"] = f"{r.tries} · {RESULT_TEXT.get(r.status, r.status)}"
+        row["failed"] = row["failed"] or r.status == "failed"
+    return sorted(by_task.values(), key=lambda r: r["task"])
+
+
+def _hms(d: timedelta | None) -> str:
+    if d is None:
+        return ""
+    total = int(d.total_seconds())
+    return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def _task_dialog(ctx: AppContext, run: BenchRun, s3_base: str, row: dict[str, Any], state: dict[str, Any]) -> None:
+    """Одна задача: workflow в Argo, логи контейнеров живого пода, файлы последней попытки в S3."""
+    task = str(row.get("task", ""))
+    wf: TaskWorkflow | None = state["tasks"].get(task)
+    result: TaskResult | None = state["results"].get(row.get("rel", ""))
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-3xl"):
+        ui.label(task).classes("text-lg break-all")
+        with ui.row().classes("gap-3 flex-wrap text-sm items-center"):
+            if wf is not None:
+                ui.label(f"Argo: {PHASE_TEXT.get(wf.phase, wf.phase)} · {wf.name}")
+                ui.link("открыть в Argo UI", workflow_url(ctx.settings.argo_ui_url, ctx.settings.namespace, wf.name), new_tab=True)
+                if wf.message:
+                    ui.label(wf.message).classes("text-negative break-all")
+                if wf.active:
+                    for container in ("main", "dind-daemon"):
+                        ui.button(f"лог {container}", on_click=lambda c=container: _text_dialog(ctx, f"{wf.name} · {c}", ctx.benches.task_log(wf.name, c))).props("flat dense no-caps")
+            else:
+                ui.label("workflow в Argo не виден (удалён или ещё не создан)").classes("opacity-70")
+        if result is None:
+            ui.label("в S3 результатов нет" if s3_base else "путь S3 неизвестен").classes("text-sm opacity-70")
+        else:
+            n = result.tries
+            ui.label(f"S3: попыток {n} · итог {RESULT_TEXT.get(result.status, result.status)} · {s3_base.rstrip('/')}/{result.rel}").classes("text-sm break-all")
+            for obj in result.files:
+                uri = f"{s3_base.rstrip('/')}/{result.rel}/try{n}/{obj.key}"
+                with ui.row().classes("items-center gap-2 no-wrap text-xs"):
+                    ui.label(obj.key).classes("break-all")
+                    ui.label(_size(obj.size)).classes("opacity-60")
+                    if obj.is_text and obj.size:
+                        ui.button("показать", on_click=lambda u=uri: _text_dialog(ctx, u, ctx.benches.s3_text(u))).props("flat dense no-caps")
+        ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+    dialog.open()
+
+
+def _s3_dialog(ctx: AppContext, run: BenchRun, s3_base: str) -> None:
+    """Все объекты прогона в S3 с фильтром; текстовые можно открыть."""
+    columns = [
+        {"name": "key", "label": "Ключ", "field": "key", "align": "left", "sortable": True},
+        {"name": "size", "label": "Размер", "field": "size", "align": "right", "sortable": True},
+        {"name": "modified", "label": "Изменён", "field": "modified", "align": "left"},
+    ]
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
+        ui.label(s3_base).classes("text-sm break-all")
+        note = ui.label("читаю…").classes("text-xs opacity-70")
+        with ui.row().classes("items-center gap-3"):
+            filter_input = ui.input("фильтр").props("dense clearable").classes("w-64")
+        table = ui.table(columns=columns, rows=[], row_key="key").classes("w-full").props("dense flat")
+        table.style("max-height: 28rem")
+        filter_input.bind_value_to(table, "filter")
+        table.on("rowClick", lambda e: _open_if_text(ctx, s3_base, e.args[1]))
+        ui.label("клик по строке текстового файла — показать начало").classes("text-xs opacity-60")
+        ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+    dialog.open()
+
+    async def load() -> None:
+        try:
+            objects = await ctx.benches.s3_objects(run.id)
+        except Exception as exc:  # noqa: BLE001
+            note.set_text(str(exc))
+            note.classes("text-negative")
+            return
+        table.rows = [{"key": o.key, "size": _size(o.size), "modified": o.modified, "text": o.is_text and o.size > 0} for o in objects]
+        table.update()
+        note.set_text(f"объектов {len(objects)} · {_size(sum(o.size for o in objects))}")
+
+    ui.timer(0, load, once=True)
+
+
+def _open_if_text(ctx: AppContext, s3_base: str, row: dict[str, Any]) -> None:
+    if not row.get("text"):
+        ui.notify("не текстовый файл или пустой")
+        return
+    uri = f"{s3_base.rstrip('/')}/{row['key']}"
+    _text_dialog(ctx, uri, ctx.benches.s3_text(uri))
+
+
+def _size(n: int) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024 or unit == "ГБ":
+            return f"{n:.0f} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} ГБ"
+
+
+def _text_dialog(ctx: AppContext, title: str, text_coro) -> None:
+    """Диалог с текстом, который ещё читается: kubectl logs, MLSC, aws s3 cp. Секреты вырезаются при показе."""
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
+        ui.label(title).classes("text-xs opacity-60 break-all")
+        body = ui.label("читаю…").classes("font-mono text-xs whitespace-pre-wrap w-full").style("max-height: 32rem; overflow: auto")
+        ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+    dialog.open()
+
+    async def load() -> None:
+        try:
+            text = await text_coro
+        except Exception as exc:  # noqa: BLE001 — ошибку команды показываем в диалоге
+            body.set_text(str(exc))
+            body.classes("text-negative")
+            return
+        body.set_text(scrub(text, ctx.benches.secrets().values()) or "(пусто)")
+
+    ui.timer(0, load, once=True)
 
 
 def _duration(run: BenchRun) -> str:

@@ -26,6 +26,9 @@ from fleet_console.compose import BenchSpec, Preview, SessionLink
 from fleet_console.fleetref.profile import DUMMY_ENV
 from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
+from fleet_console.observe import argo, mlsc, s3
+from fleet_console.observe.argo import TaskWorkflow
+from fleet_console.observe.s3 import S3Object, aws_env
 from fleet_console.presets import DatasetRef
 from fleet_console.runner import CommandError, Runner, StageFiles, attach, kill_stage
 from fleet_console.settings import Paths, Settings, scrub
@@ -63,6 +66,7 @@ STAGE_TITLES = {
 }
 BEFORE_GPU = ("preflight", "materialize")
 REQUEUED_RE = re.compile(r"Перенесено submitted → pending: (\d+)/(\d+)")
+MEASURE_RE = re.compile(r"^\s*(\S+/\S+): (\d+(?:\.\d+)?)% \((.*)\)\s*$")  # строка benchboard на лист benchmark/agent
 
 
 class BenchError(RuntimeError):
@@ -163,6 +167,51 @@ class BenchManager:
             raise BenchError(f"нет {path}: каталог прогона удалён?") from exc
         session = self.session_link(run.session_id) if run.session_id else None
         return BenchSpec.from_json(text, pod=await self._pod(), session=session)
+
+    # --- карточка: задачи, логи, S3 -----------------------------------------------
+    def aws_env(self) -> dict[str, str]:
+        """Окружение `aws` CLI: ключи fleet и свой config с endpoint — команда повторяется в терминале как есть."""
+        return aws_env(self.secrets(), self.paths.home / "aws.cfg", self.settings.s3_endpoint, self.settings.s3_region)
+
+    async def task_workflows(self, run_id: str) -> list[TaskWorkflow]:
+        return await argo.list_tasks(self.runner, self.settings.namespace, run_id)
+
+    async def task_log(self, workflow: str, container: str = "main") -> str:
+        return await argo.pod_logs(self.runner, self.settings.namespace, workflow, container)
+
+    def s3_base(self, run_id: str) -> str:
+        base = str(self.get(run_id).preview.get("s3") or "")
+        if not base:
+            raise BenchError("в превью прогона нет пути S3: конфиг не собирался")
+        return base
+
+    async def s3_objects(self, run_id: str) -> list[S3Object]:
+        return await s3.ls(self.runner, self.s3_base(run_id), self.aws_env())
+
+    async def s3_text(self, uri: str) -> str:
+        return await s3.cat(self.runner, uri, self.aws_env())
+
+    async def model_log(self, run_id: str) -> str:
+        """Последний упавший воркер версии MLSC — единственный лог модели, который отдаёт API."""
+        run = self.get(run_id)
+        version_id = run.version_id
+        if version_id is None and run.session_id:
+            version_id = self.sessions.get(run.session_id).version_id
+        if version_id is None:
+            raise BenchError("version_id модели неизвестен: модель ещё не создавалась")
+        token = self.secrets().get("MLSC_TOKEN", "")
+        if not token:
+            raise BenchError("нет MLSC_TOKEN")
+        c = self.settings.cluster
+        return await mlsc.get_last_failed_log(self.runner, c.mlsc_namespace, await self.mlsc_pod(), c.mlsc_base_url, token, version_id)
+
+    def measure_summary(self, run_id: str) -> list[str]:
+        """Строки итогов benchboard из лога стадии measure: `<benchmark>/<agent>: <score>% (…)`."""
+        try:
+            text = (Path(self.get(run_id).dir) / "logs" / "measure.log").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        return [line.strip() for line in text.splitlines() if MEASURE_RE.match(line)]
 
     async def _pod(self) -> str:
         try:
