@@ -25,6 +25,13 @@ CREATE TABLE IF NOT EXISTS revisions (
     synced_at TEXT NOT NULL,
     last_used_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    version_id INTEGER,
+    model TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    adopted_at TEXT NOT NULL
+);
 """
 
 
@@ -49,6 +56,21 @@ class Revision:
     profile: dict[str, Any]
     synced_at: str
     last_used_at: str
+
+
+@dataclass(frozen=True)
+class OwnRun:
+    """Свой прогон: запущен сервисом (с Ф3) или усыновлён руками по run_id и version_id MLSC."""
+
+    run_id: str
+    version_id: int | None
+    model: str
+    note: str
+    adopted_at: str
+
+    def owns_version(self, version_id: int, application: str) -> bool:
+        """Версия MLSC этого прогона: по version_id или по run_id в имени приложения (шаблон job_base.yaml fleet)."""
+        return version_id == self.version_id or (bool(self.run_id) and self.run_id in application)
 
 
 class Store:
@@ -102,6 +124,27 @@ class Store:
     def revisions(self) -> list[Revision]:
         rows = self.conn.execute("SELECT * FROM revisions ORDER BY last_used_at DESC").fetchall()
         return [self._revision(r) for r in rows]
+
+    # --- свои прогоны ----------------------------------------------------
+    def adopt_run(self, run_id: str, version_id: int | None = None, model: str = "", note: str = "") -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO runs (run_id, version_id, model, note, adopted_at) VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(run_id) DO UPDATE SET version_id=excluded.version_id, model=excluded.model, note=excluded.note",
+                (run_id, version_id, model, note, _now()),
+            )
+
+    def get_run(self, run_id: str) -> OwnRun | None:
+        row = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        return OwnRun(**dict(row)) if row else None
+
+    def own_runs(self) -> dict[str, OwnRun]:
+        rows = self.conn.execute("SELECT * FROM runs ORDER BY adopted_at DESC").fetchall()
+        return {r["run_id"]: OwnRun(**dict(r)) for r in rows}
+
+    def forget_run(self, run_id: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
 
     @staticmethod
     def _revision(row: sqlite3.Row) -> Revision:

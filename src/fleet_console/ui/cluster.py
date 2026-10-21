@@ -36,6 +36,7 @@ def _col(name: str, label: str, align: str = "right") -> dict:
 RUN_COLUMNS = [
     _col("run", "Прогон", "left"),
     _col("model", "Модель", "left"),
+    _col("own", "Свой", "left"),
     _col("running", "Идут"),
     _col("pending", "В очереди"),
     _col("succeeded", "Успешно"),
@@ -48,6 +49,7 @@ MLSC_COLUMNS = [
     _col("id", "version_id", "left"),
     _col("application", "Приложение", "left"),
     _col("model", "Модель", "left"),
+    _col("own", "Свой", "left"),
     _col("planned", "План"),
     _col("current", "Факт"),
     _col("instance", "Тип инстанса", "left"),
@@ -121,6 +123,7 @@ async def cluster_page(ctx: AppContext) -> None:
             ui.button("Обновить", on_click=refresh).props("flat no-caps")
         runs = _Card(obs.runs, RUN_COLUMNS, "run")
         runs.table.add_slot("body-cell-argo", LINK_SLOT)
+        runs.table.on("rowClick", lambda e: _run_dialog(ctx, e.args[1], render))
         mlsc = _Card(obs.mlsc, MLSC_COLUMNS, "id")
         route = _Card(obs.nginx, NGINX_COLUMNS, "model")
         sub = _Card(obs.submitter, SUBMITTER_COLUMNS, "run")
@@ -131,7 +134,7 @@ async def cluster_page(ctx: AppContext) -> None:
     def render() -> None:
         state["version"] = obs.version
         _render_runs(runs, ctx, state["only_active"])
-        _render_mlsc(mlsc)
+        _render_mlsc(mlsc, ctx)
         _render_nginx(route)
         _render_submitter(sub, state["only_active"])
         _render_nodes(nodes)
@@ -154,10 +157,12 @@ def _render_runs(card: _Card, ctx: AppContext, only_active: bool) -> None:
     all_runs = card.source.data
     shown = [r for r in all_runs if r.active] if only_active else all_runs
     base = ctx.settings.argo_ui_url.rstrip("/")
+    own = ctx.store.own_runs()
     rows = [
         {
             "run": r.run_name,
             "model": r.model or "—",
+            "own": "да" if r.run_name in own else "—",
             "running": r.running,
             "pending": r.pending,
             "succeeded": r.succeeded,
@@ -169,20 +174,24 @@ def _render_runs(card: _Card, ctx: AppContext, only_active: bool) -> None:
         for r in shown
     ]
     summary = "" if shown else f"активных прогонов нет (всего {len(all_runs)})"
-    note = f"скрыто завершённых прогонов: {len(all_runs) - len(shown)}" if len(shown) < len(all_runs) else ""
+    note = "клик по строке — усыновить чужой прогон или забыть свой"
+    if len(shown) < len(all_runs):
+        note += f" · скрыто завершённых прогонов: {len(all_runs) - len(shown)}"
     card.render(rows, summary, note)
 
 
-def _render_mlsc(card: _Card) -> None:
+def _render_mlsc(card: _Card, ctx: AppContext) -> None:
     if card.source.data is None:
         card.render()
         return
     versions = card.source.data
+    own = ctx.store.own_runs().values()
     rows = [
         {
             "id": v.version_id,
             "application": v.application,
             "model": v.model or "—",
+            "own": "да" if any(o.owns_version(v.version_id, v.application) for o in own) else "—",
             "planned": v.planned,
             "current": v.current,
             "instance": v.instance_type or "—",
@@ -238,6 +247,44 @@ def _render_nodes(card: _Card) -> None:
         f"подов в Pending: {p.pending_pods}",
     ]
     card.render(summary=" · ".join(facts))
+
+
+def _run_dialog(ctx: AppContext, row: dict, on_change) -> None:  # noqa: ANN001 — колбэк перерисовки страницы
+    """Чужой прогон — усыновить (run_id, version_id MLSC, заметка); свой — забыть."""
+    run_id = row["run"]
+    own = ctx.store.get_run(run_id)
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
+        ui.label(run_id).classes("text-lg break-all")
+        if own:
+            adopted = _when(datetime.fromisoformat(own.adopted_at))
+            facts = ["свой", f"version_id MLSC: {own.version_id if own.version_id is not None else '—'}", f"усыновлён {adopted}"]
+            ui.label(" · ".join(facts + ([own.note] if own.note else []))).classes("text-sm")
+
+            def forget() -> None:
+                ctx.store.forget_run(run_id)
+                ctx.store.event("forget_run", run_id, "ok")
+                dialog.close()
+                on_change()
+                ui.notify(f"{run_id}: больше не свой")
+
+            ui.button("Забыть", on_click=forget).props("flat no-caps")
+        else:
+            ui.label("Чужой прогон: запущен не из сервиса. Усыновлённым можно управлять (с Ф2).").classes("text-sm opacity-80")
+            suggested = next((v.version_id for v in ctx.observer.mlsc.data or [] if run_id in v.application), None)
+            version = ui.number("version_id MLSC (необязательно)", value=suggested, precision=0, min=0).classes("w-full")
+            ui.label("version_id — в карточке «Модели MLSC» у версии, чьё приложение содержит run_id").classes("text-xs opacity-60")
+            note = ui.input("Заметка").classes("w-full")
+
+            def adopt() -> None:
+                version_id = int(version.value) if version.value else None
+                ctx.store.adopt_run(run_id, version_id, model=row.get("model", ""), note=note.value.strip())
+                ctx.store.event("adopt_run", run_id, "ok", f"version_id={version_id}")
+                dialog.close()
+                on_change()
+                ui.notify(f"{run_id}: теперь свой")
+
+            ui.button("Усыновить", on_click=adopt).props("unelevated no-caps")
+    dialog.open()
 
 
 async def _log_dialog(ctx: AppContext, run_id: str) -> None:

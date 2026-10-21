@@ -26,3 +26,19 @@ def test_revisions_crud(tmp_path: Path) -> None:
     store.delete_revision("abc")
     assert store.revisions() == []
     store.close()
+
+
+def test_own_runs_adopt_and_forget(tmp_path: Path) -> None:
+    store = Store(tmp_path / "c.sqlite")
+    assert store.get_run("run-a") is None and store.own_runs() == {}
+    store.adopt_run("run-a", 41, model="GLM", note="ручной smoke")
+    run = store.get_run("run-a")
+    assert run and run.version_id == 41 and run.note == "ручной smoke" and run.adopted_at
+    assert run.owns_version(41, "whatever") and run.owns_version(7, "gigacode-fleet-egbulychev run-a")
+    assert not run.owns_version(7, "someone else")
+    store.adopt_run("run-a", None)  # повтор — обновление, не ошибка
+    assert store.get_run("run-a").version_id is None
+    assert list(store.own_runs()) == ["run-a"]
+    store.forget_run("run-a")
+    assert store.own_runs() == {}
+    store.close()

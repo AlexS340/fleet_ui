@@ -94,3 +94,16 @@ async def test_cluster_page_shows_all_sources(user: User) -> None:
     assert "label=fleet%2Frun-name%3Drun-a" in runs.rows[0]["argo"]
     assert [m["model"] for m in models.rows] == ["GLM-5.3-Flash", "Qwen3"] and models.rows[0]["gpus"] == 24
     assert route.rows == [{"model": "GLM-5.3-Flash", "replicas": 2}, {"model": "Qwen3", "replicas": 1}]
+
+
+async def test_cluster_page_marks_own_runs(user: User) -> None:
+    fakes.CTX.store.adopt_run("run-a", 41, model="GLM")
+    try:
+        await user.open("/cluster")
+        user.find("Обновить").click()
+        await user.should_see("скрыто завершённых прогонов: 2")
+        tables = {t.columns[-1]["name"]: t for t in user.find(kind=ui.table).elements}
+        assert tables["argo"].rows[0]["own"] == "да"
+        assert [m["own"] for m in tables["gpus"].rows] == ["да", "—"]  # версия 41 своя, 42 чужая
+    finally:
+        fakes.CTX.store.forget_run("run-a")
