@@ -6,8 +6,6 @@ import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
-
 from fleet_console.catalog import CatalogEntry, scan
 from fleet_console.connect.kube import Kube, KubeStatus, required_checks
 from fleet_console.connect.supervisor import Forward, Supervisor, subprocess_spawner
@@ -19,7 +17,6 @@ from fleet_console.settings import Paths, Settings, default_home, read_secret
 from fleet_console.store import Store
 
 BASTION = "bastion"
-ARGO = "argo"
 KUBE_POLL_SEC = 30.0
 KUBE_RETRY_SEC = 5.0  # пока API-сервер не ответил (ssh ещё поднимается) — опрашиваем чаще
 
@@ -45,7 +42,7 @@ class AppContext:
 
     async def refresh_kube(self, with_permissions: bool = False) -> None:
         previous = self.kube_status
-        checks = required_checks(self.settings.namespace, self.settings.argo.namespace) if with_permissions else None
+        checks = required_checks(self.settings.namespace) if with_permissions else None
         status = await self.kube.status(checks)
         if not with_permissions and previous.permissions:
             status.permissions = previous.permissions  # права не зависят от связи: показываем последние известные
@@ -114,24 +111,7 @@ def build_context(home: Path | None = None) -> AppContext:
                 hint=f"Порты берутся из ~/.ssh/config (Host {host}). Руками: ssh -N {host}",
             )
         )
-    argo = settings.argo
-    argo_url = f"http://127.0.0.1:{argo.local_port}/"
-
-    async def argo_health() -> bool:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(argo_url)
-        return response.status_code in (200, 401)  # 401 = сервер жив, нужен токен
-
-    forwards.append(
-        Forward(
-            ARGO,
-            "Argo",
-            ["kubectl", "-n", argo.namespace, "port-forward", f"service/{argo.service}", f"{argo.local_port}:{argo.remote_port}"],
-            health=argo_health,
-            depends_on=BASTION if host else None,
-            hint=f"Argo UI: {argo_url} (auth-mode=client: нужен токен Kubernetes)",
-        )
-    )
+    # Проброс до Argo Server пока не делаем (решение 2026-10-21): наблюдение идёт через CRD по Kubernetes API.
     supervisor = Supervisor(forwards, subprocess_spawner, log_dir=paths.logs)
 
     def sync_gate() -> str | None:

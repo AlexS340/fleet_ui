@@ -18,7 +18,6 @@ async def test_header_and_branches(user: User) -> None:
     await user.should_see("Fleet Console")
     await user.should_see("internal · swe-bench-v2-20260308")
     await user.should_see("бастион")
-    await user.should_see("Argo")
     await user.should_see("fetch:")
     branch = _select(user, "Ветка")
     assert set(branch.options) == {"master", "feat/x"} and branch.value == "master"

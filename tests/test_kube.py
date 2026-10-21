@@ -13,7 +13,7 @@ def _runner(context="internal", ready=True, can_i="yes") -> FakeRunner:
 
 async def test_status_ok_with_permissions() -> None:
     kube = Kube(_runner(), ["internal"])
-    st = await kube.status(required_checks("ns", "argo"))
+    st = await kube.status(required_checks("ns"))
     assert st.context == "internal" and st.server == "https://127.0.0.1:8443"
     assert st.allowed and st.ready and st.error == ""
     assert st.permissions["list workflows.argoproj.io -n ns"] is True and st.missing_permissions == []
@@ -22,7 +22,7 @@ async def test_status_ok_with_permissions() -> None:
 
 async def test_status_context_not_allowed_stops_early() -> None:
     fake = _runner(context="prod")
-    st = await Kube(fake, ["internal"]).status(required_checks("ns", "argo"))
+    st = await Kube(fake, ["internal"]).status(required_checks("ns"))
     assert not st.allowed and "не в списке разрешённых" in st.error
     assert not any(c[0][:2] == ("kubectl", "get") for c in fake.calls)  # readyz не вызывался
 

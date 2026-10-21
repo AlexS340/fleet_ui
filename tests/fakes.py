@@ -38,11 +38,8 @@ class FakeSupervisor:
         async def ok() -> bool:
             return True
 
-        self.forwards = [
-            Forward("bastion", "бастион", ["ssh", "-N", "fleetbastion"], ok, hint="ssh -N fleetbastion"),
-            Forward("argo", "Argo", ["kubectl", "port-forward"], ok, depends_on="bastion"),
-        ]
-        self.states = {"bastion": ForwardState(status="green"), "argo": ForwardState(status="off", note="ждёт: бастион")}
+        self.forwards = [Forward("bastion", "бастион", ["ssh", "-N", "fleetbastion"], ok, hint="ssh -N fleetbastion")]
+        self.states = {"bastion": ForwardState(status="green")}
         self.restarted: list[str] = []
 
     def state(self, name: str) -> ForwardState:

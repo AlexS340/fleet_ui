@@ -65,15 +65,6 @@ class Bastion(BaseModel):
     socks_proxy: str = "socks5h://127.0.0.1:1080"
 
 
-class ArgoForward(BaseModel):
-    """Проброс до Argo Server для Argo UI."""
-
-    namespace: str = "argo"
-    service: str = "argo-workflows-server"
-    remote_port: int = 2746
-    local_port: int = 2746
-
-
 class Cluster(BaseModel):
     """Источники дашборда — свойства стенда, как system/cluster.yaml и mlsc/common.yaml в fleet."""
 
@@ -94,7 +85,6 @@ class Settings(BaseModel):
     allowed_contexts: list[str] = Field(default_factory=lambda: ["internal"])
     namespace: str = "swe-bench-v2-20260308"
     bastion: Bastion = Field(default_factory=Bastion)
-    argo: ArgoForward = Field(default_factory=ArgoForward)
     cluster: Cluster = Field(default_factory=Cluster)
     auto_fetch_minutes: int = 0
     worktree_ttl_days: int = 14

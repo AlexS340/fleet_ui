@@ -8,7 +8,6 @@ dependencies = [
     "nicegui>=3.18,<4",
     "pyyaml>=6.0",
     "pydantic>=2.6",
-    "httpx>=0.27",
 ]
 
 [project.scripts]

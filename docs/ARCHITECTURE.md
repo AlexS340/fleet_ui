@@ -392,7 +392,7 @@ Fleet это позволяет: подъём и гашение модели —
 | Проброс | Зачем | Проверка |
 | --- | --- | --- |
 | ssh-сессия к бастиону (`ssh -N fleetbastion`: API-сервер на 8443, SOCKS на 1080) | всё остальное: kubectl, `uv sync`, ingress-хосты | `kubectl get --raw /readyz` = `ok` |
-| Argo Server (`-n argo service/argo-workflows-server`, 2746) | Argo UI и шаги fleet, которым нужен Argo API (`mlsc.monitor` через hera; сервис его не вызывает) | `GET /` = 200; API без токена отвечает 401 — это тоже «жив» |
+| Argo Server (`-n argo service/argo-workflows-server`, 2746) — **пока не делаем** (решение 2026-10-21) | Argo UI; шагов fleet с Argo API сервис не вызывает | при надобности руками: `kubectl -n argo port-forward service/argo-workflows-server 2746`; API без токена отвечает 401 |
 | Шлюз моделей litellm или nginx | песочница и свои скрипты к vLLM | `GET /v1/models` |
 
 Процесс перезапускается, если он завершился, если проверка не прошла два раза подряд или если замечен выход Mac из сна. Пауза между попытками растёт экспоненциально до потолка. Статус каждого проброса виден в шапке: зелёный, жёлтый (переподключение) или красный.
@@ -545,7 +545,7 @@ fleet-console/
 - [x] Имена и порты сервисов litellm и nginx — см. «Модель без бенча» (2026-10-21).
 - [ ] Нужен ли ключ litellm?
 - [ ] Токен Argo для UI: SA `argo-server` в `argo` (как в fleet) или `argo-workflows-api-client-fleet`? Проверить `kubectl -n argo create token …` на Ф1.
-- [ ] Нужен ли сервису проброс до Argo вообще: сам он читает CRD через Kubernetes API, а Argo UI доступен и по ingress через SOCKS бастиона.
+- [x] Проброс до Argo сервис пока не держит (2026-10-21): наблюдение идёт через CRD по Kubernetes API, Argo UI — по ingress через SOCKS или ручным port-forward. Вернуться, если понадобятся ссылки в Argo UI из карточки прогона.
 - [ ] Безопасен ли повторный `submitter_launch` и как остановить сабмиттер одного прогона — достаточно ли лимита 0?
 - [ ] Пригодно ли S3-зеркало `harbor_datasets` для локальной материализации?
 

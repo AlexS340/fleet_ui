@@ -10,7 +10,7 @@ from fleet_console.runner import Runner
 Check = tuple[str, str, str | None]  # verb, resource, namespace
 
 
-def required_checks(namespace: str, argo_namespace: str) -> list[Check]:
+def required_checks(namespace: str) -> list[Check]:
     """Права, без которых сервис не сможет работать (Ф0–Ф2)."""
     return [
         ("list", "workflows.argoproj.io", namespace),
@@ -18,7 +18,7 @@ def required_checks(namespace: str, argo_namespace: str) -> list[Check]:
         ("create", "pods/exec", namespace),
         ("create", "pods/exec", "vllm-proxy"),
         ("get", "configmaps", "vllm-proxy"),
-        ("create", "pods/portforward", argo_namespace),
+        ("create", "pods/portforward", "vllm-proxy"),
         ("get", "nodes", None),
     ]
 
