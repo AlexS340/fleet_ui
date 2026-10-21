@@ -20,6 +20,7 @@ from fleet_console.store import Store
 BASTION = "bastion"
 ARGO = "argo"
 KUBE_POLL_SEC = 30.0
+KUBE_RETRY_SEC = 5.0  # пока API-сервер не ответил (ssh ещё поднимается) — опрашиваем чаще
 
 
 @dataclass
@@ -59,7 +60,7 @@ class AppContext:
     async def _kube_loop(self) -> None:
         await self.refresh_kube(with_permissions=True)
         while True:
-            await asyncio.sleep(KUBE_POLL_SEC)
+            await asyncio.sleep(KUBE_POLL_SEC if self.kube_status.ready else KUBE_RETRY_SEC)
             await self.refresh_kube(with_permissions=not self.kube_status.permissions)
 
     async def _mirror_init(self) -> None:
