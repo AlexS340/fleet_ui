@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "fleet-console",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "fleet-console"],
+      "port": 8080
+    }
+  ]
+}
