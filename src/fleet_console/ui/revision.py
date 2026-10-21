@@ -71,8 +71,9 @@ async def revision_page(ctx: AppContext) -> None:
                 ui.label(title).classes("text-warning" if pr.compatible else "text-negative")
                 for reason in pr.missing:
                     ui.label("• " + reason).classes("text-sm whitespace-pre-wrap")
-            with ui.expansion("Шаги fleet в этой ревизии", caption=f"{len(pr.steps)} секций с _target_").classes("w-full"):
-                ui.label("\n".join(pr.steps) or "нет").classes("font-mono text-sm whitespace-pre-wrap")
+            if pr.steps:
+                with ui.expansion("Шаги fleet в этой ревизии", caption=f"{len(pr.steps)} секций с _target_").classes("w-full"):
+                    ui.label("\n".join(pr.steps)).classes("font-mono text-sm whitespace-pre-wrap")
             _catalog(ctx, r.worktree)
 
     async def show_info() -> None:

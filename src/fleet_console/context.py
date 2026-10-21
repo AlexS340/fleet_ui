@@ -37,9 +37,19 @@ class AppContext:
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
         return scan(worktree)
 
+    def needs_permission_check(self) -> bool:
+        """Права проверяем, пока их не знаем или пока хоть одно «✗»: отказ бывает транзитным (ssh только поднялся)."""
+        return not self.kube_status.permissions or bool(self.kube_status.missing_permissions)
+
     async def refresh_kube(self, with_permissions: bool = False) -> None:
+        previous = self.kube_status
         checks = required_checks(self.settings.namespace, self.settings.argo.namespace) if with_permissions else None
-        self.kube_status = await self.kube.status(checks)
+        status = await self.kube.status(checks)
+        if not with_permissions and status.ready and previous.permissions:
+            status.permissions = previous.permissions  # статус пересоздаётся, а права без повторной проверки не теряем
+            if status.missing_permissions and not status.error:
+                status.error = "нет прав: " + ", ".join(status.missing_permissions)
+        self.kube_status = status
 
     async def startup(self) -> None:
         self._tasks = [
@@ -61,7 +71,7 @@ class AppContext:
         await self.refresh_kube(with_permissions=True)
         while True:
             await asyncio.sleep(KUBE_POLL_SEC if self.kube_status.ready else KUBE_RETRY_SEC)
-            await self.refresh_kube(with_permissions=not self.kube_status.permissions)
+            await self.refresh_kube(with_permissions=self.needs_permission_check())
 
     async def _mirror_init(self) -> None:
         try:
