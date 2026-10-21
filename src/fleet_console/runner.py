@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 from typing import Protocol
 
 Argv = Sequence[str]
@@ -64,6 +65,113 @@ class Runner(Protocol):
         log_path: Path | None = None,
         on_line: LineHook | None = None,
     ) -> Result: ...
+
+    async def detach(
+        self,
+        argv: Argv,
+        *,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        files: "StageFiles",
+    ) -> "Detached": ...
+
+
+@dataclass(frozen=True)
+class StageFiles:
+    """Файлы отделённой стадии: лог пишет сам дочерний процесс, pid и код выхода нужны для возобновления."""
+
+    log: Path
+    pid: Path
+    exit: Path
+
+    @classmethod
+    def for_stage(cls, logs_dir: Path, name: str) -> "StageFiles":
+        return cls(logs_dir / f"{name}.log", logs_dir / f"{name}.pid", logs_dir / f"{name}.exit")
+
+    def read_pid(self) -> int | None:
+        return _read_int(self.pid)
+
+    def read_exit(self) -> int | None:
+        return _read_int(self.exit)
+
+    def clear(self) -> None:
+        """Перед новым запуском: старые pid и код выхода не должны выдать себя за свежие. Лог остаётся (дописывается)."""
+        for path in (self.pid, self.exit):
+            path.unlink(missing_ok=True)
+
+    def alive(self) -> bool:
+        pid = self.read_pid()
+        return pid is not None and self.read_exit() is None and pid_alive(pid)
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def detached_argv(argv: Argv, files: StageFiles) -> list[str]:
+    """Обёртка sh: вывод в лог пишет сам процесс, код выхода — в файл; так стадия переживает перезапуск сервиса."""
+    script = (
+        f"{shlex.join(argv)} >> {shlex.quote(str(files.log))} 2>&1; code=$?; "
+        f"echo $code > {shlex.quote(str(files.exit))}; exit $code"
+    )
+    return ["sh", "-c", script]
+
+
+class Detached(Protocol):
+    pid: int
+
+    async def wait(self) -> int: ...
+
+
+class DetachedProcess:
+    """Стадия, запущенная этим процессом сервиса: ждём штатно, код берём из exit-файла."""
+
+    def __init__(self, proc: asyncio.subprocess.Process, files: StageFiles) -> None:
+        self.pid = proc.pid
+        self.proc = proc
+        self.files = files
+
+    async def wait(self) -> int:
+        await self.proc.wait()
+        code = self.files.read_exit()
+        return code if code is not None else (self.proc.returncode or 0)
+
+
+async def attach(files: StageFiles, poll: float = 1.0) -> int | None:
+    """После перезапуска сервиса: дождаться кода выхода живой стадии. None — процесс мёртв, а кода нет (убит)."""
+    while True:
+        code = files.read_exit()
+        if code is not None:
+            return code
+        pid = files.read_pid()
+        if pid is None or not pid_alive(pid):
+            return files.read_exit()
+        await asyncio.sleep(poll)
+
+
+def kill_stage(files: StageFiles) -> bool:
+    """SIGTERM всей группе процессов стадии (setsid): uv, fleet и их дети."""
+    pid = files.read_pid()
+    if pid is None or not pid_alive(pid):
+        return False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -156,6 +264,31 @@ class SubprocessRunner:
                 log.close()
         return Result(tuple(argv), code, "\n".join(lines), "")
 
+    async def detach(
+        self,
+        argv: Argv,
+        *,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        files: StageFiles,
+    ) -> DetachedProcess:
+        """Запустить стадию в собственной сессии (setsid): перезапуск сервиса её не убьёт, лог и код выхода на диске."""
+        files.log.parent.mkdir(parents=True, exist_ok=True)
+        files.clear()
+        with files.log.open("a", encoding="utf-8") as log:
+            log.write(f"$ {shlex.join(argv)}\n")
+        proc = await asyncio.create_subprocess_exec(
+            *detached_argv(argv, files),
+            cwd=cwd,
+            env=_merged_env(env),
+            start_new_session=True,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        files.pid.write_text(str(proc.pid), encoding="utf-8")
+        return DetachedProcess(proc, files)
+
 
 def _emit(line: str, lines: list[str], log, on_line: LineHook | None) -> None:
     line = ANSI.sub("", line).rstrip()
@@ -204,3 +337,23 @@ class FakeRunner:
             for line in result.stdout.splitlines():
                 on_line(line)
         return result
+
+    async def detach(self, argv: Argv, *, cwd=None, env=None, files: StageFiles) -> "FakeDetached":
+        """Как настоящая стадия, только мгновенно: лог, pid и код выхода на диске."""
+        result = await self._answer(argv, {"cwd": cwd, "env": dict(env or {}), "files": files})
+        files.log.parent.mkdir(parents=True, exist_ok=True)
+        files.clear()
+        with files.log.open("a", encoding="utf-8") as log:
+            log.write(f"$ {shlex.join(argv)}\n{result.stdout}\n")
+        files.pid.write_text("4242", encoding="utf-8")
+        files.exit.write_text(str(result.returncode), encoding="utf-8")
+        return FakeDetached(4242, result.returncode)
+
+
+@dataclass
+class FakeDetached:
+    pid: int
+    code: int
+
+    async def wait(self) -> int:
+        return self.code

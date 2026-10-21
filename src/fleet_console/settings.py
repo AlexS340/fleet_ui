@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable
 import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PRESETS_DIR = REPO_ROOT / "presets"  # пресеты бенчей, версионируются в git сервиса
+OVERLAY_DIR = REPO_ROOT / "overlay" / "configs"  # свои группы Hydra поверх групп ревизии fleet
+KNOWN_ISSUES = REPO_ROOT / "known_issues.yaml"
+# Секреты, которые уходят только в окружение подпроцессов fleet; в exp.yaml, resolved.yaml и логи не попадают.
+SECRET_NAMES = ("MLSC_TOKEN", "AWS_ACCESS_KEY_ID_gcvmfleet", "AWS_SECRET_ACCESS_KEY_gcvmfleet")
 
 SETTINGS_HEADER = (
     "# Настройки Fleet Console. Правятся здесь или на странице «Настройки».\n"
@@ -88,6 +96,15 @@ class Cluster(BaseModel):
     gateway_ports: dict[str, int] = Field(default_factory=lambda: {"litellm": 18080, "nginx": 18081})
 
 
+class Bench(BaseModel):
+    """Бенч-прогоны: опрос, requeue, автогашение без ответа."""
+
+    poll_seconds: int = 20  # цикл исполнения: лимит агентов, счётчики, завершение
+    requeue_rounds: int = 1  # раундов system.requeue_failed после первого прохода
+    attention_minutes: int = 30  # «требует внимания» без ответа → автогашение модели; 0 — не гасить
+    startup_grace_seconds: int = 90  # после submitter_launch: сабмиттер стартует асинхронно, workflows появляются не сразу
+
+
 class Settings(BaseModel):
     """Настройки сервиса; файл создаётся с дефолтами при первом запуске."""
 
@@ -104,6 +121,13 @@ class Settings(BaseModel):
     # Сессии моделей: время жизни по умолчанию и льготный интервал после уведомления до гашения.
     session_ttl_minutes: int = 120
     session_grace_minutes: int = 10
+    # Локальный корень датасетов Harbor (FLEET_DATASETS_ROOT для fleet); пусто — из окружения сервиса.
+    datasets_root: str = ""
+    bench: Bench = Field(default_factory=Bench)
+
+    def datasets_root_path(self) -> Path | None:
+        raw = self.datasets_root.strip() or os.environ.get("FLEET_DATASETS_ROOT", "").strip()
+        return Path(raw).expanduser() if raw else None
 
     @classmethod
     def load(cls, paths: Paths) -> "Settings":
@@ -133,3 +157,21 @@ def read_secret(paths: Paths, name: str) -> str | None:
         if line.startswith(f"{name}="):
             return line.split("=", 1)[1].strip().strip("\"'") or None
     return None
+
+
+def secrets_env(paths: Paths, names: Iterable[str] = SECRET_NAMES) -> dict[str, str]:
+    """Известные секреты, которые есть: окружение подпроцессов fleet."""
+    env = {}
+    for name in names:
+        value = read_secret(paths, name)
+        if value:
+            env[name] = value
+    return env
+
+
+def scrub(text: str, secrets: Iterable[str]) -> str:
+    """Вырезать значения секретов из текста перед записью на диск или показом в UI."""
+    for value in secrets:
+        if value and len(value) >= 6:
+            text = text.replace(value, "<secret>")
+    return text

@@ -1,0 +1,19 @@
+# Smoke-пресет для гейта Ф3: маленькая модель на 1 GPU, 3 задачи BIRD-SQL (sqlite), terminus-2.
+# Проверяет весь путь: материализация → подъём → сабмит → задачи → гашение → замер.
+name: qwen36-birdsql-smoke
+description: Qwen3.6-35B-A3B × birdsql_sqlite × terminus-2, 1 реплика, 3 задачи — проверка пути до замера
+fleet:
+  ref: master
+model: qwen36_35b_a3b            # mlsc/model: 1 GPU (a100plus.1gpu)
+model_name: Qwen3.6-35B-A3B-console   # суффикс: на кластере бывает чужая Qwen3.6-35B-A3B
+agent: terminus2                 # harbor/agent
+dataset: birdsql_sqlite          # harbor/dataset: в файле ревизии фильтр task_names на одну задачу — снимите его overrides
+resources:
+  jobs: 1
+  agents_per_replica: 3
+execution:
+  profile: production
+  task_limit: 3
+harbor_job:
+  agent_timeout_multiplier: 2.0
+  verifier_timeout_multiplier: 2.0

@@ -1,0 +1,18 @@
+# Полный SWE-bench Verified (500 задач) на Qwen3.6-35B-A3B: 4 реплики по 1 GPU, 10 агентов на реплику.
+name: qwen36-swe-verified
+description: Qwen3.6-35B-A3B × swe_bench_verified × uag_minimal_no_skills_0.3.0, 4 × 1 GPU, лимит 40
+fleet:
+  ref: master
+model: qwen36_35b_a3b
+model_name: Qwen3.6-35B-A3B-console
+agent: uag_minimal_no_skills_0.3.0
+dataset: swe_bench_verified
+resources:
+  jobs: 4
+  agents_per_replica: 10
+execution:
+  profile: production
+  task_limit: null
+harbor_job:
+  agent_timeout_multiplier: 2.0
+  verifier_timeout_multiplier: 2.0

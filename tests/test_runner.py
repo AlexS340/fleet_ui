@@ -63,3 +63,49 @@ async def test_child_env_drops_virtual_env_and_colors(monkeypatch, tmp_path: Pat
     code = "print('\\x1b[1m\\x1b[33mwarning\\x1b[39m: plain')"
     await SubprocessRunner().stream([sys.executable, "-c", code], on_line=seen.append)
     assert seen == ["warning: plain"]
+
+
+async def test_detached_stage_survives_and_reports_exit_code(tmp_path: Path) -> None:
+    from fleet_console.runner import StageFiles, attach, kill_stage
+
+    files = StageFiles.for_stage(tmp_path / "logs", "materialize")
+    code = "import sys; print('материализовано 3'); print('warn', file=sys.stderr); sys.exit(4)"
+    proc = await SubprocessRunner().detach([sys.executable, "-c", code], files=files, env={"PROBE": "x"})
+    assert files.read_pid() == proc.pid
+    assert await proc.wait() == 4
+    text = files.log.read_text(encoding="utf-8")
+    assert text.startswith("$ ") and "материализовано 3" in text and "warn" in text
+    assert files.read_exit() == 4 and await attach(files) == 4  # повторный attach читает код из файла
+    assert not files.alive() and not kill_stage(files)
+
+    files.clear()
+    assert files.read_pid() is None and files.read_exit() is None and files.log.exists()
+    files.pid.write_text("999999999")  # мёртвый pid без кода выхода — стадию убили
+    assert await attach(files, poll=0.01) is None
+
+
+async def test_detached_stage_can_be_attached_and_killed(tmp_path: Path) -> None:
+    import asyncio
+
+    from fleet_console.runner import StageFiles, attach, kill_stage
+
+    files = StageFiles.for_stage(tmp_path / "logs", "execute")
+    proc = await SubprocessRunner().detach([sys.executable, "-c", "import time; time.sleep(30)"], files=files)
+    await asyncio.sleep(0.2)
+    assert files.alive()
+    waiter = asyncio.create_task(attach(files, poll=0.05))
+    assert kill_stage(files)
+    code = await asyncio.wait_for(waiter, timeout=5)
+    assert code is None and not files.alive()  # убита вся группа вместе с sh: кода выхода нет — так менеджер узнаёт «убили»
+    await proc.wait()
+
+
+async def test_fake_runner_detach_writes_stage_files(tmp_path: Path) -> None:
+    from fleet_console.runner import StageFiles
+
+    fake = FakeRunner()
+    fake.on("uv", "run", stdout="ok\n", returncode=0)
+    files = StageFiles.for_stage(tmp_path, "s")
+    proc = await fake.detach(["uv", "run", "fleet"], files=files, cwd=tmp_path)
+    assert await proc.wait() == 0 and files.read_exit() == 0 and "ok" in files.log.read_text()
+    assert fake.calls[-1][1]["files"] is files

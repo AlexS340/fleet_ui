@@ -1,0 +1,8 @@
+# Известные несовместимости для preflight Fleet Console. Шаблоны — glob (fnmatch) по имени группы
+# harbor/agent, рецепта mlsc/model, датасета и версии Harbor ревизии; поле пропущено — не проверяется.
+# level: warn — предупреждение, которое можно принять; fail — запуск заблокирован.
+- id: terminus2-mcp-harbor-0.22
+  agent: "terminus2*"
+  harbor: "0.22.*"
+  level: warn
+  message: terminus-2 на Harbor 0.22 не подключает MCP как инструменты — задачи с MCP-серверами пройдут без них

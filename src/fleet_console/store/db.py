@@ -1,4 +1,4 @@
-"""SQLite: события (аудит) и кеш профилей ревизий по SHA."""
+"""SQLite: события (аудит), кеш профилей ревизий по SHA, свои прогоны, сессии моделей, бенч-прогоны."""
 
 from __future__ import annotations
 
@@ -63,9 +63,51 @@ CREATE TABLE IF NOT EXISTS session_stages (
     finished_at TEXT,
     returncode INTEGER
 );
+CREATE TABLE IF NOT EXISTS bench_runs (
+    id TEXT PRIMARY KEY,
+    preset TEXT NOT NULL DEFAULT '',
+    ref TEXT NOT NULL DEFAULT '',
+    sha TEXT NOT NULL DEFAULT '',
+    worktree TEXT NOT NULL DEFAULT '',
+    dir TEXT NOT NULL DEFAULT '',
+    recipe TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    agent TEXT NOT NULL DEFAULT '',
+    dataset TEXT NOT NULL DEFAULT '',
+    jobs INTEGER NOT NULL DEFAULT 1,
+    agents_per_replica INTEGER NOT NULL DEFAULT 1,
+    task_limit INTEGER,
+    inference TEXT NOT NULL DEFAULT 'litellm',
+    session_id TEXT,
+    status TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT '',
+    version_id INTEGER,
+    error TEXT NOT NULL DEFAULT '',
+    manual INTEGER NOT NULL DEFAULT 0,
+    requeues INTEGER NOT NULL DEFAULT 0,
+    agent_limit INTEGER,
+    counters_json TEXT NOT NULL DEFAULT '{}',
+    preview_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    attention_at TEXT,
+    finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS bench_stages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    command TEXT NOT NULL,
+    log_path TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    returncode INTEGER
+);
 """
 
 ACTIVE_SESSION_STATUSES = ("starting", "ready", "stopping", "attention")
+ACTIVE_BENCH_STATUSES = ("running", "attention", "stopping")
 
 
 def _now() -> str:
@@ -147,6 +189,74 @@ class Stage:
     stage: str
     command: str
     log_path: str
+    started_at: str
+    finished_at: str | None
+    returncode: int | None
+
+
+@dataclass
+class BenchRun:
+    """Бенч-прогон, запущенный сервисом: стадии fleet по журналу, своя или сессионная модель."""
+
+    id: str  # он же experiment.run_id и лейбл fleet/run-name
+    status: str  # running | attention | stopping | stopped | failed | done
+    created_at: str
+    preset: str = ""
+    ref: str = ""
+    sha: str = ""
+    worktree: str = ""
+    dir: str = ""
+    recipe: str = ""
+    model: str = ""
+    agent: str = ""
+    dataset: str = ""  # имя группы harbor/dataset или JSON {path, benchmark, mapping}
+    jobs: int = 1
+    agents_per_replica: int = 1
+    task_limit: int | None = None
+    inference: str = "litellm"
+    session_id: str | None = None  # бенч на уже поднятой сессии модели: подъём и гашение пропускаются
+    stage: str = ""
+    version_id: int | None = None
+    error: str = ""
+    manual: int = 0  # ручные правки конфига в каталоге прогона
+    requeues: int = 0  # сделано раундов requeue
+    agent_limit: int | None = None  # последнее записанное значение файла лимита
+    counters_json: str = "{}"
+    preview_json: str = "{}"
+    started_at: str | None = None
+    attention_at: str | None = None
+    finished_at: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.status in ACTIVE_BENCH_STATUSES
+
+    @property
+    def own_model(self) -> bool:
+        return self.session_id is None
+
+    @property
+    def holds_gpu(self) -> bool:
+        """Своя версия MLSC создана и не погашена."""
+        return self.own_model and self.version_id is not None and self.status not in {"stopped", "failed", "done"}
+
+    @property
+    def counters(self) -> dict[str, Any]:
+        return json.loads(self.counters_json or "{}")
+
+    @property
+    def preview(self) -> dict[str, Any]:
+        return json.loads(self.preview_json or "{}")
+
+
+@dataclass(frozen=True)
+class BenchStage:
+    id: int
+    run_id: str
+    stage: str
+    command: str
+    log_path: str
+    pid: int | None
     started_at: str
     finished_at: str | None
     returncode: int | None
@@ -267,6 +377,60 @@ class Store:
     def stages(self, session_id: str) -> list[Stage]:
         rows = self.conn.execute("SELECT * FROM session_stages WHERE session_id = ? ORDER BY id", (session_id,)).fetchall()
         return [Stage(**dict(r)) for r in rows]
+
+    # --- бенч-прогоны ----------------------------------------------------
+    def create_bench(self, run: BenchRun) -> None:
+        cols = [f.name for f in fields(BenchRun)]
+        with self.conn:
+            self.conn.execute(
+                f"INSERT INTO bench_runs ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                [getattr(run, c) for c in cols],
+            )
+
+    def update_bench(self, run_id: str, **values: Any) -> None:
+        if not values:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in values)
+        with self.conn:
+            self.conn.execute(f"UPDATE bench_runs SET {assignments} WHERE id = ?", [*values.values(), run_id])
+
+    def get_bench(self, run_id: str) -> BenchRun | None:
+        row = self.conn.execute("SELECT * FROM bench_runs WHERE id = ?", (run_id,)).fetchone()
+        return BenchRun(**dict(row)) if row else None
+
+    def benches(self, active_only: bool = False) -> list[BenchRun]:
+        sql = "SELECT * FROM bench_runs"
+        if active_only:
+            sql += " WHERE status IN (" + ", ".join("?" * len(ACTIVE_BENCH_STATUSES)) + ")"
+        rows = self.conn.execute(sql + " ORDER BY created_at DESC", ACTIVE_BENCH_STATUSES if active_only else ()).fetchall()
+        return [BenchRun(**dict(r)) for r in rows]
+
+    def start_bench_stage(self, run_id: str, stage: str, command: str, log_path: str = "", pid: int | None = None) -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO bench_stages (run_id, stage, command, log_path, pid, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, stage, command, log_path, pid, _now()),
+            )
+            return int(cur.lastrowid)
+
+    def set_bench_stage_pid(self, stage_id: int, pid: int | None) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE bench_stages SET pid = ? WHERE id = ?", (pid, stage_id))
+
+    def finish_bench_stage(self, stage_id: int, returncode: int | None) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE bench_stages SET finished_at = ?, returncode = ? WHERE id = ?", (_now(), returncode, stage_id))
+
+    def bench_stages(self, run_id: str) -> list[BenchStage]:
+        rows = self.conn.execute("SELECT * FROM bench_stages WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
+        return [BenchStage(**dict(r)) for r in rows]
+
+    def open_bench_stage(self, run_id: str) -> BenchStage | None:
+        """Последняя стадия без кода выхода — та, что шла, когда сервис перезапустили."""
+        row = self.conn.execute(
+            "SELECT * FROM bench_stages WHERE run_id = ? AND finished_at IS NULL ORDER BY id DESC LIMIT 1", (run_id,)
+        ).fetchone()
+        return BenchStage(**dict(row)) if row else None
 
     @staticmethod
     def _revision(row: sqlite3.Row) -> Revision:
