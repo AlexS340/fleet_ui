@@ -36,6 +36,7 @@ STEPS = [
 ]
 DATASETS_ROOT = Path(tempfile.mkdtemp(prefix="fleet-console-ui-data-"))
 RESOLVED = f"""system:
+  s3_datasets_root: s3://p-rndml-gcvmfleet/swe-bench-v2-20260308/harbor_datasets
   namespace: swe-bench-v2-20260308
   agent_image: registry/gc-cli-harbor:v0.3.0
   s3_base_directory: s3://p-rndml-gcvmfleet/swe-bench-v2-20260308/GLM/bench
@@ -210,7 +211,7 @@ def make_worktree(root: Path) -> Path:
         "harbor/job/default.yaml": "harbor_job: {}\n",
         "harbor/source/composed.yaml": "harbor_source: {}\n",
     }
-    (DATASETS_ROOT / "cowork" / "tasks").mkdir(parents=True, exist_ok=True)
+    (DATASETS_ROOT / "cowork" / "tasks" / "t1").mkdir(parents=True, exist_ok=True)  # хотя бы одна задача: пустой каталог preflight бракует
     for rel, text in files.items():
         (cfg / rel).parent.mkdir(parents=True, exist_ok=True)
         (cfg / rel).write_text(text, encoding="utf-8")
@@ -285,4 +286,7 @@ def make_context() -> AppContext:
         agent_limit=ctx.set_agent_limit, stop_tasks=lambda run_id: ctx.stop_own_run(run_id), sleep=fast_sleep, platform="linux",
     )
     sessions.paused = ctx.benches.busy_sessions
+    from fleet_console.compose import DatasetFetcher
+
+    ctx.datasets = DatasetFetcher(kubectl, paths.logs / "datasets", ctx.benches.aws_env, store.event)
     return ctx

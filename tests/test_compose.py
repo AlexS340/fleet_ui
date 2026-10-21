@@ -179,7 +179,7 @@ def _profile(steps=ALL_STEPS, harbor="0.22.0") -> Profile:
 
 def test_preflight_checks(tmp_path: Path) -> None:
     root = tmp_path / "data"
-    (root / "birdsql" / "sqlite" / "tasks").mkdir(parents=True)
+    (root / "birdsql" / "sqlite" / "tasks" / "bird_dev_0").mkdir(parents=True)  # пустой каталог задач — тоже ✗
     spec = spec_for(tmp_path)
     mappings, _ = build_registry(spec.worktree, spec.overlay, spec.run_dir)
     resolved = {**RESOLVED, "harbor_job": {**RESOLVED["harbor_job"], "datasets": [{"path": str(root / "birdsql" / "sqlite" / "tasks")}]}}
@@ -272,3 +272,64 @@ def test_save_to_overlay_and_three_way(tmp_path: Path) -> None:
     assert drift is not None and drift.summary == "harbor/agent/terminus2-mine.yaml: оригинал harbor/agent/terminus2.yaml изменился после ревизии 378874b3"
     assert "+    - name: terminus-3" in drift.diff_original and "-    - name: terminus-2" in drift.diff_original
     assert "+    - name: terminus-2-mine" in drift.diff_mine and "fleet-console" not in drift.diff_mine  # шапка overlay в diff не попадает
+
+
+def test_preflight_offers_dataset_fetch_when_dir_missing(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    (root / "swe_bench_verified" / "tasks").mkdir(parents=True)  # есть, но пустой
+    spec = spec_for(tmp_path)
+    mappings, _ = build_registry(spec.worktree, spec.overlay, spec.run_dir)
+    kube = KubeStatus(context="internal", allowed=True, ready=True, permissions={"get nodes": True})
+    common = dict(
+        secrets={}, kube=kube, profile=_profile(), own_model=True, resolve_error="", datasets_root=root, mappings=mappings, registry_errors=[],
+        foreign_models=set(), model_name="GLM", agent="terminus2", recipe="glm", dataset="birdsql_sqlite", issues=[],
+    )
+    missing = run_checks(
+        resolved={**RESOLVED, "harbor_job": {"datasets": [{"path": str(root / "birdsql" / "sqlite" / "tasks"), "task_names": ["bird_dev_0"]}]}}, **common
+    )
+    check = {c.key: c for c in missing}["dataset"]
+    assert check.level == "fail" and "можно скачать из S3 по реестру birdsql_sqlite" in check.detail
+    assert check.action == {"kind": "fetch_dataset", "mapping": "birdsql_sqlite", "path": str(root / "birdsql" / "sqlite" / "tasks"), "task_names": ["bird_dev_0"]}
+    empty = run_checks(resolved={**RESOLVED, "harbor_job": {"datasets": [{"path": str(root / "swe_bench_verified" / "tasks")}]}}, **common)
+    check = {c.key: c for c in empty}["dataset"]
+    assert "пустой каталог" in check.detail and check.action is not None and check.action["mapping"] == "swe"
+    unmapped = run_checks(resolved={**RESOLVED, "harbor_job": {"datasets": [{"path": str(root / "unknown" / "tasks")}]}}, **common)
+    check = {c.key: c for c in unmapped}["dataset"]
+    assert check.action is None and "маппинга в реестре для него нет" in check.detail
+
+
+async def test_dataset_fetch_plan_and_job(tmp_path: Path) -> None:
+    from fleet_console.compose import DatasetFetcher, plan_fetch
+    from fleet_console.compose.datasets import parse_prefixes
+    from fleet_console.runner import FakeRunner
+
+    spec = spec_for(tmp_path)
+    mappings, _ = build_registry(spec.worktree, spec.overlay, spec.run_dir)
+    mapping = next(m for m in mappings if m.name == "birdsql_sqlite")
+    root = tmp_path / "data"
+    plan = plan_fetch(mapping, root, "s3://p-rndml-gcvmfleet/swe-bench-v2-20260308/harbor_datasets/")
+    assert plan.src == "s3://p-rndml-gcvmfleet/swe-bench-v2-20260308/harbor_datasets/birdsql/sqlite/tasks/" and plan.dst == root / "birdsql" / "sqlite" / "tasks"
+    assert plan.argv == ["aws", "s3", "sync", plan.src, str(plan.dst)]
+    few = plan_fetch(mapping, root, "s3://b/ns/harbor_datasets", ("bird_dev_0", "bird_dev_1"))
+    assert few.argv[5:] == ["--exclude", "*", "--include", "bird_dev_0/*", "--include", "bird_dev_1/*"] and few.command.startswith("aws s3 sync s3://b/ns/harbor_datasets/birdsql/sqlite/tasks/ ")
+    assert parse_prefixes("                           PRE bird_dev_1/\n                           PRE bird_dev_0/\n2026-10-21 10:00:00   12 README.md\n") == ["bird_dev_0", "bird_dev_1"]
+
+    fake = FakeRunner()
+    fake.on("aws", "s3", "ls", stdout="                           PRE bird_dev_0/\n                           PRE bird_dev_1/\n")
+    fake.on("aws", "s3", "sync", stdout="download: s3://b/x/bird_dev_0/task.toml to bird_dev_0/task.toml\n")
+    events: list[tuple[str, str, str, str]] = []
+    fetcher = DatasetFetcher(fake, tmp_path / "logs", lambda: {"AWS_CONFIG_FILE": "/x"}, lambda *a: events.append(a))
+    assert await fetcher.task_dirs(plan.src) == ["bird_dev_0", "bird_dev_1"] and fake.calls[-1][1]["env"] == {"AWS_CONFIG_FILE": "/x"}
+    job = fetcher.fetch(few)
+    assert job.active and fetcher.job_for(few.dst) is job
+    with pytest.raises(RuntimeError, match="уже идёт"):
+        fetcher.fetch(few)
+    await job.task
+    assert job.status == "done" and job.returncode == 0 and job.lines == 1 and job.last.startswith("download:") and few.dst.is_dir()
+    assert job.log.read_text().startswith("download:") and events[-1][:3] == ("dataset_fetch", "birdsql_sqlite", "ok")
+    fake.on("aws", "s3", "sync", returncode=1)
+    fake.handlers.insert(0, fake.handlers.pop())  # теперь sync падает
+    failed = fetcher.fetch(few)
+    await failed.task
+    assert failed.status == "failed" and events[-1][2] == "error"

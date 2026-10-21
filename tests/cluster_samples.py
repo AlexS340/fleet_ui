@@ -84,4 +84,6 @@ def install(fake, namespace: str = "swe-bench-v2-20260308") -> None:
         return Result(argv, 0, S3_LS.replace("swe-bench-v2-20260308/GLM/run-a/", key + "/"))
 
     fake.on("aws", "s3", "ls", "--recursive", result=s3_ls)
+    fake.on("aws", "s3", "ls", stdout="                           PRE t1/\n                           PRE t2/\n                           PRE t3/\n                           PRE t4/\n")
+    fake.on("aws", "s3", "sync", stdout="download: s3://b/x/t1/task.toml to t1/task.toml\ndownload: s3://b/x/t2/task.toml to t2/task.toml\n")
     fake.on("sh", "-c", stdout="runner log line 1\nrunner log line 2\n")  # aws s3 cp <uri> - | head -c N

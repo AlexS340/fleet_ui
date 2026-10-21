@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from nicegui import ui
 from nicegui.testing import User
@@ -329,3 +330,34 @@ async def test_benches_page_warns_when_overlay_original_drifted(user: User) -> N
         await user.should_see("была → стала (ревизия)")
     finally:
         mine.unlink()
+
+
+async def test_benches_page_offers_dataset_download(user: User) -> None:
+    from fleet_console.connect.kube import KubeStatus
+
+    fakes.CTX.kube_status = KubeStatus(context="internal", server="s", allowed=True, ready=True, permissions={"get nodes": True})
+    await fakes.CTX.manager.prepare("master")
+    tasks_dir = fakes.DATASETS_ROOT / "cowork" / "tasks"
+    hidden = tasks_dir.with_name("tasks.hidden")
+    tasks_dir.rename(hidden)  # путь из resolved.yaml заглушки фиксирован: прячем сам каталог задач
+    try:
+        await user.open("/runs")
+        user.find("Запустить бенч").click()
+        await user.should_see("Пресет")
+        user.find("Превью и preflight").click()
+        await user.should_see("можно скачать из S3 по реестру cowork")
+        user.find("Скачать из S3").click()
+        await user.should_see("Скачать датасет из S3 · cowork")
+        await user.should_see("harbor_datasets/cowork/tasks/ → ")
+        await user.should_see("· задач: 3")  # лимит задач в форме пуст → первые 3 по имени
+        await user.should_see("--include 't1/*'")  # shlex.join берёт glob в кавычки
+        user.find(marker="fetch-dataset").click()
+        await user.should_see("готово: строк вывода 2")
+        assert tasks_dir.is_dir()
+        assert any(e.action == "dataset_fetch" and e.result == "ok" for e in fakes.CTX.store.events())
+    finally:
+        if tasks_dir.exists():
+            import shutil
+
+            shutil.rmtree(tasks_dir)
+        hidden.rename(tasks_dir)

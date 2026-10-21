@@ -25,10 +25,12 @@ from fleet_console.compose import (
     build_registry,
     copy_for_edit,
     from_resolved,
+    list_task_dirs,
     load_issues,
     make_bench_id,
     manual_edits,
     overlay_origin,
+    plan_fetch,
     run_checks,
     save_to_overlay,
     sources,
@@ -408,6 +410,8 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                         ui.icon(icon).classes(f"{color} text-base mt-0.5")
                         ui.label(c.title).classes("text-sm")
                         ui.label(c.detail).classes("text-xs opacity-70 break-all")
+                        if c.action and c.action.get("kind") == "fetch_dataset":
+                            ui.button("Скачать из S3", on_click=lambda a=c.action: _fetch_dataset_dialog(ctx, draft, rebuild, a)).props("flat dense no-caps")
             accept.set_visibility(warns > 0)
             accept.set_value(False)
             refresh_start()
@@ -458,6 +462,88 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
 
 
 # --- полный конфиг ---------------------------------------------------------------
+
+
+def _fetch_dataset_dialog(ctx: AppContext, draft: Draft, rebuild, action: dict[str, Any]) -> None:
+    """Скачать задачи датасета из S3-зеркала fleet по реестру: весь датасет, задачи из конфига или первые N."""
+    spec, resolved = draft.spec, draft.resolved or {}
+    root = ctx.settings.datasets_root_path()
+    system = resolved.get("system") or {}
+    s3_root = str(system.get("s3_datasets_root") or "")
+    if not s3_root and system.get("bucket") and system.get("namespace"):  # старые ревизии без ключа: та же раскладка, что в system/cluster.yaml
+        s3_root = f"{str(system['bucket']).rstrip('/')}/{system['namespace']}/harbor_datasets"
+    mappings, _ = build_registry(spec.worktree, spec.overlay, spec.run_dir) if spec else ([], [])
+    mapping = next((m for m in mappings if m.name == action.get("mapping")), None)
+    names = [str(n) for n in action.get("task_names") or []]
+    limit = (spec.task_limit if spec else None) or 3
+    state: dict[str, Any] = {"plan": None, "job": None}
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-3xl"):
+        ui.label(f"Скачать датасет из S3 · {action.get('mapping')}").classes("text-lg")
+        if spec is None or mapping is None or root is None or not s3_root:
+            ui.label("не хватает данных: нужен собранный конфиг с system.s3_datasets_root, корень датасетов в настройках и маппинг в реестре").classes("text-negative text-sm")
+            ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+            dialog.open()
+            return
+        ui.label(f"реестр {mapping.name} ({mapping.origin}): S3 {mapping.task_s3_base} → локально {mapping.tasks_root}; в каждой задаче fleet ждёт task.toml с environment.docker_image").classes(
+            "text-xs opacity-70"
+        )
+        options = {"first": f"первые {limit} задач по имени (как execution.task_limit)", "all": "весь датасет"}
+        if names:
+            options = {"names": "задачи из конфига: " + ", ".join(names)} | options
+        mode = ui.radio(options, value=next(iter(options))).props("dense")
+        plan_box = ui.column().classes("w-full gap-1")
+        progress = ui.label().classes("text-sm font-mono whitespace-pre-wrap")
+        with ui.row().classes("gap-2 items-center"):
+            start_button = ui.button("Скачать", on_click=lambda: start()).props("unelevated no-caps").mark("fetch-dataset")
+            again = ui.button("Превью и preflight", on_click=lambda: finish()).props("unelevated no-caps color=positive")
+            again.set_visibility(False)
+            ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+
+        async def make_plan() -> None:
+            tasks: tuple[str, ...] = ()
+            try:
+                if mode.value == "names":
+                    tasks = tuple(names)
+                elif mode.value == "first":
+                    tasks = tuple((await ctx.datasets.task_dirs(f"{s3_root.rstrip('/')}/{mapping.task_s3_base.strip('/')}/"))[:limit])
+            except Exception as exc:  # noqa: BLE001 — нет ключей или aws: показываем и даём скачать всё
+                progress.set_text(f"список задач не прочитать: {exc}")
+            plan = plan_fetch(mapping, root, s3_root, tasks)
+            state["plan"] = plan
+            plan_box.clear()
+            with plan_box:
+                ui.label(f"{plan.src} → {plan.dst}" + (f" · задач: {len(plan.tasks)}" if plan.tasks else " · все задачи")).classes("text-sm break-all")
+                ui.code(plan.command, language="bash").classes("w-full")
+
+        async def start() -> None:
+            if state["plan"] is None:
+                await make_plan()
+            try:
+                job = ctx.datasets.fetch(state["plan"])
+            except RuntimeError as exc:
+                progress.set_text(str(exc))
+                return
+            state["job"] = job
+            start_button.disable()
+            mode.disable()
+            timer = ui.timer(0.5, lambda: poll(timer))
+            poll(timer)
+
+        def poll(timer: ui.timer) -> None:
+            job = state["job"]
+            progress.set_text(f"{'идёт' if job.active else 'готово' if job.status == 'done' else 'не удалось'}: строк вывода {job.lines} · {job.last}\nлог: {job.log}")
+            if not job.active:
+                timer.deactivate()
+                again.set_visibility(True)
+                start_button.enable()
+
+        async def finish() -> None:
+            dialog.close()
+            await rebuild()
+
+        mode.on_value_change(lambda _: make_plan())
+        ui.timer(0, make_plan, once=True)
+    dialog.open()
 
 
 async def _overlay_drift(ctx: AppContext, spec: BenchSpec, sha: str) -> list[Drift]:

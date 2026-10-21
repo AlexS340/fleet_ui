@@ -1,5 +1,6 @@
 """Сборка бенч-прогона: exp.yaml и overrides, реестр датасетов, превью «что и где», preflight, исходники конфигов."""
 
+from fleet_console.compose.datasets import DatasetFetcher, FetchJob, FetchPlan, list_task_dirs, plan_fetch
 from fleet_console.compose.preflight import Check, Issue, load_issues, required_steps, run_checks, summary
 from fleet_console.compose.preview import Preview, from_resolved, tasks_total
 from fleet_console.compose.registry import Mapping, build_registry, find_mapping
@@ -20,7 +21,10 @@ from fleet_console.compose.spec import BenchSpec, SessionLink, make_bench_id
 __all__ = [
     "BenchSpec",
     "Check",
+    "DatasetFetcher",
     "Drift",
+    "FetchJob",
+    "FetchPlan",
     "Issue",
     "Mapping",
     "Preview",
@@ -30,10 +34,12 @@ __all__ = [
     "copy_for_edit",
     "find_mapping",
     "from_resolved",
+    "list_task_dirs",
     "load_issues",
     "make_bench_id",
     "manual_edits",
     "overlay_origin",
+    "plan_fetch",
     "required_steps",
     "run_checks",
     "save_to_overlay",

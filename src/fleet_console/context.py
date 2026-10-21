@@ -19,6 +19,7 @@ from fleet_console.control import Command, StopReport, stop_run, write_agent_lim
 from fleet_console.control.mlsc import set_planned_state
 from fleet_console.fleetref.git import Mirror
 from fleet_console.fleetref.manager import PrepareError, RevisionManager
+from fleet_console.compose import DatasetFetcher
 from fleet_console.guard import SleepGuard, SleepReport
 from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
@@ -51,6 +52,7 @@ class AppContext:
     guard: SleepGuard = field(default_factory=SleepGuard)
     sessions: SessionManager = field(default=None)  # type: ignore[assignment] — задаётся в build_context и в тестах
     benches: BenchManager = field(default=None)  # type: ignore[assignment]
+    datasets: DatasetFetcher = field(default=None)  # type: ignore[assignment] — скачивание датасетов из S3
     _tasks: list[asyncio.Task] = field(default_factory=list)
 
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
@@ -299,4 +301,5 @@ def build_context(home: Path | None = None) -> AppContext:
         sessions=sessions, agent_limit=ctx.set_agent_limit, stop_tasks=lambda run_id: ctx.stop_own_run(run_id),
     )
     sessions.paused = ctx.benches.busy_sessions  # таймер сессии стоит, пока на ней идёт бенч
+    ctx.datasets = DatasetFetcher(runner, paths.logs / "datasets", ctx.benches.aws_env, store.event)
     return ctx

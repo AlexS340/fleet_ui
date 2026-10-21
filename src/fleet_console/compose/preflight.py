@@ -40,6 +40,7 @@ class Check:
     title: str
     level: str  # ok | warn | fail
     detail: str = ""
+    action: dict[str, Any] | None = None  # что UI может предложить: {"kind": "fetch_dataset", "mapping": …, "path": …}
 
     @property
     def ok(self) -> bool:
@@ -149,20 +150,24 @@ def run_checks(
     elif resolved is not None:
         problems = []
         found = []
+        action = None
         for d in (resolved.get("harbor_job") or {}).get("datasets") or []:
             path = Path(str(d.get("path", ""))) if isinstance(d, dict) else None
             if path is None:
                 continue
-            if not path.is_dir():
-                problems.append(f"нет каталога {path}")
-                continue
             m = find_mapping(mappings, datasets_root, path)
+            if not path.is_dir() or not any(path.iterdir()):
+                what = "нет каталога" if not path.is_dir() else "пустой каталог"
+                problems.append(f"{what} {path}" + (f" — можно скачать из S3 по реестру {m.name}" if m else "; маппинга в реестре для него нет"))
+                if m is not None and action is None:
+                    action = {"kind": "fetch_dataset", "mapping": m.name, "path": str(path), "task_names": list(d.get("task_names") or [])}
+                continue
             if m is None:
                 problems.append(f"для {path} нет маппинга в реестре (tasks_root)")
             else:
                 found.append(f"{path.name} → {m.name} ({m.origin})")
         level = "fail" if problems else ("ok" if found else "warn")
-        checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", level, "; ".join(problems or found) or "в конфиге нет harbor_job.datasets"))
+        checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", level, "; ".join(problems or found) or "в конфиге нет harbor_job.datasets", action))
     else:
         checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", "warn", "проверю после сборки конфига"))
 
