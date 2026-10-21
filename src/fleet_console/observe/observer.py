@@ -84,15 +84,25 @@ class ClusterObserver:
         source.at = datetime.now(timezone.utc)
         self.version += 1
 
-    async def _read_mlsc(self) -> list[mlsc.Version]:
+    def require_token(self) -> str:
         token = self.mlsc_token()
         if not token:
             raise RuntimeError("нет MLSC_TOKEN: задайте в окружении сервиса или в secrets.env")
+        return token
+
+    async def mlsc_pod(self) -> str:
+        """Живой под для вызовов MLSC; кешируется до первой ошибки (под мог быть передеплоен)."""
         c = self.settings.cluster
         if self._mlsc_pod is None:
             self._mlsc_pod = await mlsc.find_pod(self.runner, c.mlsc_namespace, c.mlsc_deployment)
+        return self._mlsc_pod
+
+    async def _read_mlsc(self) -> list[mlsc.Version]:
+        token = self.require_token()
+        c = self.settings.cluster
+        pod = await self.mlsc_pod()
         try:
-            configuration = await mlsc.get_configuration(self.runner, c.mlsc_namespace, self._mlsc_pod, c.mlsc_base_url, token)
+            configuration = await mlsc.get_configuration(self.runner, c.mlsc_namespace, pod, c.mlsc_base_url, token)
         except Exception:
             self._mlsc_pod = None  # под мог быть передеплоен: в следующий раз ищем заново
             raise

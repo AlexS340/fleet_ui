@@ -14,11 +14,13 @@ from fleet_console.catalog import CatalogEntry, scan
 from fleet_console.connect.gateway import Gateway, free_port, parse_target, probe
 from fleet_console.connect.kube import Kube, KubeStatus, required_checks
 from fleet_console.connect.supervisor import Forward, Supervisor, subprocess_spawner
+from fleet_console.control import Command, StopReport, stop_run, write_agent_limit
+from fleet_console.control.mlsc import set_planned_state
 from fleet_console.fleetref.git import Mirror
 from fleet_console.fleetref.manager import PrepareError, RevisionManager
 from fleet_console.guard import SleepGuard
 from fleet_console.observe import ClusterObserver
-from fleet_console.runner import SubprocessRunner
+from fleet_console.runner import CommandError, Runner, SubprocessRunner
 from fleet_console.settings import Paths, Settings, default_home, read_secret
 from fleet_console.store import Store
 
@@ -108,6 +110,47 @@ class AppContext:
         await self.guard.stop()
         await self.http.aclose()
         self.store.close()
+
+    # --- управление своими прогонами ------------------------------------
+    @property
+    def runner(self) -> Runner:
+        return self.observer.runner
+
+    async def set_agent_limit(self, run_id: str, limit: int) -> Command:
+        """Записать лимит агентов прогона на submitter-под; действие и команда попадают в журнал."""
+        c = self.settings.cluster
+        try:
+            cmd = await write_agent_limit(self.runner, self.settings.namespace, c.submitter_pod, run_id, limit)
+        except CommandError as exc:
+            self.store.event("agent_limit", run_id, "error", str(exc))
+            raise
+        self.store.event("agent_limit", run_id, "ok", f"limit={limit}; {cmd.text}")
+        return cmd
+
+    async def set_replicas(self, version_id: int, count: int) -> str:
+        """Плановое число инстансов версии MLSC: реплики на лету или 0 — погасить."""
+        c = self.settings.cluster
+        try:
+            token = self.observer.require_token()
+            pod = await self.observer.mlsc_pod()
+            out = await set_planned_state(self.runner, c.mlsc_namespace, pod, c.mlsc_base_url, token, version_id, count)
+        except (CommandError, RuntimeError) as exc:
+            self.store.event("set_replicas", str(version_id), "error", str(exc))
+            raise
+        self.store.event("set_replicas", str(version_id), "ok", f"planned={count}")
+        return out
+
+    async def stop_own_run(self, run_id: str, version_id: int | None = None) -> StopReport:
+        """Остановка прогона по документу: лимит 0, сабмиттер, Terminate workflows, затем модель (если своя)."""
+        report = await stop_run(self.runner, self.settings.namespace, self.settings.cluster.submitter_pod, run_id)
+        if version_id is not None:
+            try:
+                await self.set_replicas(version_id, 0)
+                report.steps.append(f"модели (версия {version_id}) выставлено 0 инстансов")
+            except (CommandError, RuntimeError) as exc:
+                report.failed.append(f"модель: {exc}")
+        self.store.event("stop_run", run_id, "ok" if report.ok else "error", "; ".join(report.steps + report.failed))
+        return report
 
     # --- защита от сна ---------------------------------------------------
     def sleep_reasons(self) -> dict[str, str]:

@@ -85,3 +85,18 @@ async def test_sleep_reasons_cover_only_active_own_runs(tmp_path: Path) -> None:
     ctx.store.adopt_run("run-a")
     ctx.store.adopt_run("run-b")  # завершён: активных задач нет
     assert list(ctx.sleep_reasons()) == ["run-a"] and "задач идёт 2" in ctx.sleep_reasons()["run-a"]
+
+
+async def test_control_actions_are_journaled(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    fake = ctx.observer.runner
+    cluster_samples.install(fake)
+    fake.on("kubectl", "-n", ctx.settings.namespace, "patch", "workflow")
+    cmd = await ctx.set_agent_limit("run-a", 20)
+    assert "'20' > /manifests/harbor_run/run-a/agents_limit" in cmd.argv[-1] and cmd.text.startswith("kubectl exec")
+    report = await ctx.stop_own_run("run-a", version_id=41)  # токена нет: задачи остановлены, модель — ошибка
+    assert report.terminated == 2 and any("MLSC_TOKEN" in f for f in report.failed) and not report.ok
+    ctx.observer.mlsc_token = lambda: "t"
+    assert await ctx.set_replicas(41, 2) == cluster_samples.CONFIGURATION  # фейк отвечает тем же JSON на любой exec -i
+    actions = [(e.action, e.result) for e in ctx.store.events()]
+    assert actions == [("set_replicas", "ok"), ("stop_run", "error"), ("set_replicas", "error"), ("agent_limit", "ok")]

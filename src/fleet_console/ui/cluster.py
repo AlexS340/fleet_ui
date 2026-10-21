@@ -13,6 +13,7 @@ from nicegui import ui
 from fleet_console.context import AppContext
 from fleet_console.observe import Source
 from fleet_console.observe.argo import argo_ui_url
+from fleet_console.observe.submitter import ROOT
 from fleet_console.ui.header import build_header
 
 LINK_SLOT = '<q-td :props="props"><a :href="props.value" target="_blank" class="text-primary">Argo UI</a></q-td>'
@@ -256,18 +257,7 @@ def _run_dialog(ctx: AppContext, row: dict, on_change) -> None:  # noqa: ANN001 
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
         ui.label(run_id).classes("text-lg break-all")
         if own:
-            adopted = _when(datetime.fromisoformat(own.adopted_at))
-            facts = ["свой", f"version_id MLSC: {own.version_id if own.version_id is not None else '—'}", f"усыновлён {adopted}"]
-            ui.label(" · ".join(facts + ([own.note] if own.note else []))).classes("text-sm")
-
-            def forget() -> None:
-                ctx.store.forget_run(run_id)
-                ctx.store.event("forget_run", run_id, "ok")
-                dialog.close()
-                on_change()
-                ui.notify(f"{run_id}: больше не свой")
-
-            ui.button("Забыть", on_click=forget).props("flat no-caps")
+            _own_controls(ctx, dialog, own, row, on_change)
         else:
             ui.label("Чужой прогон: запущен не из сервиса. Усыновлённым можно управлять (с Ф2).").classes("text-sm opacity-80")
             suggested = next((v.version_id for v in ctx.observer.mlsc.data or [] if run_id in v.application), None)
@@ -284,6 +274,128 @@ def _run_dialog(ctx: AppContext, row: dict, on_change) -> None:  # noqa: ANN001 
                 ui.notify(f"{run_id}: теперь свой")
 
             ui.button("Усыновить", on_click=adopt).props("unelevated no-caps")
+    dialog.open()
+
+
+def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change) -> None:  # noqa: ANN001
+    """Свой прогон: лимит агентов, реплики модели, остановка, «забыть». Всё разрушительное — через подтверждение."""
+    run_id = own.run_id
+    version = next((v for v in ctx.observer.mlsc.data or [] if own.owns_version(v.version_id, v.application)), None)
+    sub = next((s for s in ctx.observer.submitter.data or [] if s.run_id == run_id), None)
+    adopted = _when(datetime.fromisoformat(own.adopted_at))
+    facts = ["свой", f"усыновлён {adopted}", f"задач идёт {row.get('running', 0)}, в очереди {row.get('pending', 0)}"]
+    ui.label(" · ".join(facts + ([own.note] if own.note else []))).classes("text-sm")
+
+    with ui.row().classes("items-end gap-2 flex-wrap"):
+        limit = ui.number("Лимит агентов", value=sub.limit if sub and sub.limit is not None else 0, min=0, precision=0).classes("w-40")
+
+        def ask_limit() -> None:
+            n = int(limit.value or 0)
+            _confirm(
+                f"Записать лимит агентов {n} для {run_id}",
+                [f"файл {ROOT}/{run_id}/agents_limit на поде {ctx.settings.cluster.submitter_pod}", "0 — пауза: сабмиттер перестаёт слать задачи"],
+                lambda: ctx.set_agent_limit(run_id, n),
+                on_change,
+            )
+
+        ui.button("Записать", on_click=ask_limit).props("flat no-caps")
+    if sub:
+        ui.label(
+            f"на поде: лимит {sub.limit if sub.limit is not None else '—'}, в очереди {sub.pending}, сабмиттер {'жив' if sub.alive else 'не запущен'}"
+        ).classes("text-xs opacity-70")
+    else:
+        ui.label("каталога прогона на submitter-поде не видно").classes("text-xs opacity-70")
+
+    if version:
+        gpu = version.gpu_per_instance or 0
+        with ui.row().classes("items-end gap-2 flex-wrap"):
+            replicas = ui.number("Реплики модели", value=version.planned, min=0, precision=0).classes("w-40")
+
+            def ask_replicas() -> None:
+                n = int(replicas.value or 0)
+                _confirm(
+                    f"Версии {version.version_id} выставить {n} инстансов",
+                    [f"сейчас план {version.planned}, факт {version.current}", f"{gpu} GPU на инстанс → {n * gpu} GPU", "0 — погасить модель"],
+                    lambda: ctx.set_replicas(version.version_id, n),
+                    on_change,
+                )
+
+            ui.button("Применить", on_click=ask_replicas).props("flat no-caps")
+        ui.label(f"MLSC версия {version.version_id}: план {version.planned}, факт {version.current}, {version.instance_type or '?'}").classes(
+            "text-xs opacity-70"
+        )
+    else:
+        hint = f"version_id {own.version_id}" if own.version_id is not None else "version_id не указан"
+        ui.label(f"живой версии MLSC у прогона не видно ({hint})").classes("text-xs opacity-70")
+
+    def forget() -> None:
+        ctx.store.forget_run(run_id)
+        ctx.store.event("forget_run", run_id, "ok")
+        dialog.close()
+        on_change()
+        ui.notify(f"{run_id}: больше не свой")
+
+    with ui.row().classes("gap-2 mt-2"):
+        ui.button("Остановить прогон", on_click=lambda: _stop_dialog(ctx, run_id, row, version, on_change)).props("flat no-caps color=negative")
+        ui.button("Забыть", on_click=forget).props("flat no-caps")
+
+
+def _confirm(title: str, lines: list[str], action, after) -> None:  # noqa: ANN001
+    """Диалог со сводкой перед разрушительным действием; ошибка остаётся в диалоге."""
+    with ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-xl"):
+        ui.label(title).classes("text-lg")
+        for line in lines:
+            ui.label(line).classes("text-sm")
+        status = ui.label().classes("text-sm whitespace-pre-wrap")
+
+        async def run() -> None:
+            status.set_text("выполняю…")
+            status.classes(remove="text-negative")
+            try:
+                await action()
+            except Exception as exc:  # noqa: BLE001 — текст ошибки kubectl показываем как есть
+                status.set_text(str(exc))
+                status.classes("text-negative")
+                return
+            dialog.close()
+            after()
+            ui.notify("Готово")
+
+        with ui.row().classes("gap-2"):
+            ui.button("Выполнить", on_click=run).props("unelevated no-caps color=negative")
+            ui.button("Отмена", on_click=dialog.close).props("flat no-caps")
+    dialog.open()
+
+
+def _stop_dialog(ctx: AppContext, run_id: str, row: dict, version, on_change) -> None:  # noqa: ANN001
+    active = int(row.get("running", 0) or 0) + int(row.get("pending", 0) or 0)
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
+        ui.label(f"Остановить прогон {run_id}?").classes("text-lg break-all")
+        ui.label(
+            f"Активных задач: {active}. Лимит агентов станет 0, сабмиттер прогона будет убит, активным workflows уйдёт Terminate."
+        ).classes("text-sm")
+        stop_model = None
+        if version:
+            gpu = (version.gpu_per_instance or 0) * version.planned
+            stop_model = ui.checkbox(
+                f"погасить модель: версия {version.version_id}, план {version.planned} × {version.gpu_per_instance or '?'} GPU = {gpu} GPU", value=True
+            )
+        else:
+            ui.label("Живой модели прогона в MLSC нет — гасить нечего.").classes("text-sm opacity-70")
+        log = ui.label().classes("text-sm whitespace-pre-wrap font-mono")
+
+        async def run() -> None:
+            log.set_text("останавливаю…")
+            version_id = version.version_id if version and stop_model and stop_model.value else None
+            report = await ctx.stop_own_run(run_id, version_id)
+            lines = ["✓ " + s for s in report.steps] + ["✗ " + f for f in report.failed]
+            log.set_text("\n".join(lines))
+            log.classes(add="text-negative" if report.failed else "", remove="" if report.failed else "text-negative")
+            on_change()
+
+        with ui.row().classes("gap-2"):
+            ui.button("Остановить", on_click=run).props("unelevated no-caps color=negative")
+            ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
     dialog.open()
 
 
