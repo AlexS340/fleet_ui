@@ -314,9 +314,9 @@ Fleet это позволяет: подъём и гашение модели —
 **Что проверить на прототипе:**
 
 - [x] имена сервисов шлюзов (2026-10-21): litellm — `litellm-argo/service/litellm` (headless, 80; это и есть `http://litellm.litellm-argo` из `system/cluster.yaml`) и `litellm-argo/service/litellm-fleet` (ClusterIP, 80); nginx — сервиса `vllm-proxy` в namespace `vllm-proxy` нет, есть `vllm-proxy/service/nginx-vllm-proxy-test` (80; deployment `nginx-vllm-proxy` смасштабирован в 0, работает `-test`) и headless `argo/service/vllm-proxy` (80). Адрес `http://vllm-proxy.vllm-proxy:80` выше взят из `docs/REFACTORING_CONCEPTS.md` fleet и в кластере не подтверждён;
-- [ ] нужен ли ключ litellm;
-- [ ] что шаги `mlsc.*` собираются из минимального `exp.yaml` без групп harbor; иначе подставлять заглушки;
-- [ ] как сервису отличать свои MLSC-приложения от чужих: в `mlsc/job_base.yaml` master имя приложения задано шаблоном `gigacode-fleet-egbulychev ${experiment.run_id}`, префикс лучше переопределять своим.
+- [x] ключ litellm не нужен (2026-10-21, см. открытые вопросы);
+- [x] из минимального `exp.yaml` без harbor-групп не собираются — подставляем заглушки (2026-10-21, см. открытые вопросы);
+- [x] свои MLSC-приложения (2026-10-21): fleet сам дописывает к `application_name` префикс `$USER | ` (`fleet/create_job.py`, валидатор `Job.prefix_user`), в живом списке имена вида `asstrelkov | gigacode-fleet-egbulychev <run_id>`. Сервис передаёт `-o mlsc.create_job.job.application_name=fleet-console <run_id>` и `USER` владельца в окружении; свои версии узнаются по `run_id` в имени и по `version_id` из журнала.
 
 ## Прозрачность запуска
 
@@ -518,7 +518,7 @@ fleet-console/
 
 **Статус:** Ф0 выполнена 2026-10-21 (ветка `phase-0`, 48 тестов без кластера); гейт проверен на живом кластере: сервис сам поднял ssh к бастиону и проброс Argo, склонировал зеркало, подготовил `master` и показал каталог с шапками; ветка без `harbor_new` помечена несовместимой. 
 
-**Ф1 в работе** (2026-10-21, ветка `phase-1`): страница «Кластер» читает Argo (workflows по `fleet/run-name`), шлюз nginx, submitter-под и узлы пула; цифры сверены с `kubectl` на живом кластере (8 активных прогонов, 49/49 узлов, реплики в маршруте 12/1/1/1, лимит агентов на поде = числу идущих workflows). Карточка MLSC ждёт `MLSC_TOKEN` (окружение сервиса или `~/.fleet-console/secrets.env`). Усыновление ручных прогонов сделано: таблица `runs` в SQLite, клик по строке прогона — «Усыновить» (run_id, version_id MLSC, заметка) или «Забыть», метка «Свой» в таблицах Argo и MLSC; проверено на живом кластере. Не сделано: сверка с Argo UI (нужен токен); карточка MLSC с текущим токеном получает 401 от API — отложено по решению владельца.
+**Ф1 в работе** (2026-10-21, ветка `phase-1`): страница «Кластер» читает Argo (workflows по `fleet/run-name`), шлюз nginx, submitter-под и узлы пула; цифры сверены с `kubectl` на живом кластере (8 активных прогонов, 49/49 узлов, реплики в маршруте 12/1/1/1, лимит агентов на поде = числу идущих workflows). Карточка MLSC ждёт `MLSC_TOKEN` (окружение сервиса или `~/.fleet-console/secrets.env`). Усыновление ручных прогонов сделано: таблица `runs` в SQLite, клик по строке прогона — «Усыновить» (run_id, version_id MLSC, заметка) или «Забыть», метка «Свой» в таблицах Argo и MLSC; проверено на живом кластере. Карточка MLSC проверена 2026-10-21: первый токен API не знал (одинаковый 401 с ним и без него, запрос сервиса совпадает с `fleet/mlsc.py` и `scripts/mlsc_queue.py`), со вторым токеном владельца карточка показывает те же 10 живых версий и 245 GPU, что `get_configuration` напрямую. Токен лежит в `~/.fleet-console/secrets.env`. Не сделано: сверка с Argo UI (нужен токен). Попутно: под VPN на Mac ssh к бастиону рвётся.
 
 ## Риски и открытые вопросы
 
@@ -527,7 +527,7 @@ fleet-console/
 | Риск | Чем опасен | Что делаем |
 | --- | --- | --- |
 | Fleet меняет имена шагов, флаги CLI, правило суффикса run\_id | пресеты ломаются на новой ревизии | профиль возможностей, ночная проверка, прогон всегда на точном SHA |
-| Override `main.run=[…]` со списком не сработает | стадии нельзя собрать из шагов | свои файлы `mode/console_<стадия>.yaml` в overlay и `-o mode=…` |
+| ~~Override `main.run=[…]` со списком не сработает~~ (работает, проверено 2026-10-21) | — | запасной путь остаётся: файлы `mode/console_<стадия>.yaml` в overlay |
 | Потерян `version_id` после `create_job` | MLSC-приложение-«сирота» жжёт GPU | `version_id` сразу в каталог прогона и в SQLite; дашборд показывает приложения со своим префиксом без прогона |
 | Mac спит с поднятой моделью | модель никто не гасит | защита от сна, предупреждения, режим сервера для прогонов без присмотра |
 | Имя пода MLSC захардкожено в fleet с хэшем ReplicaSet | все вызовы MLSC падают после редеплоя | сервис находит под сам и передаёт `mlsc.pod_name` |
@@ -538,15 +538,15 @@ fleet-console/
 
 **Открытые вопросы** (закрыть до начала соответствующей фазы):
 
-- [ ] Отдаёт ли MLSC API свободную квоту GPU по очереди?
-- [ ] Есть ли у MLSC своё время жизни приложения — страховка на случай сна Mac?
-- [ ] Работает ли override `main.run=[…]` со списком в CLI fleet?
-- [ ] Собираются ли шаги `mlsc.*` из `exp.yaml` без групп harbor?
+- [x] Квоту GPU `get_configuration` не отдаёт (проверено 2026-10-21): верхний уровень — `applications`, `credentials`, `regions` (типы инстансов по регионам), `mlspace_projects` (аллокации с типами инстансов, без остатков), `application_versions`, `application_version_states` (`planned`/`current`). Дашборд считает GPU по известным версиям, как и задумано.
+- [x] Времени жизни у MLSC нет (проверено 2026-10-21): у приложения только `worker_start_timeout_seconds`, таймауты healthcheck и `disruption_budget_absolute`; у версии — `job_priority_class`, `include_nodes`/`exclude_nodes`, `last_deploy_error`/`last_deploy_error_date` (пригодится карточке). Гасить по таймеру должен сервис; защита от сна обязательна.
+- [x] Override `main.run=[a,b]` со списком работает (проверено 2026-10-21 на master через `--print-config`): `main.run` становится списком; одиночная строка и `-o mode=stop_llm` тоже работают. Файлы `mode/console_*.yaml` не нужны.
+- [x] Без harbor-групп не собираются (проверено 2026-10-21): `system: cluster` резолвит `${harbor_dataset.benchmark}` и `${output_dir}` даже для `--print-config`. Конфиг сессии модели повторяет `defaults` шаблона с любыми членами `harbor/agent` и `harbor/dataset` как заглушками и своим `output_dir`; на шаги `mlsc.*` они не влияют. Конфиг вне worktree подключается через `-o hydra.searchpath=[file://<worktree>/examples/harbor_new/configs]` — работает.
 - [x] Имена и порты сервисов litellm и nginx — см. «Модель без бенча» (2026-10-21).
-- [ ] Нужен ли ключ litellm?
+- [x] Ключ litellm не нужен (проверено 2026-10-21 через port-forward): `litellm-argo/service/litellm-fleet` отвечает на `GET /v1/models` 200 без заголовка Authorization и отдаёт список моделей с лимитами контекста. nginx `vllm-proxy/service/nginx-vllm-proxy-test` на `/v1/models` даёт 404 «model not set in request»: маршрутизирует только по имени модели в запросе, список моделей для него — из ConfigMap upstream.
 - [ ] Токен Argo для UI: SA `argo-server` в `argo` (как в fleet) или `argo-workflows-api-client-fleet`? Проверить `kubectl -n argo create token …` на Ф1.
 - [x] Проброс до Argo сервис пока не держит (2026-10-21): наблюдение идёт через CRD по Kubernetes API, Argo UI — по ingress через SOCKS или ручным port-forward. Вернуться, если понадобятся ссылки в Argo UI из карточки прогона.
-- [ ] Безопасен ли повторный `submitter_launch` и как остановить сабмиттер одного прогона — достаточно ли лимита 0?
+- [x] Повторный `submitter_launch` небезопасен (код `infra/fleet_submitter_python/submit_workflows.py`, 2026-10-21): ни lock-, ни pid-файла нет, второй запуск даст второй процесс на том же `pending/`. Лимит 0 — только пауза: процесс живёт и ждёт. Остановить сабмиттер одного прогона — убить его процесс на поде по командной строке `submit_workflows.py /manifests/harbor_run/<run_id>/pending` (так же дашборд определяет «жив»). Сам процесс завершается, когда `pending/` пуст и активных workflows прогона нет.
 - [ ] Пригодно ли S3-зеркало `harbor_datasets` для локальной материализации?
 
 ### Закрытые вопросы Ф0 (проверено 2026-10-21)
