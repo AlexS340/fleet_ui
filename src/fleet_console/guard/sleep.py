@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,16 @@ from fleet_console.connect.supervisor import ProcessLike, Spawner, subprocess_sp
 from fleet_console.runner import Runner
 
 PERCENT = re.compile(r"(\d+)%")
+SLEEP_GAP_SEC = 120.0  # разрыв между циклами сверх периода опроса, который сон по простою не объяснит
+
+
+@dataclass
+class SleepReport:
+    """Сводка после пробуждения: сколько спал и что за это время изменилось."""
+
+    minutes: int
+    at: datetime
+    lines: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,8 @@ class SleepGuard:
         self.proc: ProcessLike | None = None
         self.battery: Battery | None = None
         self.error = ""
+        self.last_tick: datetime | None = None
+        self.last_sleep: SleepReport | None = None  # показывается в шапке, пока не закрыли
 
     @property
     def supported(self) -> bool:
@@ -76,6 +89,16 @@ class SleepGuard:
             except Exception as exc:  # noqa: BLE001 — нет caffeinate или не запустился: показываем в шапке
                 self.proc = None
                 self.error = f"caffeinate: {exc}"
+
+    def note_tick(self, now: datetime, poll_seconds: float) -> int | None:
+        """Цикл сервиса пишет метки времени; большой разрыв между ними — Mac спал. Возвращает минуты сна."""
+        gap = None
+        if self.last_tick is not None:
+            extra = (now - self.last_tick).total_seconds() - poll_seconds
+            if extra >= SLEEP_GAP_SEC:
+                gap = max(1, round(extra / 60))
+        self.last_tick = now
+        return gap
 
     async def refresh_battery(self) -> None:
         if not self.supported or self.runner is None:

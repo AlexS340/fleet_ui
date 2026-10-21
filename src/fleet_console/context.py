@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,7 +19,7 @@ from fleet_console.control import Command, StopReport, stop_run, write_agent_lim
 from fleet_console.control.mlsc import set_planned_state
 from fleet_console.fleetref.git import Mirror
 from fleet_console.fleetref.manager import PrepareError, RevisionManager
-from fleet_console.guard import SleepGuard
+from fleet_console.guard import SleepGuard, SleepReport
 from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import CommandError, Runner, SubprocessRunner
@@ -204,7 +205,35 @@ class AppContext:
         while True:
             await self.guard.update(self.sleep_reasons())
             await self.guard.refresh_battery()
+            gap = self.guard.note_tick(datetime.now(timezone.utc), GUARD_POLL_SEC)
+            if gap:
+                try:
+                    await self.after_sleep(gap)
+                except Exception as exc:  # noqa: BLE001 — сводка после сна не должна ронять цикл
+                    self.store.event("mac_sleep", "-", "error", str(exc))
             await asyncio.sleep(GUARD_POLL_SEC)
+
+    async def after_sleep(self, minutes: int) -> SleepReport:
+        """После пробуждения: сверить свои прогоны с кластером и собрать сводку — что завершилось, какие сессии просрочены.
+
+        Пробросы поднимает супервизор по своей проверке здоровья; таймеры сессий и автогашение
+        догоняют в своих циклах — здесь только сверка и сводка.
+        """
+        own = self.store.own_runs()
+        before = {r.run_name: r.succeeded + r.failed for r in (self.observer.runs.data or []) if r.run_name in own}
+        await self.observer.refresh()
+        now = datetime.now(timezone.utc)
+        lines = []
+        for r in self.observer.runs.data or []:
+            if r.run_name in own:
+                lines.append(f"прогон {r.run_name}: завершилось задач {max(0, r.succeeded + r.failed - before.get(r.run_name, 0))}, идёт {r.active}")
+        for s in self.sessions.sessions(active_only=True):
+            if s.status == "ready" and s.expires_at and datetime.fromisoformat(s.expires_at) <= now:
+                lines.append(f"сессия {s.model or s.recipe} просрочена: гашение по таймеру после льготного интервала, если не продлить")
+        report = SleepReport(minutes, now, lines)
+        self.guard.last_sleep = report
+        self.store.event("mac_sleep", "-", "ok", f"Mac спал {minutes} мин" + ("; " + "; ".join(lines) if lines else ""))
+        return report
 
     async def _kube_loop(self) -> None:
         await self.refresh_kube(with_permissions=True)

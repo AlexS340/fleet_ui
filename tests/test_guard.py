@@ -69,3 +69,15 @@ async def test_battery_parsing_and_refresh(tmp_path: Path) -> None:
     linux, _ = make(tmp_path, platform="linux", runner=runner)
     await linux.refresh_battery()
     assert linux.battery is None and not any(c[0][0] == "pmset" for c in FakeRunner().calls)
+
+
+def test_note_tick_detects_sleep_gap(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    guard, _ = make(tmp_path)
+    t0 = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
+    assert guard.note_tick(t0, 15) is None  # первая метка
+    assert guard.note_tick(t0 + timedelta(seconds=16), 15) is None  # обычный цикл
+    assert guard.note_tick(t0 + timedelta(seconds=16 + 15 + 100), 15) is None  # задержка меньше порога
+    assert guard.note_tick(t0 + timedelta(minutes=50), 15) == 48  # ~47 мин сверх периода опроса → спал
+    assert guard.last_tick == t0 + timedelta(minutes=50) and guard.last_sleep is None  # сводку собирает контекст

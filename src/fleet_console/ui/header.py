@@ -34,6 +34,8 @@ def build_header(ctx: AppContext) -> None:
             _chip(f"без сна · {len(guard.reasons)}", "positive" if ok else "negative", lambda: _guard_dialog(ctx, holder))
             if guard.battery and not guard.battery.on_ac:
                 _chip(f"батарея {guard.battery.percent}%", "warning", lambda: _guard_dialog(ctx, holder))
+        if guard.last_sleep is not None:
+            _chip(f"Mac спал {guard.last_sleep.minutes} мин", "warning", lambda: _sleep_dialog(ctx, holder, status_row.refresh))
         ui.link(_cluster_text(ctx), "/cluster").classes("text-white")
         ui.link("Модели", "/models").classes("text-white")
         ui.link(_benches_text(ctx), "/runs").classes("text-white")
@@ -141,6 +143,26 @@ def _guard_dialog(ctx: AppContext, holder: ui.element) -> None:
             "text-xs opacity-70"
         )
         ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+    dialog.open()
+
+
+def _sleep_dialog(ctx: AppContext, holder: ui.element, refresh) -> None:
+    """Сводка после пробуждения: пока Mac спал, циклы сервиса стояли — что за это время случилось в кластере."""
+    report = ctx.guard.last_sleep
+    if report is None:
+        return
+    with holder, ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-xl"):
+        ui.label(f"Mac спал {report.minutes} мин").classes("text-lg")
+        ui.label(f"проснулся {report.at.astimezone().strftime('%d.%m %H:%M')}; пробросы и прогоны сверены с кластером").classes("text-sm opacity-70")
+        for line in report.lines or ["своих прогонов и сессий в это время не было"]:
+            ui.label("• " + line).classes("text-sm")
+
+        def close() -> None:
+            ctx.guard.last_sleep = None
+            dialog.close()
+            refresh()
+
+        ui.button("Понятно", on_click=close).props("unelevated no-caps")
     dialog.open()
 
 

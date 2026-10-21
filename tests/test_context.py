@@ -114,3 +114,21 @@ async def test_control_actions_are_journaled(tmp_path: Path) -> None:
     assert await ctx.set_replicas(41, 2) == cluster_samples.CONFIGURATION  # фейк отвечает тем же JSON на любой exec -i
     actions = [(e.action, e.result) for e in ctx.store.events()]
     assert actions == [("set_replicas", "ok"), ("stop_run", "error"), ("set_replicas", "error"), ("agent_limit", "ok")]
+
+
+async def test_after_sleep_reports_own_runs_and_expired_sessions(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from fleet_console.store import Session
+
+    ctx = _ctx(tmp_path)
+    cluster_samples.install(ctx.observer.runner)
+    ctx.store.adopt_run("run-a")
+    expired = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    ctx.store.create_session(Session(id="s1", recipe="glm", status="ready", created_at="t", model="GLM", expires_at=expired))
+    ctx.store.create_session(Session(id="s2", recipe="glm", status="ready", created_at="t", model="Qwen", expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()))
+    report = await ctx.after_sleep(47)
+    assert report.minutes == 47 and ctx.guard.last_sleep is report
+    assert report.lines == ["прогон run-a: завершилось задач 1, идёт 2", "сессия GLM просрочена: гашение по таймеру после льготного интервала, если не продлить"]
+    event = next(e for e in ctx.store.events() if e.action == "mac_sleep")
+    assert event.result == "ok" and event.details.startswith("Mac спал 47 мин; прогон run-a")

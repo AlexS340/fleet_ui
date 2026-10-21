@@ -141,8 +141,21 @@ async def test_header_shows_sleep_guard(user: User) -> None:
         user.find("без сна · 1").click()
         await user.should_see("прогон run-a: задач идёт 2")
         await user.should_see("Защита от сна включена")
+        # сводка после сна Mac — чип в шапке, закрывается кнопкой
+        from datetime import datetime, timezone
+
+        from fleet_console.guard import SleepReport
+
+        fakes.CTX.guard.last_sleep = SleepReport(47, datetime.now(timezone.utc), ["прогон run-a: завершилось задач 120, идёт 3"])
+        await user.open("/")
+        await user.should_see("Mac спал 47 мин")
+        user.find("Mac спал 47 мин").click()
+        await user.should_see("завершилось задач 120")
+        user.find("Понятно").click()
+        assert fakes.CTX.guard.last_sleep is None
     finally:
         await fakes.CTX.guard.update({})
+        fakes.CTX.guard.last_sleep = None
 
 
 async def test_models_page_sessions(user: User) -> None:

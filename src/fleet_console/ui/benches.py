@@ -431,6 +431,10 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                 "стадии: " + stages,
                 f"результаты: {preview.s3}",
             ]
+            if ctx.guard.supported:
+                lines.append("Прогон займёт часы: не закрывайте крышку Mac и не отключайте питание — caffeinate этого не остановит; без присмотра надёжнее сервер.")
+                if ctx.guard.battery and not ctx.guard.battery.on_ac:
+                    lines.append(f"Mac на батарее ({ctx.guard.battery.percent}%): подключите зарядку.")
 
             async def start() -> None:
                 run = await ctx.benches.start(spec, ref=revision.ref, preview=preview)
