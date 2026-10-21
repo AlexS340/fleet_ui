@@ -13,8 +13,9 @@ from fleet_console.connect.kube import Kube, KubeStatus, required_checks
 from fleet_console.connect.supervisor import Forward, Supervisor, subprocess_spawner
 from fleet_console.fleetref.git import Mirror
 from fleet_console.fleetref.manager import PrepareError, RevisionManager
+from fleet_console.observe import ClusterObserver
 from fleet_console.runner import SubprocessRunner
-from fleet_console.settings import Paths, Settings, default_home
+from fleet_console.settings import Paths, Settings, default_home, read_secret
 from fleet_console.store import Store
 
 BASTION = "bastion"
@@ -31,6 +32,7 @@ class AppContext:
     kube: Kube
     manager: RevisionManager
     supervisor: Supervisor
+    observer: ClusterObserver
     kube_status: KubeStatus = field(default_factory=KubeStatus)
     _tasks: list[asyncio.Task] = field(default_factory=list)
 
@@ -52,10 +54,12 @@ class AppContext:
         self.kube_status = status
 
     async def startup(self) -> None:
+        self.observer.ready = lambda: self.kube_status.ready  # без API-сервера kubectl только плодит ошибки
         self._tasks = [
             asyncio.create_task(self.supervisor.run(), name="supervisor"),
             asyncio.create_task(self._kube_loop(), name="kube"),
             asyncio.create_task(self._mirror_init(), name="mirror"),
+            asyncio.create_task(self.observer.loop(), name="observer"),
         ]
         if self.settings.auto_fetch_minutes > 0:
             self._tasks.append(asyncio.create_task(self._fetch_loop(), name="auto-fetch"))
@@ -136,4 +140,5 @@ def build_context(home: Path | None = None) -> AppContext:
         return None
 
     manager = RevisionManager(mirror, store, runner, paths, settings, sync_gate=sync_gate)
-    return AppContext(settings, paths, store, kube, manager, supervisor)
+    observer = ClusterObserver(runner, settings, mlsc_token=lambda: read_secret(paths, "MLSC_TOKEN"))
+    return AppContext(settings, paths, store, kube, manager, supervisor, observer)

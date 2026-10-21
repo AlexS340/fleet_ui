@@ -34,7 +34,7 @@ async def test_fake_runner_prefix_and_calls(tmp_path: Path) -> None:
     assert (await fake.run(["git", "fetch", "--prune"], cwd=tmp_path)).stdout == "ok"
     assert (await fake.run(["uv", "sync"])).returncode == 1
     assert (await fake.run(["kubectl"])).returncode == 127
-    assert fake.calls[0] == (("git", "fetch", "--prune"), {"cwd": tmp_path, "env": {}, "timeout": None})
+    assert fake.calls[0] == (("git", "fetch", "--prune"), {"cwd": tmp_path, "env": {}, "timeout": None, "stdin": None})
     log = tmp_path / "s.log"
     lines: list[str] = []
     await fake.stream(["git", "fetch"], log_path=log, on_line=lines.append)

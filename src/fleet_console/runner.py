@@ -52,6 +52,7 @@ class Runner(Protocol):
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
         timeout: float | None = None,
+        stdin: str | None = None,
     ) -> Result: ...
 
     async def stream(
@@ -88,16 +89,21 @@ class SubprocessRunner:
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
         timeout: float | None = None,
+        stdin: str | None = None,
     ) -> Result:
+        """stdin — для секретов (токен в `kubectl exec -i`): в argv и логи они не попадают."""
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
             env=_merged_env(env),
+            stdin=asyncio.subprocess.PIPE if stdin is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            out, err = await asyncio.wait_for(
+                proc.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
+            )
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
@@ -187,8 +193,8 @@ class FakeRunner:
                 return Result(argv_t, result.returncode, result.stdout, result.stderr)
         return Result(argv_t, 127, "", f"FakeRunner: нет ответа для {shlex.join(argv_t)}")
 
-    async def run(self, argv: Argv, *, cwd: Path | None = None, env=None, timeout=None) -> Result:
-        return await self._answer(argv, {"cwd": cwd, "env": dict(env or {}), "timeout": timeout})
+    async def run(self, argv: Argv, *, cwd: Path | None = None, env=None, timeout=None, stdin=None) -> Result:
+        return await self._answer(argv, {"cwd": cwd, "env": dict(env or {}), "timeout": timeout, "stdin": stdin})
 
     async def stream(self, argv: Argv, *, cwd=None, env=None, log_path=None, on_line=None) -> Result:
         result = await self._answer(argv, {"cwd": cwd, "env": dict(env or {}), "log_path": log_path})
