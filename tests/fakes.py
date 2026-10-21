@@ -15,6 +15,7 @@ from fleet_console.context import AppContext
 from fleet_console.fleetref.git import Branch, Commit, CommitInfo
 from fleet_console.fleetref.manager import PrepareError, Progress, ReadyRevision
 from fleet_console.fleetref.profile import CONFIGS_REL, Profile
+from fleet_console.guard import SleepGuard
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import FakeRunner
 from fleet_console.settings import Paths, Settings
@@ -32,6 +33,18 @@ class FakeKube:
 
     async def readyz(self) -> bool:
         return True
+
+
+class FakeProc:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+async def fake_spawner(argv, log_path) -> FakeProc:  # noqa: ANN001
+    return FakeProc()
 
 
 class FakeSupervisor:
@@ -158,4 +171,5 @@ def make_context() -> AppContext:
         observer=ClusterObserver(kubectl, settings, mlsc_token=lambda: "token"),
         http=fake_gateway.client(),
         port_picker=lambda preferred: preferred,  # порт из настроек, без проверки занятости
+        guard=SleepGuard(kubectl, fake_spawner, platform="darwin", pid=1),
     )

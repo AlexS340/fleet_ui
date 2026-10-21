@@ -126,3 +126,15 @@ async def test_models_page_gateway_and_sandbox(user: User) -> None:
     user.find("Закрыть проброс").click()
     await user.should_see("Пробросить порт")
     assert not fakes.CTX.gateways
+
+
+async def test_header_shows_sleep_guard(user: User) -> None:
+    await fakes.CTX.guard.update({"run-a": "прогон run-a: задач идёт 2"})
+    try:
+        await user.open("/")
+        await user.should_see("без сна · 1")
+        user.find("без сна · 1").click()
+        await user.should_see("прогон run-a: задач идёт 2")
+        await user.should_see("Защита от сна включена")
+    finally:
+        await fakes.CTX.guard.update({})

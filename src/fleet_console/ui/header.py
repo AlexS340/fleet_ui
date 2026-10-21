@@ -26,6 +26,12 @@ def build_header(ctx: AppContext) -> None:
         for fwd in ctx.supervisor.forwards:
             st = ctx.supervisor.state(fwd.name)
             _chip(fwd.title, STATUS_COLORS[st.status], lambda name=fwd.name: _forward_dialog(ctx, name))
+        guard = ctx.guard
+        if guard.reasons:  # чип виден только пока есть что беречь
+            ok = guard.active or not guard.supported
+            _chip(f"без сна · {len(guard.reasons)}", "positive" if ok else "negative", lambda: _guard_dialog(ctx))
+            if guard.battery and not guard.battery.on_ac:
+                _chip(f"батарея {guard.battery.percent}%", "warning", lambda: _guard_dialog(ctx))
         ui.link(_cluster_text(ctx), "/cluster").classes("text-white")
         ui.link("Модели", "/models").classes("text-white")
         ui.label(_fetch_text(ctx)).classes("text-sm text-white opacity-80 hidden sm:inline")  # на узком экране шапка в 2 строки
@@ -103,6 +109,28 @@ def _kube_dialog(ctx: AppContext) -> None:
             _kube_dialog(ctx)
 
         ui.button("Перепроверить", on_click=recheck).props("flat no-caps")
+    dialog.open()
+
+
+def _guard_dialog(ctx: AppContext) -> None:
+    g = ctx.guard
+    with ui.dialog() as dialog, ui.card().classes("min-w-80 max-w-xl"):
+        ui.label("Защита от сна").classes("text-lg")
+        ui.label(g.status()).classes("text-positive" if g.active else "")
+        for text in g.reasons.values():
+            ui.label("• " + text).classes("text-sm")
+        if g.supported:
+            ui.label(shlex.join(g.argv)).classes("font-mono text-xs opacity-70")
+        if g.battery:
+            percent = f" · {g.battery.percent}%" if g.battery.percent is not None else ""
+            if g.battery.on_ac:
+                ui.label("питание от сети" + percent).classes("text-sm")
+            else:
+                ui.label("на батарее: запрет сна слабее, подключите зарядку" + percent).classes("text-sm text-warning")
+        ui.label("Закрытую крышку, разряд и ручной сон caffeinate не остановит. Проверка снаружи: pmset -g assertions").classes(
+            "text-xs opacity-70"
+        )
+        ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
     dialog.open()
 
 

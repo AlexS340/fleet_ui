@@ -16,6 +16,7 @@ from fleet_console.connect.kube import Kube, KubeStatus, required_checks
 from fleet_console.connect.supervisor import Forward, Supervisor, subprocess_spawner
 from fleet_console.fleetref.git import Mirror
 from fleet_console.fleetref.manager import PrepareError, RevisionManager
+from fleet_console.guard import SleepGuard
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import SubprocessRunner
 from fleet_console.settings import Paths, Settings, default_home, read_secret
@@ -24,6 +25,7 @@ from fleet_console.store import Store
 BASTION = "bastion"
 KUBE_POLL_SEC = 30.0
 KUBE_RETRY_SEC = 5.0  # пока API-сервер не ответил (ssh ещё поднимается) — опрашиваем чаще
+GUARD_POLL_SEC = 15.0
 
 
 @dataclass
@@ -39,6 +41,7 @@ class AppContext:
     http: httpx.AsyncClient = field(default_factory=httpx.AsyncClient)  # шлюз моделей и песочница
     gateways: dict[str, Gateway] = field(default_factory=dict)  # открытые пробросы к шлюзам по ключу
     port_picker: Callable[[int], int] = free_port
+    guard: SleepGuard = field(default_factory=SleepGuard)
     _tasks: list[asyncio.Task] = field(default_factory=list)
 
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
@@ -92,6 +95,7 @@ class AppContext:
             asyncio.create_task(self._kube_loop(), name="kube"),
             asyncio.create_task(self._mirror_init(), name="mirror"),
             asyncio.create_task(self.observer.loop(), name="observer"),
+            asyncio.create_task(self._guard_loop(), name="guard"),
         ]
         if self.settings.auto_fetch_minutes > 0:
             self._tasks.append(asyncio.create_task(self._fetch_loop(), name="auto-fetch"))
@@ -101,8 +105,25 @@ class AppContext:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.supervisor.stop()
+        await self.guard.stop()
         await self.http.aclose()
         self.store.close()
+
+    # --- защита от сна ---------------------------------------------------
+    def sleep_reasons(self) -> dict[str, str]:
+        """Почему Mac не должен спать: свои прогоны с идущими задачами (с сессиями моделей — и они)."""
+        own = self.store.own_runs()
+        return {
+            r.run_name: f"прогон {r.run_name}: задач идёт {r.active}"
+            for r in (self.observer.runs.data or [])
+            if r.run_name in own and r.active
+        }
+
+    async def _guard_loop(self) -> None:
+        while True:
+            await self.guard.update(self.sleep_reasons())
+            await self.guard.refresh_battery()
+            await asyncio.sleep(GUARD_POLL_SEC)
 
     async def _kube_loop(self) -> None:
         await self.refresh_kube(with_permissions=True)
@@ -157,4 +178,5 @@ def build_context(home: Path | None = None) -> AppContext:
 
     manager = RevisionManager(mirror, store, runner, paths, settings, sync_gate=sync_gate)
     observer = ClusterObserver(runner, settings, mlsc_token=lambda: read_secret(paths, "MLSC_TOKEN"))
-    return AppContext(settings, paths, store, kube, manager, supervisor, observer)
+    guard = SleepGuard(runner, subprocess_spawner, log_path=paths.logs / "caffeinate.log")
+    return AppContext(settings, paths, store, kube, manager, supervisor, observer, guard=guard)

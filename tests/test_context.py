@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import cluster_samples
 from fleet_console.connect.kube import KubeStatus
 from fleet_console.context import AppContext
 from fleet_console.observe import ClusterObserver
@@ -74,3 +75,13 @@ async def test_gateway_open_close(tmp_path: Path) -> None:
     assert all(f.name != "gateway-litellm" for f in ctx.supervisor.forwards) and not ctx.gateways
     ctx.close_gateway("litellm")  # повторно — тихо
     assert [e.action for e in ctx.store.events()] == ["close_gateway", "open_gateway"]
+
+
+async def test_sleep_reasons_cover_only_active_own_runs(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    cluster_samples.install(ctx.observer.runner)
+    await ctx.observer.refresh()
+    assert ctx.sleep_reasons() == {}  # чужие прогоны Mac не держат
+    ctx.store.adopt_run("run-a")
+    ctx.store.adopt_run("run-b")  # завершён: активных задач нет
+    assert list(ctx.sleep_reasons()) == ["run-a"] and "задач идёт 2" in ctx.sleep_reasons()["run-a"]
