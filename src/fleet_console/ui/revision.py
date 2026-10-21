@@ -168,4 +168,4 @@ def _catalog(ctx: AppContext, worktree: Path) -> None:
             for e in items:
                 with ui.expansion(e.name, caption=e.summary).classes("w-full").props("dense"):
                     ui.label(e.header or "без шапки-комментария").classes("whitespace-pre-wrap font-mono text-sm")
-                    ui.label(e.path + (f" · @package {e.package}" if e.package else "")).classes("text-xs opacity-70")
+                    ui.label(e.path + (f" · @package {e.package}" if e.package else "")).classes("text-xs opacity-70 break-all")
