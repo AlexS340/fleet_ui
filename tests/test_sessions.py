@@ -109,7 +109,7 @@ async def test_session_comes_up_through_fleet_stages(h: Harness) -> None:
     assert (run_dir / "console_model.yaml").exists() and (run_dir / "resolved.yaml").read_text().startswith("mlsc:")
     assert (run_dir / "version_id").read_text().strip() == "1234" and (run_dir / "logs" / "check.log").exists()
     envs = [meta["env"] for argv, meta in h.runner.calls if argv[:2] == ("uv", "run")]
-    assert envs[0]["MLSC_TOKEN"] == "tok" and "FLEET_DATASETS_ROOT" in envs[0]  # preflight: заглушки oc.env
+    assert envs[0]["MLSC_TOKEN"] == "fleet-console-dummy" and "FLEET_DATASETS_ROOT" in envs[0]  # preflight: только заглушки, токен в resolved.yaml не попадает
     assert envs[1] == {"MLSC_TOKEN": "tok"}  # стадии: только токен, остальное из окружения сервиса
     assert [s.returncode for s in h.store.stages(session.id)] == [0, 0, 0, 0]
     assert [e.action for e in h.store.events()][:2] == ["session_ready", "session_start"]
@@ -183,3 +183,15 @@ async def test_start_without_model_name_takes_served_model_name_from_recipe(h: H
     assert h.mgr.get(session.id).model == "GLM-5.3-Flash"
     assert session.id.startswith("console-glm-")  # id по рецепту, как и раньше
     assert "mlsc.served_model_name=" not in h.commands(session.id)["create_job"]  # имя из рецепта не переопределяется
+
+
+async def test_session_under_bench_is_paused_and_protected(h: Harness) -> None:
+    session = await h.start(ttl_minutes=60)
+    h.mgr.paused = lambda: {session.id}
+    h.now = T0 + timedelta(minutes=61)
+    await h.mgr.tick()
+    s = h.mgr.get(session.id)
+    assert s.status == "ready" and s.warned == 0 and datetime.fromisoformat(s.expires_at) == h.now + timedelta(minutes=10)  # срок сдвинут
+    with pytest.raises(SessionError, match="идёт бенч"):
+        await h.mgr.stop(session.id)
+    assert (await h.mgr.stop(session.id, force=True)).status == "stopped"

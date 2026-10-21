@@ -22,7 +22,8 @@ from fleet_console.guard import SleepGuard
 from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import CommandError, Runner, SubprocessRunner
-from fleet_console.settings import Paths, Settings, default_home, read_secret
+from fleet_console.runs import BenchManager
+from fleet_console.settings import Paths, Settings, default_home, read_secret, secrets_env
 from fleet_console.store import Store
 
 BASTION = "bastion"
@@ -30,6 +31,7 @@ KUBE_POLL_SEC = 30.0
 KUBE_RETRY_SEC = 5.0  # пока API-сервер не ответил (ssh ещё поднимается) — опрашиваем чаще
 GUARD_POLL_SEC = 15.0
 SESSIONS_POLL_SEC = 30.0
+BENCHES_POLL_SEC = 60.0
 
 
 @dataclass
@@ -47,6 +49,7 @@ class AppContext:
     port_picker: Callable[[int], int] = free_port
     guard: SleepGuard = field(default_factory=SleepGuard)
     sessions: SessionManager = field(default=None)  # type: ignore[assignment] — задаётся в build_context и в тестах
+    benches: BenchManager = field(default=None)  # type: ignore[assignment]
     _tasks: list[asyncio.Task] = field(default_factory=list)
 
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
@@ -102,14 +105,17 @@ class AppContext:
             asyncio.create_task(self.observer.loop(), name="observer"),
             asyncio.create_task(self._guard_loop(), name="guard"),
             asyncio.create_task(self._sessions_loop(), name="sessions"),
+            asyncio.create_task(self._benches_loop(), name="benches"),
         ]
         if self.settings.auto_fetch_minutes > 0:
             self._tasks.append(asyncio.create_task(self._fetch_loop(), name="auto-fetch"))
 
     async def shutdown(self) -> None:
-        for task in [*self._tasks, *self.sessions.tasks.values()]:
+        # Задачи бенчей отменяем тоже, но их подпроцессы fleet живут в своих группах и переживут перезапуск: resume прицепится.
+        pending = [*self._tasks, *self.sessions.tasks.values(), *self.benches.tasks.values()]
+        for task in pending:
             task.cancel()
-        await asyncio.gather(*self._tasks, *self.sessions.tasks.values(), return_exceptions=True)
+        await asyncio.gather(*pending, return_exceptions=True)
         await self.supervisor.stop()
         await self.guard.stop()
         await self.http.aclose()
@@ -156,6 +162,19 @@ class AppContext:
         self.store.event("stop_run", run_id, "ok" if report.ok else "error", "; ".join(report.steps + report.failed))
         return report
 
+    # --- бенч-прогоны ----------------------------------------------------
+    async def _benches_loop(self) -> None:
+        try:
+            await self.benches.resume()
+        except Exception as exc:  # noqa: BLE001 — сбой возобновления одного прогона не должен ронять цикл
+            self.store.event("bench_resume", "-", "error", str(exc))
+        while True:
+            await asyncio.sleep(BENCHES_POLL_SEC)
+            try:
+                await self.benches.tick()
+            except Exception as exc:  # noqa: BLE001
+                self.store.event("bench_tick", "-", "error", str(exc))
+
     # --- сессии моделей --------------------------------------------------
     async def _sessions_loop(self) -> None:
         await self.sessions.resume()
@@ -177,6 +196,8 @@ class AppContext:
         }
         for s in self.sessions.sessions(active_only=True):
             reasons[f"session:{s.id}"] = f"сессия {s.model or s.recipe}: {s.status}"
+        for b in self.benches.runs(active_only=True):
+            reasons[f"bench:{b.id}"] = f"бенч {b.id}: {b.status}" + (f", стадия {b.stage}" if b.stage else "")
         return reasons
 
     async def _guard_loop(self) -> None:
@@ -242,4 +263,10 @@ def build_context(home: Path | None = None) -> AppContext:
     sessions = SessionManager(
         store, runner, paths, settings, token=lambda: read_secret(paths, "MLSC_TOKEN"), mlsc_pod=observer.mlsc_pod
     )
-    return AppContext(settings, paths, store, kube, manager, supervisor, observer, guard=guard, sessions=sessions)
+    ctx = AppContext(settings, paths, store, kube, manager, supervisor, observer, guard=guard, sessions=sessions)
+    ctx.benches = BenchManager(
+        store, runner, paths, settings, secrets=lambda: secrets_env(paths), mlsc_pod=observer.mlsc_pod, observer=observer,
+        sessions=sessions, agent_limit=ctx.set_agent_limit, stop_tasks=lambda run_id: ctx.stop_own_run(run_id),
+    )
+    sessions.paused = ctx.benches.busy_sessions  # таймер сессии стоит, пока на ней идёт бенч
+    return ctx

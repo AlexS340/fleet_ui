@@ -36,6 +36,7 @@ def build_header(ctx: AppContext) -> None:
                 _chip(f"батарея {guard.battery.percent}%", "warning", lambda: _guard_dialog(ctx, holder))
         ui.link(_cluster_text(ctx), "/cluster").classes("text-white")
         ui.link("Модели", "/models").classes("text-white")
+        ui.link(_benches_text(ctx), "/runs").classes("text-white")
         ui.label(_fetch_text(ctx)).classes("text-sm text-white opacity-80 hidden sm:inline")  # на узком экране шапка в 2 строки
         ui.button("Актуализировать", on_click=fetch).props("flat dense no-caps").classes("text-white")
 
@@ -53,6 +54,13 @@ def build_header(ctx: AppContext) -> None:
 
 def _chip(text: str, color: str, on_click) -> None:
     ui.chip(text, color=color, text_color="white", on_click=on_click).props("clickable dense").classes("m-0")
+
+
+def _benches_text(ctx: AppContext) -> str:
+    active = ctx.benches.runs(active_only=True) if ctx.benches is not None else []
+    attention = sum(1 for r in active if r.status == "attention")
+    text = "Прогоны" + (f" · идёт {len(active)}" if active else "")
+    return text + (f" · ⚠ {attention}" if attention else "")
 
 
 def _cluster_text(ctx: AppContext) -> str:

@@ -21,7 +21,12 @@ def settings_page(ctx: AppContext) -> None:
         with ui.row().classes("gap-4 flex-wrap"):
             auto_fetch = ui.number("Авто-fetch, минут (0 — выключен)", value=s.auto_fetch_minutes, min=0, precision=0)
             ttl = ui.number("TTL worktree, дней", value=s.worktree_ttl_days, min=1, precision=0)
-        ui.label(f"Данные сервиса: {ctx.paths.home}").classes("text-sm opacity-70")
+        datasets_root = ui.input("Корень датасетов Harbor (FLEET_DATASETS_ROOT; пусто — из окружения сервиса)", value=s.datasets_root).classes("w-full")
+        with ui.row().classes("gap-4 flex-wrap"):
+            requeue = ui.number("Раундов requeue упавших", value=s.bench.requeue_rounds, min=0, max=3, precision=0)
+            attention = ui.number("Автогашение без ответа, мин (0 — нет)", value=s.bench.attention_minutes, min=0, precision=0)
+            poll = ui.number("Опрос прогона, с", value=s.bench.poll_seconds, min=5, precision=0)
+        ui.label(f"Данные сервиса: {ctx.paths.home} · секреты: окружение или {ctx.paths.secrets_env.name} (MLSC_TOKEN, AWS_*_gcvmfleet)").classes("text-sm opacity-70")
 
         def save() -> None:
             s.fleet_remote = remote.value.strip()
@@ -31,6 +36,10 @@ def settings_page(ctx: AppContext) -> None:
             s.bastion.socks_proxy = socks.value.strip()
             s.auto_fetch_minutes = int(auto_fetch.value or 0)
             s.worktree_ttl_days = int(ttl.value or 1)
+            s.datasets_root = datasets_root.value.strip()
+            s.bench.requeue_rounds = int(requeue.value or 0)
+            s.bench.attention_minutes = int(attention.value or 0)
+            s.bench.poll_seconds = int(poll.value or 20)
             s.save(ctx.paths)
             ui.notify("Сохранено. Пробросы и зеркало применят новые значения после перезапуска сервиса.")
 

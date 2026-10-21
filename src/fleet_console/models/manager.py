@@ -20,7 +20,7 @@ from fleet_console.fleetref.manager import ReadyRevision
 from fleet_console.fleetref.profile import DUMMY_ENV
 from fleet_console.models.compose import SessionSpec, make_run_id, recipe_summary, write_config
 from fleet_console.runner import Runner
-from fleet_console.settings import Paths, Settings
+from fleet_console.settings import Paths, Settings, scrub
 from fleet_console.store import Session, Store
 
 Clock = Callable[[], datetime]
@@ -62,6 +62,7 @@ class SessionManager:
         self.clock = clock
         self.platform = platform
         self.tasks: dict[str, asyncio.Task] = {}
+        self.paused: Callable[[], set[str]] = set  # сессии, на которых идёт бенч: таймер стоит, гашение — с подтверждением
 
     # --- чтение ----------------------------------------------------------
     def sessions(self, active_only: bool = False) -> list[Session]:
@@ -145,8 +146,10 @@ class SessionManager:
         self._launch(run_id, spec, "preflight")
         return session
 
-    async def stop(self, session_id: str, reason: str = "по кнопке") -> Session:
+    async def stop(self, session_id: str, reason: str = "по кнопке", force: bool = False) -> Session:
         session = self.get(session_id)
+        if session_id in self.paused() and not force:
+            raise SessionError("на сессии идёт бенч: остановите прогон или подтвердите гашение под идущим бенчем")
         task = self.tasks.pop(session_id, None)
         if task is not None and not task.done():
             task.cancel()  # подъём прерван: дальше только гашение
@@ -206,8 +209,12 @@ class SessionManager:
         """Таймер жизни: по истечении — уведомление, через льготный интервал — гашение."""
         now = self.clock()
         grace = timedelta(minutes=self.settings.session_grace_minutes)
+        paused = self.paused()
         for session in self.sessions(active_only=True):
             if session.status != "ready" or not session.expires_at:
+                continue
+            if session.id in paused:  # на сессии идёт бенч: срок сдвигается, пока он не кончится
+                self.store.update_session(session.id, expires_at=_iso(max(_parse(session.expires_at), now + grace)), warned=0)
                 continue
             expires = _parse(session.expires_at)
             if now < expires:
@@ -264,13 +271,14 @@ class SessionManager:
         argv = spec.argv("create_job", print_config=True)
         stage_id = self.store.start_stage(session_id, "preflight", shlex.join(argv), str(spec.resolved))
         self.store.update_session(session_id, stage="preflight")
-        env = {**DUMMY_ENV, "MLSC_TOKEN": self.token() or ""}
-        result = await self.runner.run(argv, cwd=spec.worktree, env=env, timeout=300)
+        # Только заглушки: --print-config резолвит oc.env, и настоящий токен попал бы в resolved.yaml (так и было до Ф3).
+        result = await self.runner.run(argv, cwd=spec.worktree, env=DUMMY_ENV, timeout=300)
         self.store.finish_stage(stage_id, result.returncode)
+        secrets = [self.token() or ""]
         if result.ok:
-            spec.resolved.write_text(result.stdout, encoding="utf-8")
+            spec.resolved.write_text(scrub(result.stdout, secrets), encoding="utf-8")
         else:
-            (spec.run_dir / "logs" / "preflight.log").write_text(result.stderr or result.stdout, encoding="utf-8")
+            (spec.run_dir / "logs" / "preflight.log").write_text(scrub(result.stderr or result.stdout, secrets), encoding="utf-8")
         return result.ok
 
     async def _stage(self, session_id: str, spec: SessionSpec, step: str, *, jobs: int | None = None) -> bool:

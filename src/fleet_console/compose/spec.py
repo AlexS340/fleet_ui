@@ -7,8 +7,9 @@ exp.yaml — обычный эксперимент fleet (defaults и значе
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+import json
 from pathlib import Path
 import re
 from typing import Any
@@ -67,6 +68,10 @@ class BenchSpec:
     @property
     def exp(self) -> Path:
         return self.run_dir / "exp.yaml"
+
+    @property
+    def spec_file(self) -> Path:
+        return self.run_dir / "spec.json"
 
     @property
     def resolved(self) -> Path:
@@ -170,7 +175,30 @@ class BenchSpec:
         )
         if self.sha:
             (self.run_dir / "fleet.sha").write_text(self.sha + "\n", encoding="utf-8")
+        self.spec_file.write_text(self.to_json(), encoding="utf-8")
         return self.exp
+
+    # --- сохранение -----------------------------------------------------------
+    def to_json(self) -> str:
+        data = asdict(self)
+        for key in ("worktree", "run_dir", "overlay"):
+            data[key] = str(data[key])
+        data["dataset"] = self.dataset if isinstance(self.dataset, str) else self.dataset.model_dump()
+        data["extra"] = list(self.extra)
+        return json.dumps(data, ensure_ascii=False, indent=1)
+
+    @classmethod
+    def from_json(cls, text: str, *, pod: str = "", session: SessionLink | None = None) -> "BenchSpec":
+        """Спецификация из spec.json; под MLSC и сессия — живые, подставляются заново."""
+        data = json.loads(text)
+        data["worktree"], data["run_dir"], data["overlay"] = Path(data["worktree"]), Path(data["run_dir"]), Path(data["overlay"])
+        if isinstance(data["dataset"], dict):
+            data["dataset"] = DatasetRef.model_validate(data["dataset"])
+        data["extra"] = tuple(data.get("extra") or ())
+        data["pod"] = pod or data.get("pod", "")
+        stored = data.get("session")
+        data["session"] = session or (SessionLink(**stored) if stored else None)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     # --- команды ------------------------------------------------------------
     def service_overrides(self) -> list[str]:

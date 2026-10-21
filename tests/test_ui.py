@@ -166,3 +166,88 @@ async def test_models_page_sessions(user: User) -> None:
     assert "session:" + session.id in fakes.CTX.sleep_reasons()
     await fakes.CTX.sessions.stop(session.id)
     assert fakes.CTX.sessions.get(session.id).status == "stopped"
+
+
+async def test_benches_page_form_preview_and_run(user: User) -> None:
+    from fleet_console.connect.kube import KubeStatus
+
+    fakes.CTX.kube_status = KubeStatus(context="internal", server="s", allowed=True, ready=True, permissions={"get nodes": True})
+    await user.open("/runs")
+    await user.should_see("Прогоны")
+    await user.should_see("Прогонов ещё нет")
+    user.find("Запустить бенч").click()
+    await user.should_see("Сначала подготовьте совместимую ревизию")
+    user.find("Закрыть").click()
+    await fakes.CTX.manager.prepare("master")
+    user.find("Запустить бенч").click()
+    await user.should_see("ревизия master@378874ba")
+    _select(user, "Пресет").set_value("qwen36-birdsql-smoke")
+    await asyncio.sleep(0.05)
+    await user.should_see("несовместим с ревизией: в ревизии нет mlsc/model=qwen36_35b_a3b")
+    _select(user, "Пресет").set_value("")
+    numbers = {n.props.get("label"): n for n in user.find(kind=ui.number).elements}
+    numbers["Агентов на реплику"].set_value(2)
+    numbers["Лимит задач (пусто — все)"].set_value(3)
+    await user.should_see("GPU: 1 × 8 = 8 · лимит агентов 1 × 2 = 2")
+    user.find("Превью и preflight").click()
+    await user.should_see("Что и где будет запущено")
+    preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
+    assert preview["GPU"] == "1 × a100plus.8gpu.80vG.96C.1456G = 8 GPU" and preview["Параллелизм"] == "лимит 2 = 1 реплик × 2 агентов"
+    assert preview["Модель"].startswith("GLM · образ fleet-vllm:0.24.0 · очередь gigacode · поднимет сервис")
+    await user.should_see("Preflight: ✗ 0 · ⚠ 2")  # квота GPU и terminus-2 на Harbor 0.22
+    await user.should_see("tasks → cowork (fleet)")
+    start = user.find(marker="start-bench").elements.pop()
+    assert not start.enabled  # предупреждения не приняты
+    user.find(marker="accept-warnings").elements.pop().set_value(True)
+    assert start.enabled
+    user.find(marker="start-bench").click()
+    await user.should_see("Запустить прогон?")
+    await user.should_see("стадии: preflight → материализация → create_job → start_llm → check → upload → launch → исполнение → stop_llm → замер")
+    user.find("Да, запустить").click()
+    await user.should_see("начат")
+    await asyncio.gather(*fakes.CTX.benches.tasks.values())
+    run = fakes.CTX.benches.runs()[0]
+    assert run.status == "done" and run.version_id == 777 and run.task_limit == 3 and run.agents_per_replica == 2 and run.id.startswith("glm-cowork-")
+    assert [s.stage for s in fakes.CTX.benches.stages(run.id)] == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "stop_llm", "measure"]
+    assert fakes.CTX.store.get_run(run.id) is not None and run.preview["gpu_per_instance"] == 8 and run.preview["tasks_total"] is None
+    exp = (fakes.CTX.paths.runs / run.id / "exp.yaml").read_text()
+    assert "harbor/dataset: cowork" in exp and "task_limit: 3" in exp and (fakes.CTX.paths.runs / run.id / "resolved.yaml").exists()
+    # карточка прогона по клику на строку
+    await user.open("/runs")
+    await user.should_see("клик по строке — карточка прогона")
+    table = next(iter(user.find(kind=ui.table).elements))
+    assert table.rows[0]["tasks"] == "0 / 0 / 3" and table.rows[0]["status"] == "готов"
+    user.find(kind=ui.table).trigger("rowClick", [None, {"id": run.id}])
+    await user.should_see("Что и где запущено")
+    await user.should_see("подготовка: --print-config · код 0")
+    await user.should_see("замер (Benchboard) · код 0")
+    await user.should_see("Замер заново")
+    await user.should_see("Журнал")
+
+
+async def test_benches_page_full_config_and_manual_edit(user: User) -> None:
+    from fleet_console.connect.kube import KubeStatus
+
+    fakes.CTX.kube_status = KubeStatus(context="internal", server="s", allowed=True, ready=True, permissions={"get nodes": True})
+    await fakes.CTX.manager.prepare("master")
+    await user.open("/runs")
+    user.find("Запустить бенч").click()
+    await user.should_see("Пресет")
+    user.find("Превью и preflight").click()
+    await user.should_see("Preflight:")
+    user.find("Полный конфиг: файлы, комментарии, правка").click()
+    await user.should_see("exp.yaml — эксперимент fleet")
+    await user.should_see("harbor/agent/terminus2.yaml · ревизия fleet")
+    await user.should_see("Агент terminus-2 ходит в Polar gateway.")
+    await user.should_see("resolved.yaml — итоговый конфиг (--print-config)")
+    user.find("Править в этом прогоне").click()  # первый файл из ревизии — system/cluster.yaml
+    await user.should_see("копия system/cluster.yaml в каталоге прогона")
+    await user.should_see("ручные правки: exp.yaml")
+    run_dir = next(p for p in fakes.CTX.paths.runs.iterdir() if (p / "system" / "cluster.yaml").exists())
+    (run_dir / "system" / "cluster.yaml").write_text("# Стенд.\nnamespace: other-ns\n", encoding="utf-8")
+    user.find("Превью и preflight").click()
+    await user.should_see("ручные правки: system/cluster.yaml")
+    user.find("Полный конфиг: файлы, комментарии, правка").click()
+    await user.should_see("system/cluster.yaml · правка прогона")
+    await user.should_see("Diff ручных правок (1)")
+    await user.should_see("+namespace: other-ns")

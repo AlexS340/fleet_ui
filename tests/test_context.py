@@ -6,6 +6,7 @@ from fleet_console.context import AppContext
 from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import FakeRunner
+from fleet_console.runs import BenchManager
 from fleet_console.settings import Paths, Settings
 from fleet_console.store import Store
 from fakes import FakeManager, FakeSupervisor, make_worktree
@@ -40,7 +41,12 @@ def _ctx(tmp_path: Path) -> AppContext:
     runner = FakeRunner()
     observer = ClusterObserver(runner, settings, mlsc_token=lambda: None)
     sessions = SessionManager(store, runner, paths, settings, token=lambda: None, mlsc_pod=observer.mlsc_pod, platform="linux")
-    return AppContext(settings, paths, store, ScriptedKube(), FakeManager(make_worktree(tmp_path / "wt")), FakeSupervisor(), observer, sessions=sessions)  # type: ignore[arg-type]
+    ctx = AppContext(settings, paths, store, ScriptedKube(), FakeManager(make_worktree(tmp_path / "wt")), FakeSupervisor(), observer, sessions=sessions)  # type: ignore[arg-type]
+    ctx.benches = BenchManager(
+        store, runner, paths, settings, secrets=dict, mlsc_pod=observer.mlsc_pod, observer=observer, sessions=sessions,
+        agent_limit=ctx.set_agent_limit, stop_tasks=lambda run_id: ctx.stop_own_run(run_id), platform="linux",
+    )
+    return ctx
 
 
 async def test_permissions_persist_and_recheck_until_green(tmp_path: Path) -> None:
@@ -89,6 +95,10 @@ async def test_sleep_reasons_cover_only_active_own_runs(tmp_path: Path) -> None:
     ctx.store.adopt_run("run-a")
     ctx.store.adopt_run("run-b")  # завершён: активных задач нет
     assert list(ctx.sleep_reasons()) == ["run-a"] and "задач идёт 2" in ctx.sleep_reasons()["run-a"]
+    from fleet_console.store import BenchRun
+
+    ctx.store.create_bench(BenchRun(id="b1", status="running", created_at="t", stage="execute"))
+    assert ctx.sleep_reasons()["bench:b1"] == "бенч b1: running, стадия execute"
 
 
 async def test_control_actions_are_journaled(tmp_path: Path) -> None:
