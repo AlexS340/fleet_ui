@@ -153,7 +153,7 @@ def _render_runs(card: _Card, ctx: AppContext, only_active: bool) -> None:
         return
     all_runs = card.source.data
     shown = [r for r in all_runs if r.active] if only_active else all_runs
-    base = f"http://127.0.0.1:{ctx.settings.argo.local_port}"
+    base = ctx.settings.argo_ui_url.rstrip("/")
     rows = [
         {
             "run": r.run_name,

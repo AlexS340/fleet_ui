@@ -85,6 +85,8 @@ class Settings(BaseModel):
     allowed_contexts: list[str] = Field(default_factory=lambda: ["internal"])
     namespace: str = "swe-bench-v2-20260308"
     bastion: Bastion = Field(default_factory=Bastion)
+    # База ссылок на Argo UI (ingress, открывается через SOCKS бастиона); проброс сервис не держит.
+    argo_ui_url: str = "https://fleet-argo.sberai-rnd.ru"
     cluster: Cluster = Field(default_factory=Cluster)
     auto_fetch_minutes: int = 0
     worktree_ttl_days: int = 14
