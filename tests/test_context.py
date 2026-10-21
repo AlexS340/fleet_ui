@@ -13,9 +13,13 @@ class ScriptedKube:
     def __init__(self) -> None:
         self.calls: list[bool] = []
 
+    down = False
+
     async def status(self, checks=None) -> KubeStatus:
         with_perms = checks is not None
         self.calls.append(with_perms)
+        if self.down:
+            return KubeStatus(context="internal", server="s", allowed=True, ready=False, error="API не отвечает")
         st = KubeStatus(context="internal", server="s", allowed=True, ready=True)
         if with_perms:
             first = self.calls.count(True) == 1
@@ -41,3 +45,14 @@ async def test_permissions_persist_and_recheck_until_green(tmp_path: Path) -> No
     assert ctx.kube_status.missing_permissions == [] and not ctx.needs_permission_check()
     await ctx.refresh_kube(with_permissions=False)
     assert ctx.kube_status.permissions and ctx.kube_status.error == ""
+
+
+async def test_permissions_survive_api_outage(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    await ctx.refresh_kube(with_permissions=True)
+    await ctx.refresh_kube(with_permissions=True)
+    assert ctx.kube_status.missing_permissions == []
+    ctx.kube.down = True  # type: ignore[attr-defined]
+    await ctx.refresh_kube(with_permissions=ctx.needs_permission_check())
+    assert not ctx.kube_status.ready and ctx.kube_status.permissions  # обрыв связи не стирает известные права
+    assert "API не отвечает" in ctx.kube_status.error

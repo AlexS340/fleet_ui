@@ -45,8 +45,8 @@ class AppContext:
         previous = self.kube_status
         checks = required_checks(self.settings.namespace, self.settings.argo.namespace) if with_permissions else None
         status = await self.kube.status(checks)
-        if not with_permissions and status.ready and previous.permissions:
-            status.permissions = previous.permissions  # статус пересоздаётся, а права без повторной проверки не теряем
+        if not with_permissions and previous.permissions:
+            status.permissions = previous.permissions  # права не зависят от связи: показываем последние известные
             if status.missing_permissions and not status.error:
                 status.error = "нет прав: " + ", ".join(status.missing_permissions)
         self.kube_status = status
