@@ -108,7 +108,8 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
             ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
             dialog.open()
             return
-        ui.label(f"ревизия {revision.ref}@{revision.info.sha[:8]}").classes("text-sm opacity-70")
+        ref = revision.ref if revision.ref != revision.info.sha else revision.info.sha[:8]
+        ui.label(f"ревизия {ref}@{revision.info.sha[:8]}" if ref != revision.info.sha[:8] else f"ревизия {ref}").classes("text-sm opacity-70")
         recipes = revision.profile.groups.get("mlsc/model", [])
         recipe = ui.select(recipes, value=recipes[0] if recipes else None, label="Рецепт mlsc/model").classes("w-full")
         info = ui.label().classes("text-xs opacity-70")

@@ -38,8 +38,10 @@ class Harness:
         recipe = worktree / CONFIGS_REL / "mlsc" / "model" / "glm.yaml"
         recipe.parent.mkdir(parents=True)
         recipe.write_text(
-            "# @package mlsc\nserved_model_name: GLM-5.3-Flash\ncreate_job:\n  job:\n    instance_type_name: a100plus.8gpu.80vG.96C.1456G\n",
-            encoding="utf-8",
+            "# @package mlsc\ndefaults:\n  - vllm_base@_here_\n  - _self_\nserved_model_name: GLM-5.3-Flash\n", encoding="utf-8"
+        )
+        (recipe.parent / "vllm_base.yaml").write_text(  # тип инстанса приходит из базового рецепта, как в fleet
+            "create_job:\n  job:\n    instance_type_name: a100plus.8gpu.80vG.96C.1456G\n    image: fleet-vllm:0.24.0\n", encoding="utf-8"
         )
         profile = Profile(sha=SHA, layout="harbor_new", groups={"mlsc/model": ["glm"], "harbor/agent": ["openhands"], "harbor/dataset": ["cowork"]})
         self.store.upsert_revision(SHA, profile.to_dict(), "master")
@@ -83,7 +85,7 @@ def test_compose_helpers(tmp_path: Path, h: Harness) -> None:
     assert make_run_id("GLM-5.3-Flash", T0) == "console-glm-5-3-flash-20261021-120000"
     assert gpu_in("a100plus.8gpu.80vG.96C.1456G") == 8 and gpu_in("cpu.48C") is None
     summary = recipe_summary(h.revision.worktree, "glm")
-    assert summary["served_model_name"] == "GLM-5.3-Flash" and summary["gpu_per_instance"] == 8
+    assert summary["served_model_name"] == "GLM-5.3-Flash" and summary["gpu_per_instance"] == 8 and summary["image"] == "fleet-vllm:0.24.0"
     assert recipe_summary(h.revision.worktree, "missing") == {}
     spec = SessionSpec("r1", Path("/wt"), Path("/runs/r1"), "glm", 2, "nginx", "a", "d", "pod-x", "GLM", ("experiment.agents_per_replica=5",))
     argv = spec.argv("stop", jobs=0)

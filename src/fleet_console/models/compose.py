@@ -42,8 +42,12 @@ def gpu_in(instance_type: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def recipe_summary(worktree: Path, recipe: str) -> dict[str, Any]:
-    """served_model_name, тип инстанса и образ из рецепта mlsc/model — без Hydra, только для формы."""
+def recipe_summary(worktree: Path, recipe: str, _seen: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """served_model_name, тип инстанса и образ из рецепта mlsc/model — без Hydra, только для формы.
+
+    Рецепты наследуют базовые через `defaults: [qwen_vllm_base@_here_, _self_]`: базовые той же группы
+    читаются следом, своё значение рецепта важнее.
+    """
     path = worktree / CONFIGS_REL / "mlsc" / "model" / f"{recipe}.yaml"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -54,6 +58,8 @@ def recipe_summary(worktree: Path, recipe: str) -> dict[str, Any]:
     def walk(node: Any) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
+                if key == "defaults":
+                    continue
                 if key in ("served_model_name", "instance_type_name", "image") and isinstance(value, str) and key not in found:
                     found[key] = value
                 walk(value)
@@ -62,6 +68,12 @@ def recipe_summary(worktree: Path, recipe: str) -> dict[str, Any]:
                 walk(value)
 
     walk(data)
+    for entry in data.get("defaults") or [] if isinstance(data, dict) else []:
+        name = str(entry).split("@", 1)[0] if isinstance(entry, str) else ""
+        if name and name not in {"_self_", recipe} and name not in _seen:
+            for key, value in recipe_summary(worktree, name, _seen | {recipe}).items():
+                if isinstance(value, str):
+                    found.setdefault(key, value)
     found["gpu_per_instance"] = gpu_in(found.get("instance_type_name"))
     return found
 
