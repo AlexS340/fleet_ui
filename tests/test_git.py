@@ -51,6 +51,9 @@ async def test_worktree_lifecycle(mirror: Mirror) -> None:
     assert await mirror.worktree_add(sha) == path  # идемпотентно
     assert mirror.worktrees() == [sha]
     assert await mirror.is_clean(path)
+    (path / ".venv" / "bin").mkdir(parents=True)
+    (path / ".venv" / "bin" / "fleet").touch()
+    assert await mirror.is_clean(path)  # .venv сервиса не делает worktree грязным
     (path / "feat.txt").write_text("dirty")
     assert not await mirror.is_clean(path)
     await mirror.worktree_remove(sha)

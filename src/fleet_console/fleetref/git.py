@@ -161,5 +161,7 @@ class Mirror:
         await self._git("worktree", "prune")
 
     async def is_clean(self, path: Path) -> bool:
-        result = _check(await self.runner.run(["git", "-C", str(path), "status", "--porcelain"]))
+        """Нет изменений и чужих файлов; `.venv` — артефакт сервиса, не считается."""
+        argv = ["git", "-C", str(path), "status", "--porcelain", "--", ".", ":(exclude).venv"]
+        result = _check(await self.runner.run(argv))
         return result.stdout.strip() == ""
