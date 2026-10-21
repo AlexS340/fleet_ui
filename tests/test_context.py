@@ -60,3 +60,17 @@ async def test_permissions_survive_api_outage(tmp_path: Path) -> None:
     await ctx.refresh_kube(with_permissions=ctx.needs_permission_check())
     assert not ctx.kube_status.ready and ctx.kube_status.permissions  # обрыв связи не стирает известные права
     assert "API не отвечает" in ctx.kube_status.error
+
+
+async def test_gateway_open_close(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    ctx.port_picker = lambda preferred: preferred
+    gw = ctx.open_gateway("litellm")
+    assert gw.base_url == "http://127.0.0.1:18080/v1" and gw.argv[-2:] == ["service/litellm-fleet", "18080:80"]
+    assert ctx.open_gateway("litellm") is gw  # повторно — тот же проброс
+    fwd = ctx.supervisor.forward("gateway-litellm")
+    assert fwd.depends_on == "bastion" and "kubectl -n litellm-argo port-forward" in fwd.hint
+    ctx.close_gateway("litellm")
+    assert all(f.name != "gateway-litellm" for f in ctx.supervisor.forwards) and not ctx.gateways
+    ctx.close_gateway("litellm")  # повторно — тихо
+    assert [e.action for e in ctx.store.events()] == ["close_gateway", "open_gateway"]

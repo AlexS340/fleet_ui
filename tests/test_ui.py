@@ -107,3 +107,22 @@ async def test_cluster_page_marks_own_runs(user: User) -> None:
         assert [m["own"] for m in tables["gpus"].rows] == ["да", "—"]  # версия 41 своя, 42 чужая
     finally:
         fakes.CTX.store.forget_run("run-a")
+
+
+async def test_models_page_gateway_and_sandbox(user: User) -> None:
+    await user.open("/models")
+    await user.should_see("Шлюз моделей")
+    user.find("Пробросить порт").click()
+    await user.should_see("http://127.0.0.1:18080/v1")
+    await user.should_see("GLM-5.3-Flash (512k)")
+    assert fakes.CTX.supervisor.forward("gateway-litellm").argv[-1] == "18080:80"
+    await user.should_see("Модели")  # чип в шапке и ссылка
+    box = next(t for t in user.find(kind=ui.textarea).elements if t.props.get("label") == "Сообщение")
+    box.set_value("Привет")
+    user.find("Отправить").click()
+    await user.should_see("Привет, мир")
+    await user.should_see("до первого токена")
+    await user.should_see("finish: tool_calls")
+    user.find("Закрыть проброс").click()
+    await user.should_see("Пробросить порт")
+    assert not fakes.CTX.gateways

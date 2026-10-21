@@ -8,6 +8,7 @@ import tempfile
 from types import SimpleNamespace
 
 import cluster_samples
+import fake_gateway
 from fleet_console.connect.kube import KubeStatus
 from fleet_console.connect.supervisor import Forward, ForwardState
 from fleet_console.context import AppContext
@@ -50,6 +51,16 @@ class FakeSupervisor:
 
     def log_path(self, fwd: Forward) -> Path | None:
         return None
+
+    def add(self, fwd: Forward) -> None:
+        if fwd.name in self.states:
+            raise ValueError(fwd.name)
+        self.forwards.append(fwd)
+        self.states[fwd.name] = ForwardState(status="green")  # в симуляции проброс поднимается мгновенно
+
+    def remove(self, name: str) -> None:
+        self.states.pop(name, None)
+        self.forwards = [f for f in self.forwards if f.name != name]
 
     async def run(self) -> None:
         pass
@@ -145,4 +156,6 @@ def make_context() -> AppContext:
         manager=FakeManager(make_worktree(root / "wt")),  # type: ignore[arg-type]
         supervisor=FakeSupervisor(),  # type: ignore[arg-type]
         observer=ClusterObserver(kubectl, settings, mlsc_token=lambda: "token"),
+        http=fake_gateway.client(),
+        port_picker=lambda preferred: preferred,  # порт из настроек, без проверки занятости
     )

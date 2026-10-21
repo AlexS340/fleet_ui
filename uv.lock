@@ -200,6 +200,7 @@ name = "fleet-console"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "nicegui" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -214,6 +215,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "nicegui", specifier = ">=3.18,<4" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pyyaml", specifier = ">=6.0" },

@@ -76,6 +76,11 @@ class Cluster(BaseModel):
     nginx_key: str = "model-upstreams.conf"
     submitter_pod: str = "fleet-submitter-python"
     node_selector: str = "type=bench"
+    # Шлюзы моделей для проброса порта: namespace/service:port. litellm — маршрут fleet по умолчанию
+    # (`http://litellm.litellm-argo`, тот же пул подов); деплоймент nginx-vllm-proxy в 0, работает -test.
+    litellm_gateway: str = "litellm-argo/litellm-fleet:80"
+    nginx_gateway: str = "vllm-proxy/nginx-vllm-proxy-test:80"
+    gateway_ports: dict[str, int] = Field(default_factory=lambda: {"litellm": 18080, "nginx": 18081})
 
 
 class Settings(BaseModel):

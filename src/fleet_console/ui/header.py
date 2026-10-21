@@ -27,6 +27,7 @@ def build_header(ctx: AppContext) -> None:
             st = ctx.supervisor.state(fwd.name)
             _chip(fwd.title, STATUS_COLORS[st.status], lambda name=fwd.name: _forward_dialog(ctx, name))
         ui.link(_cluster_text(ctx), "/cluster").classes("text-white")
+        ui.link("Модели", "/models").classes("text-white")
         ui.label(_fetch_text(ctx)).classes("text-sm text-white opacity-80 hidden sm:inline")  # на узком экране шапка в 2 строки
         ui.button("Актуализировать", on_click=fetch).props("flat dense no-caps").classes("text-white")
 

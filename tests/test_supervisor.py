@@ -155,3 +155,29 @@ async def test_spawn_failure_and_stop(h: Harness) -> None:
     await h.sup.restart("bastion")
     await h.tick()
     assert h.ssh_spawns() == 2
+
+
+async def test_dynamic_forward_add_and_remove(h: Harness) -> None:
+    h.healthy["bastion"] = True
+    await h.tick()
+    await h.tick()  # бастион зелёный, argo запустился
+    assert h.sup.state("bastion").status == "green"
+    healthy = {"gw": False}
+
+    async def h_gw() -> bool:
+        return healthy["gw"]
+
+    h.sup.add(Forward("gw", "шлюз litellm", ["pf", "gateway"], h_gw, depends_on="bastion"))
+    with pytest.raises(ValueError):
+        h.sup.add(Forward("gw", "дубль", ["pf"], h_gw))
+    await h.tick()
+    assert h.spawned[-1][0] == "pf" and h.sup.state("gw").status == "yellow"
+    healthy["gw"] = True
+    await h.tick()
+    assert h.sup.state("gw").status == "green"
+    proc = h.spawned[-1][1]
+    h.sup.remove("gw")
+    assert proc.killed and "gw" not in h.sup.states and all(f.name != "gw" for f in h.sup.forwards)
+    await h.tick()
+    assert h.spawned[-1][1] is proc  # после удаления ничего не перезапускается
+    h.sup.remove("gw")  # повторное удаление — не ошибка

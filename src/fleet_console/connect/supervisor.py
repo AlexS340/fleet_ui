@@ -99,6 +99,20 @@ class Supervisor:
     def forward(self, name: str) -> Forward:
         return next(f for f in self.forwards if f.name == name)
 
+    def add(self, fwd: Forward) -> None:
+        """Проброс на лету (шлюз моделей по кнопке): поднимется на следующем тике."""
+        if fwd.name in self.states:
+            raise ValueError(f"проброс «{fwd.name}» уже есть")
+        self.forwards.append(fwd)
+        self.states[fwd.name] = ForwardState()
+
+    def remove(self, name: str) -> None:
+        """Убрать проброс и убить его процесс; незнакомое имя — не ошибка."""
+        st = self.states.pop(name, None)
+        if st is not None:
+            self._kill(st)
+        self.forwards = [f for f in self.forwards if f.name != name]
+
     def log_path(self, fwd: Forward) -> Path | None:
         return self.log_dir / f"{fwd.name}.log" if self.log_dir else None
 
@@ -127,8 +141,9 @@ class Supervisor:
         if self._last_tick is not None and now - self._last_tick > self.sleep_gap:
             self._restart_all(f"разрыв {int(now - self._last_tick)} с между тиками — похоже, Mac спал")
         self._last_tick = now
-        for fwd in self.forwards:
-            await self._tick_one(fwd, now)
+        for fwd in list(self.forwards):  # копия: проброс могут убрать из UI, пока тик ждёт проверку
+            if fwd.name in self.states:
+                await self._tick_one(fwd, now)
 
     async def _tick_one(self, fwd: Forward, now: float) -> None:
         st = self.states[fwd.name]

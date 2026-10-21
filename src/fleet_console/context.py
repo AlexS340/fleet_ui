@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+import shlex
+
+import httpx
 
 from fleet_console.catalog import CatalogEntry, scan
+from fleet_console.connect.gateway import Gateway, free_port, parse_target, probe
 from fleet_console.connect.kube import Kube, KubeStatus, required_checks
 from fleet_console.connect.supervisor import Forward, Supervisor, subprocess_spawner
 from fleet_console.fleetref.git import Mirror
@@ -31,10 +36,40 @@ class AppContext:
     supervisor: Supervisor
     observer: ClusterObserver
     kube_status: KubeStatus = field(default_factory=KubeStatus)
+    http: httpx.AsyncClient = field(default_factory=httpx.AsyncClient)  # шлюз моделей и песочница
+    gateways: dict[str, Gateway] = field(default_factory=dict)  # открытые пробросы к шлюзам по ключу
+    port_picker: Callable[[int], int] = free_port
     _tasks: list[asyncio.Task] = field(default_factory=list)
 
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
         return scan(worktree)
+
+    # --- шлюз моделей ----------------------------------------------------
+    def open_gateway(self, key: str) -> Gateway:
+        """Поднять port-forward к шлюзу под супервизором; повторный вызов возвращает уже открытый."""
+        if key in self.gateways:
+            return self.gateways[key]
+        c = self.settings.cluster
+        namespace, service, port = parse_target({"litellm": c.litellm_gateway, "nginx": c.nginx_gateway}[key])
+        gateway = Gateway(key, namespace, service, port, self.port_picker(c.gateway_ports.get(key, 0)))
+
+        async def health() -> bool:
+            return await probe(self.http, gateway.base_url)
+
+        depends_on = BASTION if self.settings.bastion.ssh_host else None
+        self.supervisor.add(
+            Forward(gateway.name, gateway.title, gateway.argv, health, depends_on=depends_on, hint=f"Руками: {shlex.join(gateway.argv)}")
+        )
+        self.gateways[key] = gateway
+        self.store.event("open_gateway", key, "ok", gateway.base_url)
+        return gateway
+
+    def close_gateway(self, key: str) -> None:
+        gateway = self.gateways.pop(key, None)
+        if gateway is None:
+            return
+        self.supervisor.remove(gateway.name)
+        self.store.event("close_gateway", key, "ok", gateway.base_url)
 
     def needs_permission_check(self) -> bool:
         """Права проверяем, пока их не знаем или пока хоть одно «✗»: отказ бывает транзитным (ssh только поднялся)."""
@@ -66,6 +101,7 @@ class AppContext:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.supervisor.stop()
+        await self.http.aclose()
         self.store.close()
 
     async def _kube_loop(self) -> None:
