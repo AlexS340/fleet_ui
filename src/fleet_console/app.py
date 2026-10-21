@@ -5,6 +5,7 @@ from __future__ import annotations
 from nicegui import app, ui
 
 from fleet_console.context import AppContext, build_context
+from fleet_console.ui.cluster import cluster_page
 from fleet_console.ui.revision import revision_page
 from fleet_console.ui.settings import settings_page
 
@@ -15,6 +16,10 @@ def create_app(ctx: AppContext) -> None:
     @ui.page("/")
     async def index() -> None:
         await revision_page(ctx)
+
+    @ui.page("/cluster")
+    async def cluster() -> None:
+        await cluster_page(ctx)
 
     @ui.page("/settings")
     def settings() -> None:

@@ -78,3 +78,20 @@ async def test_settings_page_saves(user: User) -> None:
     user.find("Сохранить").click()
     await user.should_see("Сохранено")
     assert fakes.CTX.paths.settings_file.exists()
+
+
+async def test_cluster_page_shows_all_sources(user: User) -> None:
+    await user.open("/cluster")
+    await user.should_see("Кластер")
+    user.find("Обновить").click()
+    await user.should_see("скрыто завершённых прогонов: 2")  # активный run-a виден, run-b и безлейбловый скрыты
+    await user.should_see("живых версий: 2 · GPU занято: 28")
+    await user.should_see("узлов 3, готовых 2, cordoned 1")
+    await user.should_see("подов в Pending: 2")
+    await user.should_see("Кластер · прогонов идёт: 1 · GPU: 28")  # сводка в шапке
+    tables = {t.columns[-1]["name"]: t for t in user.find(kind=ui.table).elements}  # у Argo и сабмиттера row_key одинаковый
+    runs, models, route = tables["argo"], tables["gpus"], tables["replicas"]
+    assert [r["run"] for r in runs.rows] == ["run-a"] and runs.rows[0]["pending"] == 1
+    assert "label=fleet%2Frun-name%3Drun-a" in runs.rows[0]["argo"]
+    assert [m["model"] for m in models.rows] == ["GLM-5.3-Flash", "Qwen3"] and models.rows[0]["gpus"] == 24
+    assert route.rows == [{"model": "GLM-5.3-Flash", "replicas": 2}, {"model": "Qwen3", "replicas": 1}]

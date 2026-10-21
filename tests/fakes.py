@@ -7,12 +7,15 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 
+import cluster_samples
 from fleet_console.connect.kube import KubeStatus
 from fleet_console.connect.supervisor import Forward, ForwardState
 from fleet_console.context import AppContext
 from fleet_console.fleetref.git import Branch, Commit, CommitInfo
 from fleet_console.fleetref.manager import PrepareError, Progress, ReadyRevision
 from fleet_console.fleetref.profile import CONFIGS_REL, Profile
+from fleet_console.observe import ClusterObserver
+from fleet_console.runner import FakeRunner
 from fleet_console.settings import Paths, Settings
 from fleet_console.store import Store
 
@@ -135,6 +138,8 @@ def make_context() -> AppContext:
     root = Path(tempfile.mkdtemp(prefix="fleet-console-ui-test-"))
     paths = Paths(root / "home").ensure()
     settings = Settings()
+    kubectl = FakeRunner()
+    cluster_samples.install(kubectl, settings.namespace)
     return AppContext(
         settings=settings,
         paths=paths,
@@ -142,4 +147,5 @@ def make_context() -> AppContext:
         kube=FakeKube(),  # type: ignore[arg-type]
         manager=FakeManager(make_worktree(root / "wt")),  # type: ignore[arg-type]
         supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+        observer=ClusterObserver(kubectl, settings, mlsc_token=lambda: "token"),
     )

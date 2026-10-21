@@ -26,6 +26,7 @@ def build_header(ctx: AppContext) -> None:
         for fwd in ctx.supervisor.forwards:
             st = ctx.supervisor.state(fwd.name)
             _chip(fwd.title, STATUS_COLORS[st.status], lambda name=fwd.name: _forward_dialog(ctx, name))
+        ui.link(_cluster_text(ctx), "/cluster").classes("text-white")
         ui.label(_fetch_text(ctx)).classes("text-sm text-white opacity-80 hidden sm:inline")  # на узком экране шапка в 2 строки
         ui.button("Актуализировать", on_click=fetch).props("flat dense no-caps").classes("text-white")
 
@@ -43,6 +44,17 @@ def build_header(ctx: AppContext) -> None:
 
 def _chip(text: str, color: str, on_click) -> None:
     ui.chip(text, color=color, text_color="white", on_click=on_click).props("clickable dense").classes("m-0")
+
+
+def _cluster_text(ctx: AppContext) -> str:
+    """Ссылка на дашборд со сводкой: сколько прогонов идёт и сколько GPU занято."""
+    obs = ctx.observer
+    parts = []
+    if obs.runs.data is not None:
+        parts.append(f"прогонов идёт: {sum(1 for r in obs.runs.data if r.active)}")
+    if obs.mlsc.data is not None:
+        parts.append(f"GPU: {sum(v.gpus or 0 for v in obs.mlsc.data)}")
+    return "Кластер" + (" · " + " · ".join(parts) if parts else "")
 
 
 def _fetch_text(ctx: AppContext) -> str:
