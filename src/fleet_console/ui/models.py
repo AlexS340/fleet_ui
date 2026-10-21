@@ -193,7 +193,7 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
             _status_text(s),
             f"рецепт {s.recipe}",
             f"модель {s.model or '(из рецепта)'}",
-            f"ревизия {s.ref}@{s.sha[:8]}",
+            f"ревизия {s.ref}@{s.sha[:8]}" if s.ref and s.ref != s.sha else f"ревизия {s.sha[:8]}",
             f"маршрут {s.inference}",
             f"реплик {s.replicas}" + (f" — в MLSC план {v.planned}, факт {v.current}, {v.gpus or 0} GPU" if v else ""),
             f"version_id {s.version_id if s.version_id is not None else '—'}",
