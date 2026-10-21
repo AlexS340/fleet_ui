@@ -53,7 +53,7 @@ async def revision_page(ctx: AppContext) -> None:
     @ui.refreshable
     def result_view() -> None:
         r = ctx.manager.current
-        if r is None:
+        if r is None or ctx.manager.progress.busy:  # пока готовится другая ревизия, старый результат не показываем
             return
         pr = r.profile
         with ui.column().classes("w-full gap-2"):
@@ -146,6 +146,9 @@ async def revision_page(ctx: AppContext) -> None:
 
     async def tick() -> None:
         progress_view.refresh()
+        if ctx.manager.progress.busy != state.get("was_busy"):
+            state["was_busy"] = ctx.manager.progress.busy
+            result_view.refresh()
         if not state.get("loaded") and ctx.manager.mirror.exists() and not ctx.manager.progress.busy:
             await load_branches()  # зеркало появилось после открытия страницы
 
