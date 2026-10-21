@@ -99,15 +99,18 @@ async def test_cluster_page_shows_all_sources(user: User) -> None:
 
 async def test_cluster_page_marks_own_runs(user: User) -> None:
     fakes.CTX.store.adopt_run("run-a", 41, model="GLM")
+    fakes.CTX.store.adopt_run("run-gone", None, model="old")  # workflows удалены: строка нужна, чтобы прогон можно было забыть
     try:
         await user.open("/cluster")
         user.find("Обновить").click()
         await user.should_see("скрыто завершённых прогонов: 2")
         tables = {t.columns[-1]["name"]: t for t in user.find(kind=ui.table).elements}
         assert tables["argo"].rows[0]["own"] == "да"
+        assert tables["argo"].rows[-1]["run"] == "run-gone" and tables["argo"].rows[-1]["own"] == "да · workflows не видно"
         assert [m["own"] for m in tables["gpus"].rows] == ["да", "—"]  # версия 41 своя, 42 чужая
     finally:
         fakes.CTX.store.forget_run("run-a")
+        fakes.CTX.store.forget_run("run-gone")
 
 
 async def test_models_page_gateway_and_sandbox(user: User) -> None:

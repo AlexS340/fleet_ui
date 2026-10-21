@@ -9,6 +9,7 @@ from nicegui import ui
 from fleet_console.catalog import GROUP_TITLES, group_order
 from fleet_console.context import AppContext
 from fleet_console.fleetref.manager import PrepareError
+from fleet_console.ui.common import hint
 from fleet_console.ui.header import build_header
 
 PHASES = {
@@ -122,7 +123,9 @@ async def revision_page(ctx: AppContext) -> None:
         await show_info()
 
     with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-4"):
-        ui.label("Ревизия fleet").classes("text-xl")
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Ревизия fleet").classes("text-xl")
+            hint("Ревизия — коммит fleet: из него готовится worktree, его кодом и конфигами идут сессии и прогоны.")
         with ui.row().classes("w-full items-end gap-3 flex-wrap"):
             branch_select = ui.select({}, label="Ветка", with_input=True, on_change=lambda e: on_branch(e.value))
             branch_select.classes("flex-1 min-w-[16rem]")

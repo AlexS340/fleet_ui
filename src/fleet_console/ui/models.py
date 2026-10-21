@@ -13,7 +13,7 @@ from fleet_console.context import AppContext
 from fleet_console.models import SessionError, sandbox
 from fleet_console.models.compose import recipe_summary
 from fleet_console.store import Session
-from fleet_console.ui.common import confirm_dialog
+from fleet_console.ui.common import confirm_dialog, hint
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
 
 GATEWAY_OPTIONS = {"litellm": "litellm — маршрут fleet по умолчанию", "nginx": "nginx — vllm-proxy"}
@@ -67,6 +67,7 @@ def _sessions_card(ctx: AppContext) -> None:
     with ui.card().classes("w-full"):
         with ui.row().classes("w-full items-center gap-3"):
             ui.label("Сессии моделей").classes("text-lg")
+            hint("Сессия — модель, поднятая отсюда на время шагами fleet mlsc.*; по таймеру гасится, GPU освобождаются.")
             ui.space()
             ui.button("Поднять модель", on_click=lambda: _new_session_dialog(ctx, render)).props("unelevated no-caps")
         table = ui.table(columns=SESSION_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense flat")
@@ -264,6 +265,7 @@ def _gateway_card(ctx: AppContext, state: dict) -> None:
     with ui.card().classes("w-full"):
         with ui.row().classes("w-full items-center gap-3 flex-wrap"):
             ui.label("Шлюз моделей").classes("text-lg")
+            hint("Проброс порта к litellm или nginx: через него песочница и бенчи ходят в модели.")
             key = ui.select(GATEWAY_OPTIONS, value=next(iter(ctx.gateways), "litellm"), label="Шлюз").classes("w-80")
             toggle = ui.button("Пробросить порт", on_click=lambda: _toggle()).props("unelevated no-caps")
             status = ui.label().classes("text-sm")
@@ -353,7 +355,9 @@ def _sandbox_card(ctx: AppContext, state: dict) -> None:
     """Диалог с моделью через проброшенный шлюз: текст, reasoning, tool_calls, тайминги."""
     messages: list[dict] = []
     with ui.card().classes("w-full"):
-        ui.label("Песочница").classes("text-lg")
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Песочница").classes("text-lg")
+            hint("Чат с моделью через проброс: убедиться, что отвечает, посмотреть reasoning, tool_calls и тайминги.")
         with ui.row().classes("w-full gap-3 flex-wrap items-end"):
             model = ui.select([], label="Модель", with_input=True).classes("w-80")
             temperature = ui.number("temperature", value=0.7, min=0, max=2, step=0.1).classes("w-28")

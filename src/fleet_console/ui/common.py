@@ -1,8 +1,16 @@
-"""Общие кусочки UI: диалог подтверждения разрушительного действия."""
+"""Общие кусочки UI: диалог подтверждения разрушительного действия, вопросик с подсказкой."""
 
 from __future__ import annotations
 
 from nicegui import ui
+
+
+def hint(text: str) -> ui.icon:
+    """Вопросик рядом с термином: объяснение по наведению, экран не перегружается."""
+    icon = ui.icon("help_outline").classes("text-base opacity-50 cursor-help")
+    with icon:
+        ui.tooltip(text).props('max-width="24rem"').classes("text-sm")
+    return icon
 
 
 def confirm_dialog(title: str, lines: list[str], action, after=None, button: str = "Выполнить") -> None:

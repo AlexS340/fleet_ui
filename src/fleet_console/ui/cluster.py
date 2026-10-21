@@ -14,7 +14,7 @@ from fleet_console.context import AppContext
 from fleet_console.observe import Source
 from fleet_console.observe.argo import argo_ui_url
 from fleet_console.observe.submitter import ROOT
-from fleet_console.ui.common import confirm_dialog
+from fleet_console.ui.common import confirm_dialog, hint
 from fleet_console.ui.header import build_header
 
 LINK_SLOT = '<q-td :props="props"><a :href="props.value" target="_blank" class="text-primary">Argo UI</a></q-td>'
@@ -69,14 +69,28 @@ SUBMITTER_COLUMNS = [
 ]
 
 
+HINTS = {
+    "Прогоны Argo": (
+        "Argo Workflows — движок задач в кластере. Прогон — запуск бенча: пачка workflows (по одному на задачу) "
+        "с общим run-name. Усыновить — пометить чужой прогон своим, чтобы управлять им отсюда."
+    ),
+    "Модели MLSC": "MLSC — сервис инференса. Версия — поднятая модель; план и факт — сколько инстансов заказано и живёт.",
+    "Шлюз nginx": "nginx перед моделями: маршрут по имени модели, реплики — сколько инстансов в нём.",
+    "Сабмиттер": "Под, который по очереди шлёт workflows прогона в Argo. Лимит агентов — сколько задач идёт одновременно; 0 — пауза.",
+    "Узлы пула": "Узлы type=bench: на них бегут задачи прогонов.",
+}
+
+
 class _Card:
-    """Карточка источника: заголовок, время опроса, ошибка, сводка, таблица, подпись."""
+    """Карточка источника: заголовок с подсказкой, время опроса, ошибка, сводка, таблица, подпись."""
 
     def __init__(self, source: Source, columns: list[dict] | None = None, row_key: str = "id") -> None:
         self.source = source
         with ui.card().classes("w-full"):
             with ui.row().classes("w-full items-baseline gap-2"):
                 ui.label(source.title).classes("text-lg")
+                if source.title in HINTS:
+                    hint(HINTS[source.title])
                 self.ago = ui.label().classes("text-xs opacity-60")
             self.error = ui.label().classes("text-negative text-sm whitespace-pre-wrap font-mono")
             self.summary = ui.label().classes("text-sm opacity-80")
@@ -175,7 +189,24 @@ def _render_runs(card: _Card, ctx: AppContext, only_active: bool) -> None:
         }
         for r in shown
     ]
-    summary = "" if shown else f"активных прогонов нет (всего {len(all_runs)})"
+    seen = {r.run_name for r in all_runs}
+    rows += [  # свой прогон, чьих workflows в Argo уже нет (удалены или ушли в архив): иначе его негде «забыть»
+        {
+            "run": o.run_id,
+            "model": o.model or "—",
+            "own": "да · workflows не видно",
+            "running": 0,
+            "pending": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "started": "—",
+            "finished": "—",
+            "argo": argo_ui_url(base, ctx.settings.namespace, o.run_id),
+        }
+        for o in own.values()
+        if o.run_id not in seen
+    ]
+    summary = "" if rows else f"активных прогонов нет (всего {len(all_runs)})"
     note = "клик по строке — усыновить чужой прогон или забыть свой"
     if len(shown) < len(all_runs):
         note += f" · скрыто завершённых прогонов: {len(all_runs) - len(shown)}"
