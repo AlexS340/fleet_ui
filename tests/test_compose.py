@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+import pytest
+
 from fleet_console.compose import (
     BenchSpec,
     SessionLink,
@@ -15,9 +17,12 @@ from fleet_console.compose import (
     load_issues,
     make_bench_id,
     manual_edits,
+    overlay_origin,
     run_checks,
+    save_to_overlay,
     sources,
     summary,
+    three_way,
     unified_diff,
     validate_yaml,
 )
@@ -209,6 +214,8 @@ def test_preflight_checks(tmp_path: Path) -> None:
     assert by["dataset"].level == "fail" and by["registry"].level == "fail"
     no_dir = run_checks(secrets={}, **{**common, "resolved": {**resolved, "harbor_job": {"datasets": [{"path": str(root / "missing")}]}}})
     assert "нет каталога" in {c.key: c for c in no_dir}["dataset"].detail
+    drift = run_checks(secrets={}, **common, overlay_drift=["harbor/agent/x.yaml: оригинал harbor/agent/terminus2.yaml изменился после ревизии 378874b3"])
+    assert {c.key: c for c in drift}["overlay"].level == "warn" and "overlay" not in {c.key for c in no_dir}
 
 
 def test_sources_edit_and_diff(tmp_path: Path) -> None:
@@ -230,3 +237,38 @@ def test_sources_edit_and_diff(tmp_path: Path) -> None:
     assert len(edits) == 1 and edits[0][0] == "harbor/agent/terminus2_cowork.yaml" and "-    - name: terminus-2-cowork" in edits[0][1] and "+    - name: terminus-2-mine" in edits[0][1]
     assert unified_diff("a\n", "a\n", "x") == "" and validate_yaml("a: [1") and validate_yaml("a: 1") is None
     assert "строка 1" in validate_yaml("a: b: c")
+
+
+def test_save_to_overlay_and_three_way(tmp_path: Path) -> None:
+    spec = spec_for(tmp_path)
+    spec.write()
+    text = spec.exp.read_text(encoding="utf-8")
+    agent = next(f for f in sources(text, spec.run_dir, spec.worktree, spec.overlay) if f.group == "harbor/agent")
+    assert agent.origin == "fleet"
+    copy_for_edit(agent, spec.run_dir).write_text(agent.text.replace("name: terminus-2", "name: terminus-2-mine"), encoding="utf-8")
+    edited = next(f for f in sources(text, spec.run_dir, spec.worktree, spec.overlay) if f.group == "harbor/agent")
+    assert edited.origin == "run"
+    with pytest.raises(ValueError, match="в ревизии уже есть"):
+        save_to_overlay(edited, spec.overlay, spec.worktree, "terminus2", sha=spec.sha, run_id=spec.run_id)
+    with pytest.raises(ValueError, match="имя"):
+        save_to_overlay(edited, spec.overlay, spec.worktree, "Bad Name", sha=spec.sha, run_id=spec.run_id)
+    target = save_to_overlay(edited, spec.overlay, spec.worktree, "terminus2-mine", sha=spec.sha, run_id=spec.run_id)
+    assert target == spec.overlay / "harbor" / "agent" / "terminus2-mine.yaml"
+    saved = target.read_text(encoding="utf-8")
+    lines = saved.splitlines()
+    assert lines[0] == "# @package _global_"  # директива Hydra остаётся первой строкой
+    assert lines[1] == f"# fleet-console: из harbor/agent/terminus2.yaml ревизии {spec.sha} · правка прогона {spec.run_id}"
+    assert "name: terminus-2-mine" in saved and overlay_origin(saved) == ("harbor/agent/terminus2.yaml", spec.sha)
+    assert overlay_origin("# @package _global_\nharbor_job: {}\n") is None
+    with pytest.raises(ValueError, match="в overlay уже есть"):
+        save_to_overlay(edited, spec.overlay, spec.worktree, "terminus2-mine", sha=spec.sha, run_id=spec.run_id)
+    # теперь overlay-файл — член группы и виден в sources под своим именем
+    exp2 = text.replace("harbor/agent: terminus2", "harbor/agent: terminus2-mine")
+    mine = next(f for f in sources(exp2, tmp_path / "other-run", spec.worktree, spec.overlay) if f.group == "harbor/agent")
+    assert mine.origin == "overlay" and mine.name == "terminus2-mine"
+
+    assert three_way(mine.rel, agent.rel, spec.sha, agent.text, agent.text, saved) is None  # оригинал не менялся
+    drift = three_way(mine.rel, agent.rel, spec.sha, agent.text, agent.text.replace("terminus-2", "terminus-3"), saved)
+    assert drift is not None and drift.summary == "harbor/agent/terminus2-mine.yaml: оригинал harbor/agent/terminus2.yaml изменился после ревизии 378874b3"
+    assert "+    - name: terminus-3" in drift.diff_original and "-    - name: terminus-2" in drift.diff_original
+    assert "+    - name: terminus-2-mine" in drift.diff_mine and "fleet-console" not in drift.diff_mine  # шапка overlay в diff не попадает

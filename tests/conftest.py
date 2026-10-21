@@ -2,12 +2,17 @@
 
 pytest_plugins = ["nicegui.testing.user_plugin"]
 
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 import pytest
 
-from fleet_console.settings import Paths
+# overlay сервиса в тестах — временный каталог: «Сохранить в overlay» не должно писать в репозиторий
+os.environ.setdefault("FLEET_CONSOLE_OVERLAY", tempfile.mkdtemp(prefix="fleet-console-overlay-"))
+
+from fleet_console.settings import Paths  # noqa: E402 — после переменной окружения
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "Egor",

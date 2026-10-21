@@ -145,6 +145,10 @@ class FakeManager:
         self.prepared: list[str] = []
         self.fetched = 0
         self.mirror = SimpleNamespace(exists=lambda: True, last_fetch_at=lambda: NOW, remote="fake")
+        self.files_at: dict[tuple[str, str], str] = {}  # (sha, путь группы) → текст на той ревизии
+
+    async def file_at(self, sha: str, rel: str) -> str | None:
+        return self.files_at.get((sha, rel))
 
     async def ensure_mirror(self) -> None:
         pass

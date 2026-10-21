@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import difflib
 from pathlib import Path
+import re
 
 import yaml
 
@@ -122,3 +123,75 @@ def validate_yaml(text: str) -> str | None:
         where = f"строка {mark.line + 1}: " if mark else ""
         return where + str(getattr(exc, "problem", None) or exc).strip()
     return None
+
+
+# --- overlay: правка прогона → файл группы сервиса -------------------------------------
+
+OVERLAY_HEADER_RE = re.compile(r"^#\s*fleet-console:\s*из\s+(\S+)\s+ревизии\s+([0-9a-f]{7,40})")
+PACKAGE_LINE_RE = re.compile(r"^#\s*@package\s")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+
+
+def save_to_overlay(src: SourceFile, overlay: Path, worktree: Path, new_name: str, *, sha: str, run_id: str) -> Path:
+    """Копия правленного файла в overlay/<группа>/<имя>.yaml с шапкой о происхождении.
+
+    Имя не должно совпадать с членом группы в ревизии: файл ревизии ищется раньше overlay, и копия
+    никогда бы не применилась. Существующий файл overlay не перезаписывается.
+    """
+    name = new_name.strip()
+    if not NAME_RE.match(name):
+        raise ValueError("имя: строчные латинские буквы, цифры, «-», «_», «.»")
+    if (worktree / CONFIGS_REL / src.group / f"{name}.yaml").is_file():
+        raise ValueError(f"в ревизии уже есть {src.group}/{name}.yaml — overlay его не перекроет, выберите другое имя")
+    target = overlay / src.group / f"{name}.yaml"
+    if target.exists():
+        raise ValueError(f"в overlay уже есть {src.group}/{name}.yaml")
+    header = f"# fleet-console: из {src.rel} ревизии {sha} · правка прогона {run_id}\n"
+    lines = src.text.splitlines(keepends=True)
+    text = (lines[0] + header + "".join(lines[1:])) if lines and PACKAGE_LINE_RE.match(lines[0]) else header + src.text
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
+def overlay_origin(text: str) -> tuple[str, str] | None:
+    """(путь оригинала в ревизии, sha) из шапки файла overlay, сохранённого сервисом; иначе None."""
+    for line in text.splitlines()[:3]:
+        m = OVERLAY_HEADER_RE.match(line)
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+def strip_overlay_header(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not OVERLAY_HEADER_RE.match(line)) + ("\n" if text.endswith("\n") else "")
+
+
+@dataclass(frozen=True)
+class Drift:
+    """Оригинал правленного файла изменился в другой ревизии: три стороны — была, стала, моя правка."""
+
+    rel: str  # файл overlay, напр. harbor/agent/terminus2-mine.yaml
+    origin_rel: str  # оригинал в ревизии
+    then_sha: str
+    diff_original: str  # была → стала
+    diff_mine: str  # была → моя правка
+
+    @property
+    def summary(self) -> str:
+        return f"{self.rel}: оригинал {self.origin_rel} изменился после ревизии {self.then_sha[:8]}"
+
+
+def three_way(rel: str, origin_rel: str, then_sha: str, then_text: str, now_text: str, mine_text: str) -> Drift | None:
+    """None, если оригинал не менялся; иначе оба diff относительно исходной ревизии."""
+    if then_text == now_text:
+        return None
+    return Drift(
+        rel, origin_rel, then_sha,
+        _diff(then_text, now_text, f"{origin_rel} @{then_sha[:8]}", f"{origin_rel} (текущая ревизия)"),
+        _diff(then_text, strip_overlay_header(mine_text), f"{origin_rel} @{then_sha[:8]}", f"{rel} (моя правка)"),
+    )
+
+
+def _diff(a: str, b: str, name_a: str, name_b: str) -> str:
+    return "\n".join(difflib.unified_diff(a.splitlines(), b.splitlines(), name_a, name_b, lineterm="", n=2))

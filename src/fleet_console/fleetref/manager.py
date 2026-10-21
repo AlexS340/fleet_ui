@@ -162,6 +162,13 @@ class RevisionManager:
             self.current = ReadyRevision(ref, info, worktree, profile, from_cache=cached is not None)
             return self.current
 
+    async def file_at(self, sha: str, rel: str) -> str | None:
+        """Файл группы конфигов (путь относительно каталога конфигов) на ревизии из зеркала; нет — None."""
+        try:
+            return await self.mirror.show(sha, (prof.CONFIGS_REL / rel).as_posix())
+        except CommandError:
+            return None
+
     async def restore(self) -> ReadyRevision | None:
         """После перезапуска сервиса: вернуть последнюю использованную ревизию, если её worktree и профиль на месте.
 

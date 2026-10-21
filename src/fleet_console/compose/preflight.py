@@ -101,6 +101,7 @@ def run_checks(
     issues: list[Issue],
     session_status: str | None = None,
     worktree_clean: bool = True,
+    overlay_drift: list[str] | None = None,
 ) -> list[Check]:
     checks: list[Check] = []
     missing = [n for n in SECRET_NAMES if not secrets.get(n)]
@@ -164,6 +165,9 @@ def run_checks(
         checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", level, "; ".join(problems or found) or "в конфиге нет harbor_job.datasets"))
     else:
         checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", "warn", "проверю после сборки конфига"))
+
+    if overlay_drift:
+        checks.append(Check("overlay", "Правки overlay против ревизии", "warn", "; ".join(overlay_drift) + " — сравните в полном конфиге"))
 
     checks.append(Check("materialize", "Материализация (mode=generate)", "ok", "первая стадия прогона, до GPU: битый датасет остановит прогон бесплатно"))
 

@@ -18,6 +18,7 @@ import yaml
 from fleet_console.compose import (
     BenchSpec,
     Check,
+    Drift,
     Preview,
     SourceFile,
     build_registry,
@@ -26,14 +27,18 @@ from fleet_console.compose import (
     load_issues,
     make_bench_id,
     manual_edits,
+    overlay_origin,
     run_checks,
+    save_to_overlay,
     sources,
     summary,
+    three_way,
     validate_yaml,
 )
+from fleet_console.compose.provenance import Candidate, build_index, layers, lookup, tree_nodes, value_at
 from fleet_console.context import AppContext
 from fleet_console.fleetref.manager import ReadyRevision
-from fleet_console.fleetref.profile import list_groups
+from fleet_console.fleetref.profile import CONFIGS_REL, list_groups
 from fleet_console.models.compose import recipe_summary
 from fleet_console.observe.argo import argo_ui_url
 from fleet_console.presets import DatasetRef, compatibility, load_presets
@@ -99,6 +104,7 @@ class Draft:
     checks: list[Check] = field(default_factory=list)
     manual: bool = False  # exp.yaml или файлы групп правили руками: форма их больше не перезаписывает
     run_id: str = ""
+    drift: list[Drift] = field(default_factory=list)  # overlay-правки, чей оригинал изменился в этой ревизии
 
 
 # --- страница --------------------------------------------------------------
@@ -221,7 +227,9 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
         with ui.expansion("Дополнительно").classes("w-full"):
             extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение").classes("w-full").props("autogrow")
             harbor_job_text = ui.textarea("harbor_job поверх (YAML): таймауты, retry…").classes("w-full").props("autogrow")
-            config_button = ui.button("Полный конфиг: файлы, комментарии, правка", on_click=lambda: _config_dialog(ctx, draft, rebuild)).props("flat no-caps")
+            config_button = ui.button("Полный конфиг: файлы, комментарии, правка", on_click=lambda: _config_dialog(ctx, draft, rebuild, refresh_groups)).props(
+                "flat no-caps"
+            )
             config_button.disable()
         preview_box = ui.column().classes("w-full gap-1")
         checks_box = ui.column().classes("w-full gap-1")
@@ -236,6 +244,16 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
             busy.set_visibility(False)
 
         # --- поведение
+        def refresh_groups() -> None:
+            """После «Сохранить в overlay»: новый член группы появляется в списках формы."""
+            fresh = merged_groups(revision)
+            agent_select.set_options({a: label_of("harbor/agent", a) for a in fresh.get("harbor/agent", [])}, value=agent_select.value)
+            dataset_select.set_options(
+                {d: label_of("harbor/dataset", d) for d in fresh.get("harbor/dataset", [])} | {CUSTOM_DATASET: "свой путь под FLEET_DATASETS_ROOT…"}, value=dataset_select.value
+            )
+            overlay.clear()
+            overlay.update(overlay_members())
+
         def is_session() -> bool:
             return str(model_select.value or "").startswith(SESSION_PREFIX)
 
@@ -339,11 +357,12 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                     session=spec.session.id if spec.session else "",
                 )
                 foreign = {v.model for v in ctx.observer.mlsc.data or [] if not any(o.owns_version(v.version_id, v.application) for o in ctx.store.own_runs().values())}
+                draft.drift = await _overlay_drift(ctx, spec, revision.info.sha)
                 draft.checks = run_checks(
                     secrets=ctx.benches.secrets(), kube=ctx.kube_status, profile=revision.profile, own_model=spec.session is None, resolved=draft.resolved,
                     resolve_error=draft.resolve_error, datasets_root=ctx.settings.datasets_root_path(), mappings=mappings, registry_errors=registry_errors,
                     foreign_models=foreign, model_name=spec.effective_model or draft.preview.model, agent=spec.agent, recipe=spec.recipe,
-                    dataset=spec.dataset_label, issues=load_issues(), session_status=session_status,
+                    dataset=spec.dataset_label, issues=load_issues(), session_status=session_status, overlay_drift=[d.summary for d in draft.drift],
                 )
             except BenchError as exc:
                 ui.notify(str(exc), type="negative", multi_line=True)
@@ -426,7 +445,25 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
 # --- полный конфиг ---------------------------------------------------------------
 
 
-def _config_dialog(ctx: AppContext, draft: Draft, rebuild) -> None:
+async def _overlay_drift(ctx: AppContext, spec: BenchSpec, sha: str) -> list[Drift]:
+    """Файлы overlay из defaults, сохранённые сервисом с другой ревизии: изменился ли с тех пор оригинал."""
+    found: list[Drift] = []
+    for src in sources(spec.exp.read_text(encoding="utf-8"), spec.run_dir, spec.worktree, spec.overlay):
+        origin = overlay_origin(src.text) if src.origin == "overlay" else None
+        if origin is None or origin[1] == sha:
+            continue
+        origin_rel, then_sha = origin
+        now_path = spec.worktree / CONFIGS_REL / origin_rel
+        then_text = await ctx.manager.file_at(then_sha, origin_rel)
+        if then_text is None or not now_path.is_file():
+            continue
+        drift = three_way(src.rel, origin_rel, then_sha, then_text, now_path.read_text(encoding="utf-8", errors="replace"), src.text)
+        if drift is not None:
+            found.append(drift)
+    return found
+
+
+def _config_dialog(ctx: AppContext, draft: Draft, rebuild, on_overlay=None) -> None:
     spec = draft.spec
     if spec is None:
         return
@@ -453,12 +490,16 @@ def _config_dialog(ctx: AppContext, draft: Draft, rebuild) -> None:
             ui.button("Сохранить и пересобрать", on_click=save_exp).props("unelevated no-caps dense")
         ui.label("Файлы defaults в порядке применения: побеждает последний, кто задал ключ. «Править» кладёт копию в каталог прогона.").classes("text-xs opacity-70")
         for src in sources(exp_text, spec.run_dir, spec.worktree, spec.overlay):
-            _source_block(ctx, src, spec, draft, dialog, rebuild)
+            _source_block(ctx, src, spec, draft, dialog, rebuild, on_overlay)
         with ui.expansion("overrides.txt — служебные overrides сервиса").classes("w-full"):
             ui.code(spec.overrides_file.read_text(encoding="utf-8") if spec.overrides_file.exists() else "", language="bash").classes("w-full")
         with ui.expansion("resolved.yaml — итоговый конфиг (--print-config)").classes("w-full"):
-            text = spec.resolved.read_text(encoding="utf-8") if spec.resolved.exists() else draft.resolve_error or "(ещё не собран)"
-            ui.code(text, language="yaml").classes("w-full").style("max-height: 32rem; overflow: auto")
+            if draft.resolved is None:
+                ui.label(draft.resolve_error or "(ещё не собран)").classes("text-negative text-sm whitespace-pre-wrap font-mono")
+            else:
+                _resolved_browser(draft.resolved, exp_text, spec)
+                with ui.expansion("как текст").classes("w-full").props("dense"):
+                    ui.code(spec.resolved.read_text(encoding="utf-8"), language="yaml").classes("w-full").style("max-height: 32rem; overflow: auto")
         edits = manual_edits(spec.run_dir, spec.worktree, spec.overlay, exp_text)
         if edits:
             with ui.expansion(f"Diff ручных правок ({len(edits)})", value=True).classes("w-full"):
@@ -469,9 +510,74 @@ def _config_dialog(ctx: AppContext, draft: Draft, rebuild) -> None:
     dialog.open()
 
 
-def _source_block(ctx: AppContext, src: SourceFile, spec: BenchSpec, draft: Draft, dialog: ui.dialog, rebuild) -> None:
-    with ui.expansion(src.title).classes("w-full").props("dense"):
+def _resolved_browser(resolved: dict[str, Any], exp_text: str, spec: BenchSpec) -> None:
+    """Дерево итогового конфига; клик по ключу — откуда пришло значение: файл, строка, комментарии, интерполяция."""
+    index = build_index(layers(exp_text, spec.run_dir, spec.worktree, spec.overlay), spec.service_overrides())
+    ui.label("Клик по ключу — откуда пришло значение. Побеждает последний, кто задал ключ: файлы defaults по порядку, затем overrides.").classes(
+        "text-xs opacity-60"
+    )
+    with ui.row().classes("w-full gap-4 flex-wrap items-start"):
+        with ui.column().classes("flex-1 min-w-[18rem] gap-1"):
+            filter_input = ui.input("фильтр ключей").props("dense clearable").classes("w-full")
+            tree = ui.tree(tree_nodes(resolved), on_select=lambda e: show(e.value)).classes("w-full text-sm").props("dense")
+            tree.style("max-height: 28rem; overflow: auto")
+            filter_input.bind_value_to(tree, "filter")
+        panel = ui.column().classes("flex-1 min-w-[18rem] gap-1")
+
+    def show(key: str | None) -> None:
+        panel.clear()
+        if not key:
+            return
+        value = value_at(resolved, key)
+        p = lookup(key, index, value)
+        with panel:
+            ui.label(key).classes("font-mono text-sm break-all")
+            if not isinstance(value, (dict, list)):
+                ui.label(f"итоговое значение: {value!r}").classes("text-sm break-all")
+            if p.winner is None:
+                ui.label(p.note).classes("text-sm text-warning")
+                return
+            w = p.winner
+            ui.label(("вероятно: " if not p.certain else "") + w.where).classes("text-sm break-all" + ("" if p.certain else " text-warning"))
+            if w.interpolation:
+                ui.label(f"исходная интерполяция: {w.raw}").classes("font-mono text-xs break-all")
+            if w.comments:
+                ui.label(w.comments).classes("text-xs whitespace-pre-wrap opacity-80")
+            if w.inline:
+                ui.label(f"# {w.inline}").classes("text-xs opacity-80")
+            if p.note:
+                ui.label(p.note).classes("text-xs text-warning")
+            snippet = _snippet(w)
+            if snippet:
+                ui.code(snippet, language="yaml").classes("w-full text-xs")
+            if p.others:
+                with ui.expansion(f"перекрытые определения ({len(p.others)})").classes("w-full").props("dense"):
+                    for o in p.others:
+                        ui.label(o.where + (f": {o.raw}" if o.raw and not o.container else "")).classes("text-xs break-all")
+
+
+def _snippet(c: Candidate, around: int = 3) -> str:
+    """Строки файла вокруг ключа с номерами; строка ключа помечена."""
+    if not c.line:
+        return ""
+    try:
+        lines = Path(c.path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    start, end = max(0, c.line - 1 - around), min(len(lines), c.line + around)
+    return "\n".join(f"{'►' if i == c.line - 1 else ' '}{i + 1:4d}  {lines[i]}" for i in range(start, end))
+
+
+def _source_block(ctx: AppContext, src: SourceFile, spec: BenchSpec, draft: Draft, dialog: ui.dialog, rebuild, on_overlay=None) -> None:
+    drift = next((d for d in draft.drift if d.rel == src.rel), None)
+    with ui.expansion(src.title + (" · оригинал изменился" if drift else "")).classes("w-full").props("dense"):
         ui.label(str(src.path)).classes("text-xs opacity-60 break-all")
+        if drift is not None:
+            ui.label(drift.summary + ": сравните и решите, нужна ли правка на этой ревизии").classes("text-sm text-warning")
+            with ui.expansion("была → стала (ревизия)").classes("w-full").props("dense"):
+                ui.code(drift.diff_original, language="diff").classes("w-full")
+            with ui.expansion("была → моя правка (overlay)").classes("w-full").props("dense"):
+                ui.code(drift.diff_mine, language="diff").classes("w-full")
         if src.origin == "run":
             editor = ui.codemirror(src.text, language="YAML").classes("w-full").style("height: 18rem")
             error = ui.label().classes("text-negative text-sm")
@@ -486,7 +592,27 @@ def _source_block(ctx: AppContext, src: SourceFile, spec: BenchSpec, draft: Draf
                 dialog.close()
                 await rebuild()
 
-            ui.button("Сохранить и пересобрать", on_click=save).props("unelevated no-caps dense")
+            with ui.row().classes("items-end gap-2 flex-wrap"):
+                ui.button("Сохранить и пересобрать", on_click=save).props("unelevated no-caps dense")
+                overlay_name = ui.input("имя в overlay", value=f"{src.name}-console").props("dense").classes("w-56")
+
+                def to_overlay() -> None:
+                    try:
+                        target = save_to_overlay(
+                            SourceFile(src.group, src.name, src.origin, src.path, editor.value), spec.overlay, spec.worktree, str(overlay_name.value or ""),
+                            sha=spec.sha, run_id=spec.run_id,
+                        )
+                    except ValueError as exc:
+                        error.set_text(str(exc))
+                        return
+                    error.set_text("")
+                    ctx.store.event("overlay_save", spec.run_id, "ok", f"{src.rel} → {target}")
+                    ui.notify(f"{src.group}/{overlay_name.value}.yaml сохранён в overlay: можно выбирать в форме и пресетах")
+                    if on_overlay:
+                        on_overlay()
+
+                ui.button("Сохранить в overlay", on_click=to_overlay).props("flat no-caps dense")
+                hint("Правка переезжает в overlay/configs сервиса под новым именем, с пометкой, из какого файла и ревизии она сделана. На другой ревизии сервис предупредит, если оригинал изменился.")
         else:
             ui.code(src.text, language="yaml").classes("w-full").style("max-height: 24rem; overflow: auto")
 
@@ -496,7 +622,7 @@ def _source_block(ctx: AppContext, src: SourceFile, spec: BenchSpec, draft: Draf
                 ui.notify(f"копия {src.rel} в каталоге прогона: правьте её в редакторе")
                 dialog.close()
                 await rebuild()
-                _config_dialog(ctx, draft, rebuild)  # заново, уже с редактором копии
+                _config_dialog(ctx, draft, rebuild, on_overlay)  # заново, уже с редактором копии
 
             ui.button("Править в этом прогоне", on_click=edit).props("flat no-caps dense")
 

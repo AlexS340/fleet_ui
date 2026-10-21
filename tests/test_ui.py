@@ -4,6 +4,7 @@ from nicegui import ui
 from nicegui.testing import User
 import pytest
 
+from fleet_console.fleetref.profile import CONFIGS_REL
 import fakes
 
 pytestmark = pytest.mark.nicegui_main_file("tests/ui_main.py")
@@ -240,6 +241,14 @@ async def test_benches_page_full_config_and_manual_edit(user: User) -> None:
     await user.should_see("harbor/agent/terminus2.yaml · ревизия fleet")
     await user.should_see("Агент terminus-2 ходит в Polar gateway.")
     await user.should_see("resolved.yaml — итоговый конфиг (--print-config)")
+    # клик по ключу в дереве resolved.yaml — откуда пришло значение
+    user.find(kind=ui.tree).trigger("update:selected", "system.namespace")
+    await user.should_see("ревизия fleet · " + str(fakes.CTX.manager.worktree / CONFIGS_REL / "system" / "cluster.yaml") + ":2")
+    await user.should_see("итоговое значение: 'swe-bench-v2-20260308'")
+    user.find(kind=ui.tree).trigger("update:selected", "experiment.run_id")
+    await user.should_see("override командной строки · командная строка")
+    user.find(kind=ui.tree).trigger("update:selected", "experiment.model_name")
+    await user.should_see("исходная интерполяция: ${mlsc.served_model_name}")
     user.find("Править в этом прогоне").click()  # первый файл из ревизии — system/cluster.yaml
     await user.should_see("копия system/cluster.yaml в каталоге прогона")
     await user.should_see("ручные правки: exp.yaml")
@@ -251,3 +260,42 @@ async def test_benches_page_full_config_and_manual_edit(user: User) -> None:
     await user.should_see("system/cluster.yaml · правка прогона")
     await user.should_see("Diff ручных правок (1)")
     await user.should_see("+namespace: other-ns")
+    # правка прогона → overlay под новым именем, с шапкой о происхождении
+    from fleet_console.settings import OVERLAY_DIR
+
+    save = user.find("Сохранить в overlay")
+    save.elements = {max(save.elements, key=lambda e: e.id)}  # кнопка последнего открытого диалога, а не стёртого
+    save.click()
+    await user.should_see("system/cluster-console.yaml сохранён в overlay")
+    saved = (OVERLAY_DIR / "system" / "cluster-console.yaml").read_text(encoding="utf-8")
+    assert saved.startswith(f"# fleet-console: из system/cluster.yaml ревизии {fakes.SHA_MASTER}") and "namespace: other-ns" in saved
+    (OVERLAY_DIR / "system" / "cluster-console.yaml").unlink()
+
+
+async def test_benches_page_warns_when_overlay_original_drifted(user: User) -> None:
+    from fleet_console.connect.kube import KubeStatus
+    from fleet_console.settings import OVERLAY_DIR
+
+    fakes.CTX.kube_status = KubeStatus(context="internal", server="s", allowed=True, ready=True, permissions={"get nodes": True})
+    await fakes.CTX.manager.prepare("master")
+    old_sha = "0" * 40
+    mine = OVERLAY_DIR / "harbor" / "agent" / "terminus2_mine.yaml"
+    mine.parent.mkdir(parents=True, exist_ok=True)
+    mine.write_text(
+        f"# @package _global_\n# fleet-console: из harbor/agent/terminus2.yaml ревизии {old_sha} · правка прогона r1\nharbor_job:\n  agents:\n    - name: terminus-2-mine\n",
+        encoding="utf-8",
+    )
+    fakes.CTX.manager.files_at[(old_sha, "harbor/agent/terminus2.yaml")] = "# @package _global_\nharbor_job:\n  agents:\n    - name: terminus-1\n"
+    try:
+        await user.open("/runs")
+        user.find("Запустить бенч").click()
+        await user.should_see("Пресет")
+        _select(user, "Агент · harbor/agent").set_value("terminus2_mine")
+        user.find("Превью и preflight").click()
+        await user.should_see("Правки overlay против ревизии")
+        await user.should_see("harbor/agent/terminus2_mine.yaml: оригинал harbor/agent/terminus2.yaml изменился после ревизии 00000000")
+        user.find("Полный конфиг: файлы, комментарии, правка").click()
+        await user.should_see("harbor/agent/terminus2_mine.yaml · overlay сервиса · оригинал изменился")
+        await user.should_see("была → стала (ревизия)")
+    finally:
+        mine.unlink()

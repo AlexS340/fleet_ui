@@ -166,6 +166,10 @@ class Mirror:
             await self._git("worktree", "remove", "--force", str(path))
         await self._git("worktree", "prune")
 
+    async def show(self, sha: str, rel: str) -> str:
+        """Содержимое файла репозитория на коммите: `git show <sha>:<путь>`."""
+        return (await self._git("show", f"{sha}:{rel}")).stdout
+
     async def is_clean(self, path: Path) -> bool:
         """Нет изменений и чужих файлов; `.venv` — артефакт сервиса, не считается."""
         argv = ["git", "-C", str(path), "status", "--porcelain", "--", ".", ":(exclude).venv"]

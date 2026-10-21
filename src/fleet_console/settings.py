@@ -14,7 +14,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PRESETS_DIR = REPO_ROOT / "presets"  # пресеты бенчей, версионируются в git сервиса
-OVERLAY_DIR = REPO_ROOT / "overlay" / "configs"  # свои группы Hydra поверх групп ревизии fleet
+# Свои группы Hydra поверх групп ревизии fleet; FLEET_CONSOLE_OVERLAY — для тестов, чтобы не писать в репозиторий.
+OVERLAY_DIR = Path(os.environ.get("FLEET_CONSOLE_OVERLAY") or REPO_ROOT / "overlay" / "configs")
 KNOWN_ISSUES = REPO_ROOT / "known_issues.yaml"
 # Секреты, которые уходят только в окружение подпроцессов fleet; в exp.yaml, resolved.yaml и логи не попадают.
 SECRET_NAMES = ("MLSC_TOKEN", "AWS_ACCESS_KEY_ID_gcvmfleet", "AWS_SECRET_ACCESS_KEY_gcvmfleet")
