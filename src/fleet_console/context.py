@@ -68,11 +68,14 @@ class AppContext:
         gateway = Gateway(key, namespace, service, port, self.port_picker(c.gateway_ports.get(key, 0)))
 
         async def health() -> bool:
-            return await probe(self.http, gateway.base_url)
+            return await probe(self.http, gateway.health_url)
 
         depends_on = BASTION if self.settings.bastion.ssh_host else None
         self.supervisor.add(
-            Forward(gateway.name, gateway.title, gateway.argv, health, depends_on=depends_on, hint=f"Руками: {shlex.join(gateway.argv)}")
+            Forward(
+                gateway.name, gateway.title, gateway.argv, health,
+                depends_on=depends_on, hint=f"Руками: {shlex.join(gateway.argv)}", window=6,
+            )
         )
         self.gateways[key] = gateway
         self.store.event("open_gateway", key, "ok", gateway.base_url)

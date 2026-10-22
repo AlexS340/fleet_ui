@@ -3,6 +3,10 @@
 Проверено 2026-10-21: litellm (`litellm-argo/service/litellm-fleet`) отвечает на `GET /v1/models` без
 ключа и отдаёт лимиты контекста; nginx (`vllm-proxy/service/nginx-vllm-proxy-test`) на `/v1/models`
 даёт 404 — он маршрутизирует только по имени модели в запросе, его модели берём из ConfigMap upstream.
+
+Проверка проброса к litellm — `GET /health/readiness`, как у kubelet (2026-10-22: отвечает без ключа, 503 у неготового
+пода). `port-forward service/…` держится за один под, выбранный при старте; неготовый под валит проверку, супервизор
+перезапускает проброс, и kubectl выбирает готовый под.
 """
 
 from __future__ import annotations
@@ -36,6 +40,13 @@ class Gateway:
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.local_port}/v1"
+
+    @property
+    def health_url(self) -> str:
+        """Что дёргает проверка здоровья: готовность пода у litellm, у nginx — /v1/models (404 тоже ответ)."""
+        if self.key == "litellm":
+            return f"http://127.0.0.1:{self.local_port}/health/readiness"
+        return f"{self.base_url}/models"
 
     @property
     def argv(self) -> list[str]:
@@ -78,10 +89,10 @@ async def list_models(http: httpx.AsyncClient, base_url: str) -> list[Model]:
     return [Model(str(m["id"]), m.get("max_input_tokens")) for m in data if m.get("id")]
 
 
-async def probe(http: httpx.AsyncClient, base_url: str) -> bool:
-    """Проброс жив, если шлюз ответил по HTTP: nginx на /v1/models даёт 404, это тоже ответ."""
+async def probe(http: httpx.AsyncClient, url: str) -> bool:
+    """Проброс жив, если шлюз ответил по HTTP без 5xx: nginx на /v1/models даёт 404, это тоже ответ; 503 от readiness — нет."""
     try:
-        response = await http.get(f"{base_url}/models", timeout=5)
+        response = await http.get(url, timeout=5)
     except httpx.HTTPError:
         return False
     return response.status_code < 500

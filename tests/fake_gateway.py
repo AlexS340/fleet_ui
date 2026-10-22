@@ -1,4 +1,4 @@
-"""Фейковый OpenAI-совместимый шлюз для httpx.MockTransport: /v1/models и /v1/chat/completions."""
+"""Фейковый OpenAI-совместимый шлюз для httpx.MockTransport: /v1/models, /v1/chat/completions и /health/readiness litellm."""
 
 import json
 
@@ -34,6 +34,8 @@ COMPLETION = {
 
 
 def handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/health/readiness":
+        return httpx.Response(200, json={"status": "healthy", "db": "connected"})
     if request.url.path.endswith("/v1/models"):
         return httpx.Response(200, json=MODELS)
     if request.url.path.endswith("/v1/chat/completions"):
