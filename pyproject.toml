@@ -2,7 +2,7 @@
 name = "fleet-console"
 version = "0.1.0"
 description = "Личный локальный веб-интерфейс поверх fleet"
-readme = "docs/ARCHITECTURE.md"
+readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "nicegui>=3.18,<4",
