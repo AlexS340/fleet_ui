@@ -475,7 +475,7 @@ fleet-console/
     settings.py      # remote fleet, разрешённые contexts, таймеры
     fleetref/        # зеркало, ветки и коммиты, worktree, uv sync, профиль возможностей
     catalog/         # группы конфигов ревизии + overlay
-    presets/         # загрузка и валидация пресетов
+    presets/         # загрузка и валидация пресетов; scout — разведка бенча в зеркале и черновик пресета
     compose/         # exp.yaml, overrides, реестр датасетов, превью, preflight
     runs/            # машина состояний, стадии, подпроцессы fleet
     models/          # сессии моделей, таймеры, песочница
