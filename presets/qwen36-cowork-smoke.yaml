@@ -1,0 +1,20 @@
+# Smoke cowork: 3 задачи cowork-bench (ua_external) на маленькой модели. Группы harbor/dataset для cowork в fleet нет —
+# датасет задан путём под FLEET_DATASETS_ROOT и записью реестра datasets/ (как в exp_qwen36_cowork_1c.yaml ревизии).
+# Задачи качаются кнопкой «Скачать из S3» в preflight. Каждая поднимает свой стек MCP в Docker: 4 CPU, 12 ГиБ, агенту до 2 ч.
+name: qwen36-cowork-smoke
+description: Qwen3.6-35B-A3B × cowork_bench_ua_external_260902 × uag_minimal_20260912, 1 реплика, 3 задачи
+fleet:
+  ref: master
+model: qwen36_35b_a3b                  # mlsc/model: 1 GPU (a100plus.1gpu)
+model_name: Qwen3.6-35B-A3B-console    # суффикс: на кластере бывает чужая Qwen3.6-35B-A3B
+agent: uag_minimal_20260912            # агент эксперимента cowork в fleet: setup до 3600 с под compose-стек
+dataset:
+  path: cowork_bench_ua_external_260902/tasks
+  benchmark: cowork                    # уходит в workflow_prefix как есть: только [a-z0-9-]; метка результатов — из реестра
+  mapping: cowork_bench_ua_external_260902
+resources:
+  jobs: 1
+  agents_per_replica: 3
+execution:
+  profile: production
+  task_limit: 3

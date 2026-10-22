@@ -5,10 +5,10 @@ from fleet_console.settings import PRESETS_DIR
 
 GROUPS = {
     "mlsc/model": ["qwen36_35b_a3b", "glm"],
-    "harbor/agent": ["terminus2", "uag_minimal_no_skills_0.3.0"],
+    "harbor/agent": ["terminus2", "uag_minimal_no_skills_0.3.0", "uag_minimal_20260912"],
     "harbor/dataset": ["birdsql_sqlite", "swe_bench_verified"],
     "execution": ["production", "debug"],
-    "datasets": ["cowork_bench_r10"],
+    "datasets": ["cowork_bench_r10", "cowork_bench_ua_external_260902"],
 }
 STEPS = ["system.materialize", "mlsc.create_job"]
 
@@ -21,6 +21,10 @@ def test_repo_presets_load_and_fit_master_groups() -> None:
     assert smoke.harbor_job["agent_timeout_multiplier"] == 2.0 and smoke.path.endswith("qwen36-birdsql-smoke.yaml")
     assert compatibility(smoke, GROUPS, STEPS, STEPS) == []
     assert matches_ref(smoke, "master", "378874b") and not matches_ref(smoke, "feat/x", "de460aa")
+    cowork = next(p for p in presets if p.name == "qwen36-cowork-smoke")
+    assert cowork.dataset == DatasetRef(path="cowork_bench_ua_external_260902/tasks", benchmark="cowork", mapping="cowork_bench_ua_external_260902")
+    assert cowork.agent == "uag_minimal_20260912" and cowork.execution.task_limit == 3
+    assert compatibility(cowork, GROUPS, STEPS, STEPS) == []
 
 
 def test_broken_preset_is_reported_not_fatal(tmp_path: Path) -> None:
