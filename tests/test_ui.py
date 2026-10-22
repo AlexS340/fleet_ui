@@ -232,8 +232,12 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.should_see("клик по строке — карточка прогона")
     table = next(iter(user.find(kind=ui.table).elements))
     assert table.rows[0]["tasks"] == "0 / 0 / 3" and table.rows[0]["status"] == "готов"
+    (fakes.CTX.paths.runs / run.id / "out" / ".fleet").mkdir(parents=True, exist_ok=True)
+    (fakes.CTX.paths.runs / run.id / "out" / ".fleet" / "tasks.json").write_text('[{"a": 1}, {"a": 2}, {"a": 3}]')  # появился после материализации
     user.find(kind=ui.table).trigger("rowClick", [None, {"id": run.id}])
     await user.should_see("Что и где запущено")
+    facts = {r["k"]: r["v"] for r in next(iter(user.find(marker="bench-facts").elements)).rows}
+    assert "· 3 задач ·" in facts["Задачи"]  # число задач — из tasks.json, а не из превью на момент запуска
     await user.should_see("подготовка: --print-config · код 0")
     await user.should_see("замер (Benchboard) · код 0")
     await user.should_see("Замер заново")

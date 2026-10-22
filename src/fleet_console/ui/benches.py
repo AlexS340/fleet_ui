@@ -6,7 +6,7 @@ harbor_job) → «Полный конфиг» (exp.yaml, файлы defaults с 
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +35,7 @@ from fleet_console.compose import (
     save_to_overlay,
     sources,
     summary,
+    tasks_total,
     three_way,
     validate_yaml,
 )
@@ -742,6 +743,8 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         ui.notify(str(exc), type="negative")
         return
     preview = Preview.from_json(run.preview_json)
+    if preview.tasks_total is None:  # в превью на момент запуска числа задач ещё нет — оно появляется после материализации
+        preview = replace(preview, tasks_total=tasks_total(ctx.paths.runs / run_id))
     secrets = list(ctx.benches.secrets().values())
 
     def refresh() -> None:
@@ -784,7 +787,7 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         rows = [{"k": k, "v": v} for k, v in preview.rows()] if run.preview_json != "{}" else []
         rows += [{"k": "Идентификаторы", "v": f"run_id {run.id} · лейбл Argo fleet/run-name={run.id}" + (f" · MLSC version_id {run.version_id}" if run.version_id is not None else "")}]
         with ui.expansion("Что и где запущено", value=run.active).classes("w-full"):
-            _facts_table(rows)
+            _facts_table(rows).mark("bench-facts")
         base = ctx.settings.argo_ui_url
         with ui.row().classes("gap-3 flex-wrap text-sm"):
             ui.link("Argo UI по прогону", argo_ui_url(base, ctx.settings.namespace, run.id), new_tab=True)
