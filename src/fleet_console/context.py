@@ -25,7 +25,7 @@ from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import CommandError, Runner, SubprocessRunner
 from fleet_console.runs import BenchManager
-from fleet_console.settings import Paths, Settings, default_home, read_secret, secrets_env
+from fleet_console.settings import SECRET_NAMES, Paths, Settings, aws_secret_names, default_home, read_secret, secrets_env
 from fleet_console.store import Store
 
 BASTION = "bastion"
@@ -297,7 +297,8 @@ def build_context(home: Path | None = None) -> AppContext:
     )
     ctx = AppContext(settings, paths, store, kube, manager, supervisor, observer, guard=guard, sessions=sessions)
     ctx.benches = BenchManager(
-        store, runner, paths, settings, secrets=lambda: secrets_env(paths), mlsc_pod=observer.mlsc_pod, observer=observer,
+        store, runner, paths, settings, secrets=lambda: secrets_env(paths, (*SECRET_NAMES, *aws_secret_names(settings.s3_read_profile))),
+        mlsc_pod=observer.mlsc_pod, observer=observer,
         sessions=sessions, agent_limit=ctx.set_agent_limit, stop_tasks=lambda run_id: ctx.stop_own_run(run_id),
     )
     sessions.paused = ctx.benches.busy_sessions  # таймер сессии стоит, пока на ней идёт бенч

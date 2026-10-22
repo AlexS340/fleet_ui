@@ -408,10 +408,13 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                     icon, color = LEVEL_ICON[c.level]
                     with ui.row().classes("items-start gap-2 no-wrap"):
                         ui.icon(icon).classes(f"{color} text-base mt-0.5")
-                        ui.label(c.title).classes("text-sm")
-                        ui.label(c.detail).classes("text-xs opacity-70 break-all")
-                        if c.action and c.action.get("kind") == "fetch_dataset":
-                            ui.button("Скачать из S3", on_click=lambda a=c.action: _fetch_dataset_dialog(ctx, draft, rebuild, a)).props("flat dense no-caps")
+                        ui.label(c.title).classes("text-sm whitespace-nowrap")
+                        with ui.column().classes("gap-0 min-w-0"):
+                            ui.label(c.detail).classes("text-xs opacity-70 break-all")
+                            if c.action and c.action.get("kind") == "fetch_dataset":
+                                ui.button("Скачать из S3", on_click=lambda a=c.action: _fetch_dataset_dialog(ctx, draft, rebuild, a)).props("flat dense no-caps").classes(
+                                    "self-start"
+                                )
             accept.set_visibility(warns > 0)
             accept.set_value(False)
             refresh_start()
@@ -623,6 +626,7 @@ def _resolved_browser(resolved: dict[str, Any], exp_text: str, spec: BenchSpec) 
             tree = ui.tree(tree_nodes(resolved), on_select=lambda e: show(e.value)).classes("w-full text-sm").props("dense")
             tree.style("max-height: 28rem; overflow: auto")
             filter_input.bind_value_to(tree, "filter")
+            filter_input.on_value_change(lambda e: tree.expand() if e.value else tree.collapse())  # q-tree сам разделы под фильтр не раскрывает
         panel = ui.column().classes("flex-1 min-w-[18rem] gap-1")
 
     def show(key: str | None) -> None:

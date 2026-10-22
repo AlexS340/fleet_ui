@@ -22,6 +22,7 @@ def settings_page(ctx: AppContext) -> None:
             auto_fetch = ui.number("Авто-fetch, минут (0 — выключен)", value=s.auto_fetch_minutes, min=0, precision=0)
             ttl = ui.number("TTL worktree, дней", value=s.worktree_ttl_days, min=1, precision=0)
         datasets_root = ui.input("Корень датасетов Harbor (FLEET_DATASETS_ROOT; пусто — из окружения сервиса)", value=s.datasets_root).classes("w-full")
+        s3_profile = ui.input("Профиль ключей S3 для чтения из сервиса (AWS_*_<профиль>: список файлов прогона, скачивание датасетов)", value=s.s3_read_profile).classes("w-full")
         with ui.row().classes("gap-4 flex-wrap"):
             requeue = ui.number("Раундов requeue упавших", value=s.bench.requeue_rounds, min=0, max=3, precision=0)
             attention = ui.number("Автогашение без ответа, мин (0 — нет)", value=s.bench.attention_minutes, min=0, precision=0)
@@ -39,6 +40,7 @@ def settings_page(ctx: AppContext) -> None:
             s.auto_fetch_minutes = int(auto_fetch.value or 0)
             s.worktree_ttl_days = int(ttl.value or 1)
             s.datasets_root = datasets_root.value.strip()
+            s.s3_read_profile = s3_profile.value.strip() or "gcvmfleet"
             s.bench.requeue_rounds = int(requeue.value or 0)
             s.bench.attention_minutes = int(attention.value or 0)
             s.bench.poll_seconds = int(poll.value or 20)

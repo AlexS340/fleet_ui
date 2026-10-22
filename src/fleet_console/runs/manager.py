@@ -171,7 +171,7 @@ class BenchManager:
     # --- карточка: задачи, логи, S3 -----------------------------------------------
     def aws_env(self) -> dict[str, str]:
         """Окружение `aws` CLI: ключи fleet и свой config с endpoint — команда повторяется в терминале как есть."""
-        return aws_env(self.secrets(), self.paths.home / "aws.cfg", self.settings.s3_endpoint, self.settings.s3_region)
+        return aws_env(self.secrets(), self.paths.home / "aws.cfg", self.settings.s3_endpoint, self.settings.s3_region, profile=self.settings.s3_read_profile)
 
     async def task_workflows(self, run_id: str) -> list[TaskWorkflow]:
         return await argo.list_tasks(self.runner, self.settings.namespace, run_id)

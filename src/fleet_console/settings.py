@@ -133,6 +133,9 @@ class Settings(BaseModel):
     # S3 результатов и датасетов: endpoint и регион как у boto3-клиентов fleet (fleet/s3_upload.py); сервис ходит через `aws` CLI.
     s3_endpoint: str = "https://obs.ru-moscow-1.hc.sbercloud.ru"
     s3_region: str = "ru-moscow-1"
+    # Профиль ключей для чтения S3 из сервиса (список и скачивание): AWS_*_<профиль> из окружения, secrets.env или ~/.aws/credentials.
+    # Ключ gcvmfleet, которым fleet пишет результаты, может не иметь права ListObjects — тогда укажите профиль только для чтения.
+    s3_read_profile: str = "gcvmfleet"
     # Benchboard: прогон после замера виден в каталоге по модели и run_id; прямых ссылок на прогон у него нет.
     benchboard_url: str = "https://fleet-benchboard.sberai-rnd.ru"
     bench: Bench = Field(default_factory=Bench)
@@ -184,6 +187,10 @@ def read_aws_credential(name: str, path: Path = AWS_CREDENTIALS) -> str | None:
     if not parser.has_section(profile):
         return None
     return parser.get(profile, field, fallback="").strip() or None
+
+
+def aws_secret_names(profile: str) -> tuple[str, str]:
+    return f"AWS_ACCESS_KEY_ID_{profile}", f"AWS_SECRET_ACCESS_KEY_{profile}"
 
 
 def secrets_env(paths: Paths, names: Iterable[str] = SECRET_NAMES) -> dict[str, str]:

@@ -83,3 +83,22 @@
   `hydra.searchpath` — проверено на master; так работает «Править в этом прогоне».
 - Ключи S3 не просить в `secrets.env`: они лежат в профиле `[gcvmfleet]` `~/.aws/credentials`, сервис читает их
   оттуда и отдаёт fleet как `AWS_*_gcvmfleet` через окружение подпроцесса.
+
+## Грабли, найденные на хвостах Ф3
+
+- `FakeRunner` отвечает первым подошедшим префиксом argv: новый вызов с тем же началом (`kubectl -n ns get workflows …`)
+  попадёт в старую заглушку — менять порядок аргументов (`kubectl get workflows -n ns -l …`) или регистрировать раньше.
+- `user.find(text).click()` жмёт элемент с наименьшим id; в тесте с переоткрытыми диалогами нужная кнопка — последняя:
+  `i = user.find(...); i.elements = {max(i.elements, key=lambda e: e.id)}; i.click()`.
+- `BenchManager.tasks` — словарь asyncio-задач прогонов; методы с таким именем не заводить (`task_workflows`).
+- `shlex.join` берёт glob в кавычки: в тестах ждать `--include 't1/*'`.
+- Overlay сервиса в тестах — временный каталог через `FLEET_CONSOLE_OVERLAY` (ставится в `conftest.py` до импорта
+  `fleet_console.settings`); иначе «Сохранить в overlay» пишет в репозиторий.
+- `ui.tree` с фильтром (`bind_value_to(tree, "filter")`) сам разделы не раскрывает — на непустой фильтр звать `tree.expand()`.
+- Выпадающий список Quasar в диалоге может уехать за экран и при 1280×1100 — ставить viewport 1280×1500.
+- Карточку прогона без кластера смотреть на демо-копии данных: `FLEET_CONSOLE_HOME=<каталог>` с символическими ссылками
+  на `fleet.git` и `worktrees`, копией `settings.yaml` (другой `ui_port`) и `console.sqlite`, сеяными `bench_runs`; запуск
+  через временную конфигурацию в `.claude/launch.json` (`runtimeExecutable: env`), её не коммитить. Сервис при этом сам
+  поднимает ssh к бастиону — гасить `preview_stop`.
+- `aws s3 ls` ключом `gcvmfleet` с этой машины отвечает `AccessDenied` на `ListObjectsV2`; чужие профили из
+  `~/.aws/credentials` не пробовать без владельца — для чтения есть настройка `s3_read_profile`.
