@@ -28,7 +28,8 @@ class Harness:
             proc = FakeProc()
             self.spawned.append((argv[0], proc))
             if log_path:
-                log_path.write_text("Permission denied (publickey)\n")
+                with log_path.open("a") as log:  # как настоящий spawner: дописывает после строк супервизора
+                    log.write("Permission denied (publickey)\n")
             return proc
 
         async def h_bastion() -> bool:
@@ -181,3 +182,61 @@ async def test_dynamic_forward_add_and_remove(h: Harness) -> None:
     await h.tick()
     assert h.spawned[-1][1] is proc  # после удаления ничего не перезапускается
     h.sup.remove("gw")  # повторное удаление — не ошибка
+
+
+async def test_dependency_blink_keeps_dependent_alive(h: Harness) -> None:
+    h.healthy["bastion"] = h.healthy["argo"] = True
+    for _ in range(3):
+        await h.tick()
+    assert h.sup.state("argo").status == "green"
+    argo = h.proc("argo")
+    h.healthy["bastion"] = False
+    await h.tick()  # одна проваленная проверка бастиона: ssh жив, argo не трогаем
+    assert h.sup.state("bastion").status == "yellow" and not argo.killed and h.sup.state("argo").status == "green"
+    h.healthy["bastion"] = True
+    await h.tick()
+    assert h.sup.state("bastion").status == "green" and not argo.killed
+    h.proc("bastion").returncode = 255
+    await h.tick()  # процесс бастиона умер — argo гасится
+    assert argo.killed and h.sup.state("argo").status == "off" and "ждёт" in h.sup.state("argo").note
+
+
+async def test_dependent_does_not_start_until_dependency_green(h: Harness) -> None:
+    await h.tick()
+    await h.tick()
+    assert h.ssh_spawns() == 1 and h.sup.state("bastion").alive
+    assert all(a == "ssh" for a, _ in h.spawned) and h.sup.state("argo").status == "off"
+
+
+async def test_window_restarts_flapping_forward(h: Harness) -> None:
+    h.healthy["bastion"] = True
+    flaps = iter([True, False, True, False, True, False])
+    h.sup.add(Forward("gw", "шлюз litellm", ["pf", "gateway"], lambda: _value(next(flaps)), depends_on="bastion", window=6))
+    await h.tick()
+    await h.tick()  # бастион зелёный, шлюз запущен
+    gw = h.spawned[-1][1]
+    for _ in range(5):
+        await h.tick(advance=25)  # за пределами льготы: да, нет, да, нет, да
+    assert not gw.killed and h.sup.state("gw").fails == 0
+    assert "провалов 2 из последних 5" in h.sup.state("gw").note or h.sup.state("gw").status == "green"
+    await h.tick(advance=25)  # третий провал в окне — перезапуск, хотя подряд их не было
+    assert gw.killed and "3 раза из последних 6" in h.sup.state("gw").last_error
+
+
+async def test_marks_in_log(h: Harness, tmp_path: Path) -> None:
+    h.healthy["bastion"] = True
+    await h.tick()
+    await h.tick()
+    h.healthy["bastion"] = False
+    await h.tick()
+    await h.tick()  # дважды подряд — супервизор убил ssh
+    log = (tmp_path / "bastion.log").read_text()
+    assert "Permission denied" in log  # вывод процесса на месте
+    assert "=== " in log and "остановлен супервизором: проверка здоровья не прошла дважды подряд" in log
+    await h.tick()
+    assert "запуск: ssh -N fleetbastion" in (tmp_path / "bastion.log").read_text()
+    assert "===" not in h.sup.state("bastion").last_error
+
+
+async def _value(ok: bool) -> bool:
+    return ok

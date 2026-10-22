@@ -1,9 +1,12 @@
 """Супервизор долгоживущих пробросов: ssh к бастиону, kubectl port-forward.
 
 Правила: процесс умер → перезапуск с экспоненциальной паузой; проверка здоровья
-провалена дважды подряд после льготного периода → kill и перезапуск; большой
-разрыв между тиками (Mac спал) → перезапуск всех; проброс с depends_on ждёт,
-пока зависимость не станет зелёной.
+провалена дважды подряд после льготного периода → kill и перезапуск; у проброса с окном
+(`window`) — ещё и при трёх провалах среди последних проверок, иначе наполовину живой
+проброс висит, пока провалы чередуются с успехами; большой разрыв между тиками (Mac спал)
+→ перезапуск всех; проброс с depends_on не стартует, пока зависимость не зелёная, и гасится,
+только если процесс зависимости умер: одна проваленная проверка бастиона шлюз не трогает.
+Запуски и остановки отмечаются в логе проброса строкой `=== ЧЧ:ММ:СС …`.
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ import time
 from typing import Protocol
 
 Health = Callable[[], Awaitable[bool]]
+
+WINDOW_FAILS = 3  # провалов в окне последних проверок, после которых проброс перезапускается
 
 
 class ProcessLike(Protocol):
@@ -48,6 +53,7 @@ class Forward:
     health: Health
     depends_on: str | None = None
     hint: str = ""  # что сделать руками, если не поднимается
+    window: int = 0  # сколько последних проверок помнить; 0 — только «дважды подряд»
 
 
 @dataclass
@@ -60,6 +66,7 @@ class ForwardState:
     started_at: float | None = None
     last_error: str = ""
     proc: ProcessLike | None = None
+    recent: list[bool] = field(default_factory=list)  # итоги последних проверок текущего процесса
 
     @property
     def alive(self) -> bool:
@@ -110,11 +117,14 @@ class Supervisor:
         """Убрать проброс и убить его процесс; незнакомое имя — не ошибка."""
         st = self.states.pop(name, None)
         if st is not None:
-            self._kill(st)
+            self._kill(name, st, "проброс закрыт")
         self.forwards = [f for f in self.forwards if f.name != name]
 
     def log_path(self, fwd: Forward) -> Path | None:
-        return self.log_dir / f"{fwd.name}.log" if self.log_dir else None
+        return self._log_file(fwd.name)
+
+    def _log_file(self, name: str) -> Path | None:
+        return self.log_dir / f"{name}.log" if self.log_dir else None
 
     async def run(self) -> None:
         self._running = True
@@ -124,14 +134,14 @@ class Supervisor:
 
     async def stop(self) -> None:
         self._running = False
-        for st in self.states.values():
-            self._kill(st)
+        for name, st in self.states.items():
+            self._kill(name, st, "сервис останавливается")
             st.status = "off"
             st.note = "остановлен"
 
     async def restart(self, name: str) -> None:
         st = self.states[name]
-        self._kill(st)
+        self._kill(name, st, "перезапуск по запросу")
         st.attempt = 0
         st.next_try = 0.0
         st.note = "перезапуск по запросу"
@@ -147,13 +157,18 @@ class Supervisor:
 
     async def _tick_one(self, fwd: Forward, now: float) -> None:
         st = self.states[fwd.name]
-        if fwd.depends_on and self.states[fwd.depends_on].status != "green":
-            self._kill(st)
-            st.status = "off"
-            st.note = f"ждёт: {self.forward(fwd.depends_on).title}"
-            return
+        dep = self.states[fwd.depends_on] if fwd.depends_on else None
+        if dep is not None and dep.status != "green":
+            if not dep.alive:  # процесс зависимости умер — туннеля нет, держать нечего
+                self._kill(fwd.name, st, f"{self.forward(fwd.depends_on).title}: процесс не жив")
+            if st.proc is None:
+                st.status = "off"
+                st.note = f"ждёт: {self.forward(fwd.depends_on).title}"
+                return
+            # зависимость жива, но мигнула — свой процесс не трогаем, решает его собственная проверка
         if st.proc is not None and st.proc.returncode is not None:
             st.last_error = f"процесс завершился с кодом {st.proc.returncode}" + self._log_tail(fwd)
+            self._mark(fwd.name, f"процесс завершился с кодом {st.proc.returncode}")
             st.proc = None
             self._schedule_retry(st, now)
         if st.proc is None:
@@ -167,29 +182,44 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001 — любая ошибка проверки = не здоров
             ok = False
             st.last_error = f"проверка: {exc}"
+        if fwd.window:
+            st.recent = [*st.recent, ok][-fwd.window :]
         if ok:
             st.status, st.note, st.fails, st.attempt = "green", "", 0, 0
             st.started_at = None  # льготный период только до первой удачной проверки
             return
         in_grace = st.started_at is not None and now - st.started_at < self.grace
+        if in_grace and fwd.window:
+            st.recent.pop()  # провалы на старте не копим
         if not in_grace:
             st.fails += 1
+        window_fails = st.recent.count(False)
         st.status = "yellow"
         st.note = "запускается" if in_grace else f"проверка не прошла ({st.fails}/2)"
-        if st.fails >= 2:
-            self._kill(st)
-            st.last_error = st.last_error or "проверка здоровья не прошла дважды подряд"
+        if fwd.window and window_fails:
+            st.note += f", провалов {window_fails} из последних {len(st.recent)}"
+        if st.fails >= 2 or window_fails >= WINDOW_FAILS:
+            reason = (
+                "проверка здоровья не прошла дважды подряд"
+                if st.fails >= 2
+                else f"проверка здоровья не прошла {window_fails} раза из последних {len(st.recent)}"
+            )
+            st.last_error = st.last_error or reason
+            self._kill(fwd.name, st, reason)
             self._schedule_retry(st, now)
 
     async def _spawn(self, fwd: Forward, st: ForwardState, now: float) -> None:
+        self._mark(fwd.name, f"запуск: {' '.join(fwd.argv)}")
         try:
             st.proc = await self.spawner(fwd.argv, self.log_path(fwd))
         except Exception as exc:  # noqa: BLE001
             st.last_error = f"не удалось запустить: {exc}"
+            self._mark(fwd.name, st.last_error)
             self._schedule_retry(st, now)
             return
         st.started_at = now
         st.fails = 0
+        st.recent = []
         st.status = "yellow"
         st.note = "запускается"
 
@@ -201,24 +231,37 @@ class Supervisor:
         st.note = f"повтор через {int(delay)} с (попытка {st.attempt})"
 
     def _restart_all(self, reason: str) -> None:
-        for st in self.states.values():
-            self._kill(st)
+        for name, st in self.states.items():
+            self._kill(name, st, reason)
             st.attempt = 0
             st.next_try = 0.0
             st.status = "yellow"
             st.note = "перезапуск"
             st.last_error = reason
 
-    @staticmethod
-    def _kill(st: ForwardState) -> None:
+    def _kill(self, name: str, st: ForwardState, reason: str) -> None:
         if st.alive:
             assert st.proc is not None
             st.proc.kill()
+            self._mark(name, f"остановлен супервизором: {reason}")
         st.proc = None
+
+    def _mark(self, name: str, text: str) -> None:
+        """Строка супервизора в логе проброса: без неё по логу ssh не понять, когда что было."""
+        path = self._log_file(name)
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as log:
+                log.write(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+        except OSError:
+            pass  # лог — подсказка, а не условие работы проброса
 
     def _log_tail(self, fwd: Forward, lines: int = 3) -> str:
         path = self.log_path(fwd)
         if not path or not path.exists():
             return ""
-        tail = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-lines:]
+        tail = [line for line in path.read_text(encoding="utf-8", errors="replace").strip().splitlines() if not line.startswith("=== ")]
+        tail = tail[-lines:]
         return (": " + " | ".join(tail)) if tail else ""
