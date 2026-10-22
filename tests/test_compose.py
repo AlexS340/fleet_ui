@@ -80,6 +80,8 @@ def spec_for(tmp_path: Path, **kw) -> BenchSpec:
 
 
 def test_bench_id_fits_k8s_label() -> None:
+    cut = make_bench_id("checkpoints_qwen_262k-cowork-bench-ua-external-260902", T0)
+    assert cut == "checkpoints-qwen-262k-cowork-bench-ua-external-20261021-120000" and "--" not in cut and len(cut) <= 63
     assert make_bench_id("qwen36-birdsql-smoke", T0) == "qwen36-birdsql-smoke-20261021-120000"
     long = make_bench_id("Очень длинное имя " + "x" * 80, T0)
     assert len(long) <= 63 and long.endswith("-20261021-120000") and long.startswith("x")
@@ -91,7 +93,7 @@ def test_exp_yaml_overrides_and_argv(tmp_path: Path) -> None:
     text = exp.read_text(encoding="utf-8")
     data = yaml.safe_load(text)
     assert data["defaults"][2] == {"mlsc/model": "glm"} and {"harbor/dataset": "birdsql_sqlite"} in data["defaults"]
-    assert data["experiment"] == {"run_id": "???", "model_name": "${mlsc.served_model_name}", "jobs": 2, "agents_per_replica": 5, "workflow_prefix": "h-${harbor_dataset.benchmark}", "inference": "litellm"}
+    assert data["experiment"] == {"run_id": "???", "model_name": "${mlsc.served_model_name}", "jobs": 2, "agents_per_replica": 5, "workflow_prefix": "h-birdsql-sqlite", "inference": "litellm"}
     assert data["execution"]["task_limit"] == 3 and data["mlsc"] == {"served_model_name": "GLM-console"}
     assert data["harbor_job"] == {"agent_timeout_multiplier": 2.0} and data["main"]["run"] == "???" and data["output_dir"] == "???"
     assert "# Прогон Fleet Console: smoke-20261021-120000 · пресет smoke" in text and "правка действует только в этом прогоне" in text
@@ -339,3 +341,55 @@ async def test_dataset_fetch_plan_and_job(tmp_path: Path) -> None:
     failed = fetcher.fetch(few)
     await failed.task
     assert failed.status == "failed" and events[-1][2] == "error"
+
+
+def test_registry_benches_without_group_are_offered_by_path(tmp_path: Path) -> None:
+    from fleet_console.compose.registry import bench_slug, group_tasks_roots, list_mappings, registry_choices
+
+    wt, overlay = make_tree(tmp_path)
+    cfg = wt / CONFIGS_REL
+    (cfg / "harbor" / "dataset" / "many.yaml").write_text(  # группа на два бенча запись реестра не заменяет
+        "harbor_job:\n  datasets:\n    - path: ${system.datasets_root}/swe_bench_verified/tasks\n    - path: ${system.datasets_root}/x/tasks\n", encoding="utf-8"
+    )
+    (cfg / "harbor" / "dataset" / "foreign.yaml").write_text("harbor_job:\n  datasets:\n    - path: /data/someone/cowork_bench_v2/tasks\n", encoding="utf-8")
+    (overlay / "harbor" / "dataset").mkdir(parents=True)
+    (overlay / "harbor" / "dataset" / "birdsql_sqlite.yaml").write_text(  # ревизия раньше overlay: этот файл не читается
+        "harbor_job:\n  datasets:\n    - path: ${system.datasets_root}/elsewhere/tasks\n", encoding="utf-8"
+    )
+    (overlay / "datasets" / "swe.yaml").write_text("benchmark: dup\nsource:\n  tasks_root: dup/tasks\nruntime:\n  task_s3_base: dup\n", encoding="utf-8")
+    roots = group_tasks_roots([cfg, overlay])
+    assert roots == {"birdsql_sqlite": "birdsql/sqlite/tasks"}
+    mappings = list_mappings(wt, overlay)
+    assert [(m.name, m.origin) for m in mappings] == [("birdsql_sqlite", "fleet"), ("swe", "fleet"), ("cowork_r10", "overlay")]  # дубль имени из overlay отброшен
+    assert [m.name for m in registry_choices(mappings, roots)] == ["swe", "cowork_r10"]  # birdsql закрыт группой — группа важнее
+    assert bench_slug("cowork_bench_ua_external_260902") == "cowork-bench-ua-external-260902" and bench_slug("__") == "bench"
+
+
+def test_workflow_prefix_is_cleaned_by_service(tmp_path: Path) -> None:
+    from fleet_console.compose.spec import prefix_problem, workflow_prefix
+
+    assert workflow_prefix("cowork_bench_ua_external_260902") == "h-cowork-bench-ua-external-260902"
+    long = workflow_prefix("a" * 42 + "_b")
+    assert len(long) <= 45 and not long.endswith("-") and prefix_problem(long) == ""
+    assert "латинские" in prefix_problem("h-cowork_bench") and "длиннее" in prefix_problem("h-" + "a" * 50)
+    path = spec_for(tmp_path / "path", dataset=DatasetRef(path="cowork/tasks", benchmark="Cowork_Bench"))
+    assert yaml.safe_load(path.exp_text())["experiment"]["workflow_prefix"] == "h-cowork-bench"
+    group = spec_for(tmp_path / "group", dataset="birdsql_sqlite")
+    (group.run_dir / "harbor" / "dataset").mkdir(parents=True)  # копия группы в каталоге прогона главнее файла ревизии
+    (group.run_dir / "harbor" / "dataset" / "birdsql_sqlite.yaml").write_text("harbor_dataset:\n  benchmark: bird_edited\n", encoding="utf-8")
+    assert group.benchmark() == "bird_edited" and "workflow_prefix: h-bird-edited   #" in group.exp_text()
+    unknown = spec_for(tmp_path / "unknown", dataset="nope")
+    assert yaml.safe_load(unknown.exp_text())["experiment"]["workflow_prefix"] == "h-${harbor_dataset.benchmark}"
+
+
+def test_preflight_rejects_workflow_prefix_argo_cannot_take(tmp_path: Path) -> None:
+    spec = spec_for(tmp_path)
+    mappings, _ = build_registry(spec.worktree, spec.overlay, spec.run_dir)
+    resolved = {**RESOLVED, "experiment": {**RESOLVED.get("experiment", {}), "workflow_prefix": "h-cowork_bench"}}
+    checks = run_checks(
+        secrets={}, kube=KubeStatus(context="internal", allowed=True, ready=True, permissions={"get nodes": True}), profile=_profile(), own_model=True,
+        resolved=resolved, resolve_error="", datasets_root=tmp_path, mappings=mappings, registry_errors=[], foreign_models=set(), model_name="GLM",
+        agent="terminus2", recipe="glm", dataset="birdsql_sqlite", issues=[],
+    )
+    config = {c.key: c for c in checks}["config"]
+    assert config.level == "fail" and "h-cowork_bench" in config.detail and "workflow не создастся" in config.detail

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import shutil
 
 import yaml
@@ -89,3 +90,53 @@ def find_mapping(mappings: list[Mapping], datasets_root: Path, task_path: Path) 
             if len(str(root)) > best_len:
                 best, best_len = m, len(str(root))
     return best
+
+
+# --- выбор датасета в форме ----------------------------------------------------------
+ROOT_VAR = "${system.datasets_root}/"
+
+
+def list_mappings(worktree: Path, overlay: Path) -> list[Mapping]:
+    """Записи реестра ревизии и overlay без копирования; при совпадении имени или tasks_root первой идёт ревизия."""
+    out: list[Mapping] = []
+    seen: set[str] = set()
+    for m in scan(worktree / CONFIGS_REL / "datasets", "fleet") + scan(overlay / "datasets", "overlay"):
+        if m.name not in seen and m.tasks_root not in seen:
+            seen |= {m.name, m.tasks_root}
+            out.append(m)
+    return out
+
+
+def group_tasks_roots(config_dirs: list[Path]) -> dict[str, str]:
+    """Группы harbor/dataset на один каталог под корнем датасетов: имя → tasks_root.
+
+    `config_dirs` — в порядке поиска Hydra (ревизия раньше overlay): одноимённый файл дальше по списку не читается.
+    Группа на несколько бенчей или с абсолютным путём (`/data/<user>/…`) запись реестра не заменяет.
+    """
+    roots: dict[str, str] = {}
+    seen: set[str] = set()
+    for directory in config_dirs:
+        for path in sorted((directory / "harbor" / "dataset").glob("*.yaml")):
+            if path.stem in seen:
+                continue
+            seen.add(path.stem)
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            items = ((data.get("harbor_job") or {}).get("datasets") or []) if isinstance(data, dict) else []
+            paths = [str(i.get("path", "")) for i in items if isinstance(i, dict)]
+            if len(paths) == 1 and paths[0].startswith(ROOT_VAR):
+                roots[path.stem] = paths[0][len(ROOT_VAR) :].strip("/")
+    return roots
+
+
+def registry_choices(mappings: list[Mapping], group_roots: dict[str, str]) -> list[Mapping]:
+    """Записи реестра, каталог которых не закрыт группой harbor/dataset: форма предлагает их путём. Группа важнее."""
+    covered = set(group_roots.values())
+    return [m for m in mappings if m.tasks_root.strip("/") not in covered and not Path(m.tasks_root).is_absolute()]
+
+
+def bench_slug(text: str) -> str:
+    """benchmark для пути из реестра: строчные латинские буквы, цифры и дефис."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "bench"

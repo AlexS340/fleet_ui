@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from fleet_console.compose.registry import Mapping, find_mapping
+from fleet_console.compose.spec import prefix_problem
 from fleet_console.connect.kube import KubeStatus
 from fleet_console.fleetref.profile import Profile
 from fleet_console.settings import KNOWN_ISSUES, SECRET_NAMES
@@ -135,6 +136,8 @@ def run_checks(
 
     if resolved is None:
         checks.append(Check("config", "Сборка конфига (--print-config)", "fail", resolve_error or "не запускался"))
+    elif problem := prefix_problem(str((resolved.get("experiment") or {}).get("workflow_prefix") or "h-bench")):
+        checks.append(Check("config", "Сборка конфига (--print-config)", "fail", f"experiment.workflow_prefix {problem}: workflow не создастся"))
     else:
         checks.append(Check("config", "Сборка конфига (--print-config)", "ok", "resolved.yaml записан"))
 

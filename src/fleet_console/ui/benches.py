@@ -40,6 +40,7 @@ from fleet_console.compose import (
     validate_yaml,
 )
 from fleet_console.compose.provenance import Candidate, build_index, layers, lookup, tree_nodes, value_at
+from fleet_console.compose.registry import Mapping, bench_slug, group_tasks_roots, list_mappings, registry_choices
 from fleet_console.context import AppContext
 from fleet_console.fleetref.manager import ReadyRevision
 from fleet_console.fleetref.profile import CONFIGS_REL, list_groups
@@ -74,6 +75,8 @@ TASK_COLUMNS = [
 PHASE_TEXT = {"Running": "идёт", "Pending": "ждёт", "": "ждёт", "Succeeded": "успех", "Failed": "упал", "Error": "ошибка"}
 RESULT_TEXT = {"completed": "COMPLETED", "failed": "FAILED", "no_flag": "без флага", "no_attempt": "попыток нет"}
 CUSTOM_DATASET = "__custom__"
+REGISTRY_DATASET = "registry:"  # + имя записи реестра без группы harbor/dataset: путь, benchmark и маппинг подставляются
+CUSTOM_LABEL = "свой путь под FLEET_DATASETS_ROOT…"
 OWN_MODEL_PREFIX = "recipe:"
 SESSION_PREFIX = "session:"
 
@@ -105,6 +108,12 @@ def merged_groups(revision: ReadyRevision) -> dict[str, list[str]]:
 
 def overlay_members() -> dict[str, set[str]]:
     return {k: set(v) for k, v in list_groups(OVERLAY_DIR).items()}
+
+
+def registry_datasets(revision: ReadyRevision) -> dict[str, Mapping]:
+    """Бенчи из реестра datasets (ревизия + overlay), для каталога которых нет группы harbor/dataset."""
+    roots = group_tasks_roots([revision.worktree / CONFIGS_REL, OVERLAY_DIR])
+    return {REGISTRY_DATASET + m.name: m for m in registry_choices(list_mappings(revision.worktree, OVERLAY_DIR), roots)}
 
 
 @dataclass
@@ -199,6 +208,14 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
         def label_of(group: str, member: str) -> str:
             return f"{member} (overlay)" if member in overlay.get(group, set()) else member
 
+        registry = registry_datasets(revision)
+
+        def dataset_options(members: list[str]) -> dict[str, str]:
+            """Группы, затем бенчи только из реестра (путь подставится), затем свой путь."""
+            options = {d: label_of("harbor/dataset", d) for d in members}
+            options |= {key: f"{m.name} · из реестра" + (" (overlay)" if m.origin == "overlay" else "") for key, m in registry.items()}
+            return options | {CUSTOM_DATASET: CUSTOM_LABEL}
+
         # --- поля формы
         preset_options = {"": "— без пресета —"} | {p.name: f"{p.name} · {p.description}" if p.description else p.name for p in presets}
         preset_select = ui.select(preset_options, value="", label="Пресет").classes("w-full")
@@ -223,14 +240,14 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                 "flex-1 min-w-[16rem]"
             )
             datasets = groups.get("harbor/dataset", [])
-            dataset_options = {d: label_of("harbor/dataset", d) for d in datasets} | {CUSTOM_DATASET: "свой путь под FLEET_DATASETS_ROOT…"}
-            dataset_select = ui.select(dataset_options, value=datasets[0] if datasets else CUSTOM_DATASET, label="Датасет · harbor/dataset", with_input=True).classes(
-                "flex-1 min-w-[16rem]"
-            )
+            dataset_select = ui.select(
+                dataset_options(datasets), value=datasets[0] if datasets else next(iter(registry), CUSTOM_DATASET), label="Датасет · группа или реестр", with_input=True
+            ).classes("flex-1 min-w-[16rem]")
         with ui.row().classes("w-full gap-3 flex-wrap items-end") as custom_row:
             custom_path = ui.input("путь датасета относительно FLEET_DATASETS_ROOT").classes("flex-1 min-w-[14rem]")
-            custom_benchmark = ui.input("benchmark").classes("w-40")
-            custom_mapping = ui.select({"": "маппинг по tasks_root"} | {m: m for m in groups.get("datasets", [])}, value="", label="реестр datasets").classes("w-56")
+            custom_benchmark = ui.input("benchmark").classes("w-60")  # имена из реестра длинные: cowork-bench-ua-external-260902
+            mapping_names = [*groups.get("datasets", []), *(m.name for m in list_mappings(revision.worktree, OVERLAY_DIR))]
+            custom_mapping = ui.select({"": "маппинг по tasks_root"} | {m: m for m in mapping_names}, value="", label="реестр datasets").classes("w-56")
         with ui.row().classes("gap-3 flex-wrap items-end"):
             jobs = ui.number("Реплики", value=1, min=1, precision=0).classes("w-28")
             apr = ui.number("Агентов на реплику", value=1, min=1, precision=0).classes("w-40")
@@ -262,17 +279,28 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
             """После «Сохранить в overlay»: новый член группы появляется в списках формы."""
             fresh = merged_groups(revision)
             agent_select.set_options({a: label_of("harbor/agent", a) for a in fresh.get("harbor/agent", [])}, value=agent_select.value)
-            dataset_select.set_options(
-                {d: label_of("harbor/dataset", d) for d in fresh.get("harbor/dataset", [])} | {CUSTOM_DATASET: "свой путь под FLEET_DATASETS_ROOT…"}, value=dataset_select.value
-            )
+            registry.clear()
+            registry.update(registry_datasets(revision))
+            dataset_select.set_options(dataset_options(fresh.get("harbor/dataset", [])), value=dataset_select.value)
             overlay.clear()
             overlay.update(overlay_members())
+
+        def is_path_dataset() -> bool:
+            return dataset_select.value == CUSTOM_DATASET or str(dataset_select.value or "") in registry
+
+        def fill_from_registry(value: Any) -> None:
+            """Бенч из реестра: путь, benchmark и маппинг — из записи; поля остаются видимыми и правятся."""
+            m = registry.get(str(value or ""))
+            if m is not None:
+                custom_path.set_value(m.tasks_root)
+                custom_benchmark.set_value(bench_slug(m.benchmark))
+                custom_mapping.set_value(m.name if m.name in custom_mapping.options else "")
 
         def is_session() -> bool:
             return str(model_select.value or "").startswith(SESSION_PREFIX)
 
         def refresh_gpu() -> None:
-            custom_row.set_visibility(dataset_select.value == CUSTOM_DATASET)
+            custom_row.set_visibility(is_path_dataset())
             model_name.set_visibility(not is_session())
             n = int(jobs.value or 1)
             if is_session():
@@ -304,7 +332,9 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                 if preset.dataset in dataset_select.options:
                     dataset_select.set_value(preset.dataset)
             else:
-                dataset_select.set_value(CUSTOM_DATASET)
+                ref = preset.dataset
+                key = next((k for k, m in registry.items() if m.name == ref.mapping or m.tasks_root.strip("/") == ref.path.strip("/")), CUSTOM_DATASET)
+                dataset_select.set_value(key)
                 custom_path.set_value(preset.dataset.path)
                 custom_benchmark.set_value(preset.dataset.benchmark)
                 custom_mapping.set_value(preset.dataset.mapping or "")
@@ -319,7 +349,7 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
             refresh_gpu()
 
         def dataset_value() -> str | DatasetRef:
-            if dataset_select.value == CUSTOM_DATASET:
+            if is_path_dataset():
                 return DatasetRef(path=(custom_path.value or "").strip(), benchmark=(custom_benchmark.value or "").strip(), mapping=(custom_mapping.value or None))
             return str(dataset_select.value)
 
@@ -457,10 +487,12 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                 shutil.rmtree(draft.spec.run_dir, ignore_errors=True)
 
         preset_select.on_value_change(lambda e: apply_preset(e.value))
+        dataset_select.on_value_change(lambda e: fill_from_registry(e.value))
         for element in (model_select, dataset_select, jobs, apr):
             element.on_value_change(lambda _: refresh_gpu())
         accept.on_value_change(lambda _: refresh_start())
         dialog.on("hide", lambda _: discard_draft())
+        fill_from_registry(dataset_select.value)
         refresh_gpu()
     dialog.open()
 

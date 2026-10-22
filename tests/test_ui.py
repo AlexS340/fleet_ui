@@ -365,3 +365,46 @@ async def test_benches_page_offers_dataset_download(user: User) -> None:
 
             shutil.rmtree(tasks_dir)
         hidden.rename(tasks_dir)
+
+
+async def test_benches_form_offers_registry_benches_and_fills_path(user: User) -> None:
+    from fleet_console.connect.kube import KubeStatus
+
+    fakes.CTX.kube_status = KubeStatus(context="internal", server="s", allowed=True, ready=True, permissions={"get nodes": True})
+    await fakes.CTX.manager.prepare("master")
+    registry = fakes.CTX.manager.worktree / CONFIGS_REL / "datasets"
+    extra = {
+        registry / "deep_swe.yaml": "benchmark: deep_swe_v1\nsource:\n  tasks_root: deep_swe/tasks\nruntime:\n  task_s3_base: deep_swe/tasks\n",
+        registry / "cowork_bench_ua_external_260902.yaml": (  # запись под пресет qwen36-cowork-smoke репозитория
+            "benchmark: cowork_bench_ua_external_260902\nsource:\n  tasks_root: cowork_bench_ua_external_260902/tasks\nruntime:\n  task_s3_base: x\n"
+        ),
+    }
+    for path, text in extra.items():
+        path.write_text(text, encoding="utf-8")
+    try:
+        await user.open("/runs")
+        user.find("Запустить бенч").click()
+        await user.should_see("Пресет")
+        dataset = _select(user, "Датасет · группа или реестр")
+        # cowork реестра закрыт одноимённой группой — группа важнее; бенчи только из реестра идут после групп
+        assert list(dataset.options) == ["cowork", "registry:cowork_bench_ua_external_260902", "registry:deep_swe", "__custom__"]
+        assert dataset.options["registry:deep_swe"] == "deep_swe · из реестра" and dataset.value == "cowork"
+        dataset.set_value("registry:deep_swe")
+        await asyncio.sleep(0.05)
+        inputs = {i.props.get("label"): i for i in user.find(kind=ui.input).elements}
+        assert inputs["путь датасета относительно FLEET_DATASETS_ROOT"].value == "deep_swe/tasks" and inputs["benchmark"].value == "deep-swe-v1"
+        assert _select(user, "реестр datasets").value == "deep_swe"
+        user.find("Превью и preflight").click()
+        await user.should_see("Что и где будет запущено")
+        exp = next(fakes.CTX.paths.runs.glob("glm-deep-swe-v1-*/exp.yaml")).read_text()
+        assert "harbor/dataset:" not in exp and "${system.datasets_root}/deep_swe/tasks" in exp and "benchmark: deep-swe-v1" in exp
+        assert "workflow_prefix: h-deep-swe-v1" in exp
+        # пресет с путём из реестра выбирает пункт реестра, но benchmark берёт свой
+        _select(user, "Пресет").set_value("qwen36-cowork-smoke")
+        await asyncio.sleep(0.05)
+        assert dataset.value == "registry:cowork_bench_ua_external_260902" and inputs["benchmark"].value == "cowork"
+        assert inputs["путь датасета относительно FLEET_DATASETS_ROOT"].value == "cowork_bench_ua_external_260902/tasks"
+        assert _select(user, "реестр datasets").value == "cowork_bench_ua_external_260902"
+    finally:
+        for path in extra:
+            path.unlink()

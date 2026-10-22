@@ -22,12 +22,30 @@ from fleet_console.presets import DatasetRef
 
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 LABEL_MAX = 63  # run_id — значение лейбла fleet/run-name
+PREFIX_MAX = 45  # как default_workflow_prefix fleet: generate_name workflow + суффиксы fleet и Argo
+PREFIX_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def workflow_prefix(benchmark: str) -> str:
+    """`h-<benchmark>`, годный для generate_name Argo. fleet кладёт experiment.workflow_prefix в имя workflow как есть,
+    а интерполяция `h-${harbor_dataset.benchmark}` пропускает подчёркивания из реестра — сервис чистит сам."""
+    slug = SLUG_RE.sub("-", benchmark.lower()).strip("-") or "bench"
+    return f"h-{slug}"[:PREFIX_MAX].rstrip("-")
+
+
+def prefix_problem(prefix: str) -> str:
+    """Почему префикс не годится для имени workflow; пусто — годится."""
+    if not PREFIX_RE.match(prefix):
+        return f"«{prefix}»: допустимы только строчные латинские буквы, цифры и дефис"
+    if len(prefix) > PREFIX_MAX:
+        return f"«{prefix}» длиннее {PREFIX_MAX} символов"
+    return ""
 
 
 def make_bench_id(name: str, now: datetime) -> str:
     """`<имя>-<время>`: годится как лейбл k8s, S3-префикс и имя каталога; fleet суффикс не добавит (run_id передаётся)."""
     stamp = now.strftime("%Y%m%d-%H%M%S")
-    slug = SLUG_RE.sub("-", name.lower()).strip("-")[: LABEL_MAX - len(stamp) - 1] or "bench"
+    slug = SLUG_RE.sub("-", name.lower()).strip("-")[: LABEL_MAX - len(stamp) - 1].rstrip("-") or "bench"  # без «--» на стыке
     return f"{slug}-{stamp}"
 
 
@@ -101,6 +119,22 @@ class BenchSpec:
     def dataset_label(self) -> str:
         return self.dataset if isinstance(self.dataset, str) else self.dataset.label
 
+    def benchmark(self) -> str:
+        """harbor_dataset.benchmark прогона: из пути или из файла группы в порядке поиска Hydra (каталог прогона,
+        ревизия, overlay). Пусто — файла нет или в нём нет benchmark."""
+        if isinstance(self.dataset, DatasetRef):
+            return self.dataset.benchmark
+        for directory in (self.run_dir, self.worktree / CONFIGS_REL, self.overlay):
+            path = directory / "harbor" / "dataset" / f"{self.dataset}.yaml"
+            if path.is_file():
+                try:
+                    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                except (OSError, yaml.YAMLError):
+                    return ""
+                bench = (data.get("harbor_dataset") or {}).get("benchmark") if isinstance(data, dict) else None
+                return str(bench or "")
+        return ""
+
     @property
     def effective_jobs(self) -> int:
         return self.session.replicas if self.session else self.jobs
@@ -140,7 +174,9 @@ class BenchSpec:
             "  model_name: ${mlsc.served_model_name}",
             f"  jobs: {self.jobs}" + ("                      # у сессии своё число реплик: сервис переопределяет" if self.session else ""),
             f"  agents_per_replica: {self.agents_per_replica}",
-            "  workflow_prefix: h-${harbor_dataset.benchmark}",
+            (f"  workflow_prefix: {workflow_prefix(bench)}" + "   # h-<benchmark>, очищен сервисом: имя workflow Argo")
+            if (bench := self.benchmark())
+            else "  workflow_prefix: h-${harbor_dataset.benchmark}",
             f"  inference: {self.inference}",
             "",
             "execution:",
