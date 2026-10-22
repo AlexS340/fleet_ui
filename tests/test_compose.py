@@ -214,6 +214,12 @@ def test_preflight_checks(tmp_path: Path) -> None:
     assert by["dataset"].level == "fail" and by["registry"].level == "fail"
     no_dir = run_checks(secrets={}, **{**common, "resolved": {**resolved, "harbor_job": {"datasets": [{"path": str(root / "missing")}]}}})
     assert "нет каталога" in {c.key: c for c in no_dir}["dataset"].detail
+    nope = tmp_path / "nope"  # корня ещё нет: всё равно предлагаем скачать из S3 — sync создаст каталоги
+    no_root = run_checks(secrets={}, **{**common, "datasets_root": nope, "resolved": {**resolved, "harbor_job": {"datasets": [{"path": str(nope / "birdsql" / "sqlite" / "tasks")}]}}})
+    c = {c.key: c for c in no_root}["dataset"]
+    assert c.level == "fail" and "корня" in c.detail and "нет каталога" in c.detail and c.action["kind"] == "fetch_dataset" and c.action["mapping"] == "birdsql_sqlite"
+    no_root_no_cfg = run_checks(secrets={}, **{**common, "datasets_root": nope, "resolved": None, "resolve_error": "x"})
+    assert "каталога" in {c.key: c for c in no_root_no_cfg}["dataset"].detail
     drift = run_checks(secrets={}, **common, overlay_drift=["harbor/agent/x.yaml: оригинал harbor/agent/terminus2.yaml изменился после ревизии 378874b3"])
     assert {c.key: c for c in drift}["overlay"].level == "warn" and "overlay" not in {c.key for c in no_dir}
 

@@ -145,12 +145,12 @@ def run_checks(
 
     if datasets_root is None:
         checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", "fail", "FLEET_DATASETS_ROOT не задан: настройки → «Корень датасетов»"))
-    elif not datasets_root.is_dir():
-        checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", "fail", f"каталога {datasets_root} нет"))
     elif resolved is not None:
         problems = []
         found = []
         action = None
+        if not datasets_root.is_dir():  # корень создаст `aws s3 sync` — предложение скачать остаётся
+            problems.append(f"корня {datasets_root} нет (создастся при скачивании)")
         for d in (resolved.get("harbor_job") or {}).get("datasets") or []:
             path = Path(str(d.get("path", ""))) if isinstance(d, dict) else None
             if path is None:
@@ -168,6 +168,8 @@ def run_checks(
                 found.append(f"{path.name} → {m.name} ({m.origin})")
         level = "fail" if problems else ("ok" if found else "warn")
         checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", level, "; ".join(problems or found) or "в конфиге нет harbor_job.datasets", action))
+    elif not datasets_root.is_dir():
+        checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", "fail", f"каталога {datasets_root} нет"))
     else:
         checks.append(Check("dataset", "Датасет под FLEET_DATASETS_ROOT", "warn", "проверю после сборки конфига"))
 
