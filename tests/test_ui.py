@@ -68,7 +68,7 @@ async def test_fetch_button_and_dialogs(user: User) -> None:
     user.find("бастион").click()
     await user.should_see("Проброс: бастион")
     await asyncio.sleep(2.5)  # таймер шапки успевает сделать refresh — диалог должен пережить его
-    await user.should_see("ssh -N fleetbastion")
+    await user.should_see("ssh -N gigacode-bastion")
     user.find("Перезапустить").click()
     await user.should_see("бастион: перезапуск")
     assert fakes.CTX.supervisor.restarted[-1] == "bastion"

@@ -394,7 +394,11 @@ Fleet это позволяет: подъём и гашение модели —
 
 ## Подключение к кластеру
 
-Сервис работает с моим kubeconfig и сам держит все нужные пробросы портов. Проверено 2026-10-21: сам API-сервер доступен только через ssh-сессию к бастиону. Kube context `internal` смотрит на `https://127.0.0.1:8443`, а этот порт открывает `ssh fleetbastion` из `~/.ssh/config` (`ProxyJump ecs3`, `LocalForward 8443 192.168.100.17:5443`, `DynamicForward 1080`). Та же сессия даёт SOCKS-прокси `127.0.0.1:1080`, без которого из домашней сети недоступны `pypi-mirror.gitverse.ru` (индекс по умолчанию в `pyproject.toml` fleet, нужен для `uv sync` worktree) и ingress-хосты `*.sberai-rnd.ru` (Argo UI). Поэтому ssh-сессия к бастиону — проброс №0 в супервизоре: принцип autossh применим именно к ней, а `kubectl port-forward` до Argo и шлюзов идут уже поверх неё через API-сервер.
+Сервис работает с моим kubeconfig и сам держит все нужные пробросы портов. С 2026-10-30 используется прямой командный бастион `gigacode-bastion` (`87.242.125.151:22`, пользователь `afsautin`), выбранный настройкой `bastion.ssh_host`. Kube context `internal` остаётся на `https://127.0.0.1:8443`: SSH-хост в `~/.ssh/config` открывает `LocalForward 127.0.0.1:8443 192.168.100.17:5443` и `DynamicForward 127.0.0.1:1080`. Это сохраняет работу всех вызовов fleet и kubectl с существующим kubeconfig; `proxy-url` не требуется. Прежняя схема через `fleetbastion` и `ProxyJump ecs3` остаётся только в истории проверок Ф0.
+
+Та же SSH-сессия даёт SOCKS-прокси `127.0.0.1:1080`, используемый для `pypi-mirror.gitverse.ru` (индекс по умолчанию в `pyproject.toml` fleet, нужен для `uv sync` worktree) и ingress-хостов `*.sberai-rnd.ru` (Argo UI). Поэтому ssh-сессия к бастиону — проброс №0 в супервизоре, а `kubectl port-forward` до Argo и шлюзов идут уже поверх неё через API-сервер. Ключ должен иметь доступ в FreeIPA/группе бастиона; SSH-хост выбирает его через `IdentityFile`, сервис ключи не создаёт и не переносит.
+
+Проверка 2026-10-30: через новый бастион `/readyz` = `ok`, `auth can-i list workflows.argoproj.io` = `yes`. Вход работает ключом `~/.ssh/id_ed25519`; присланный владельцем ключ соответствует `~/.ssh/kub.pub`, но вход с `~/.ssh/kub` пока отклоняется. Для рабочего подключения выбран `id_ed25519`. DNS на новом бастионе разрешает зеркало и Argo, однако HTTPS к обоим через SOCKS отвечает таймаутом (`direct-tcpip: connect failed: Connection timed out`); зелёный статус бастиона проверяет только API кластера и не гарантирует готовность зеркала зависимостей. Этот сетевой доступ требует отдельного уточнения на стороне бастиона.
 
 **Kube context.** При старте сервис:
 
@@ -407,7 +411,7 @@ Fleet это позволяет: подъём и гашение модели —
 
 | Проброс | Зачем | Проверка |
 | --- | --- | --- |
-| ssh-сессия к бастиону (`ssh -N fleetbastion`: API-сервер на 8443, SOCKS на 1080) | всё остальное: kubectl, `uv sync`, ingress-хосты | `kubectl get --raw /readyz` = `ok` |
+| ssh-сессия к бастиону (`ssh -N gigacode-bastion`: API-сервер на 8443, SOCKS на 1080) | всё остальное: kubectl, `uv sync`, ingress-хосты | `kubectl get --raw /readyz` = `ok` |
 | Argo Server (`-n argo service/argo-workflows-server`, 2746) — **пока не делаем** (решение 2026-10-21) | Argo UI; шагов fleet с Argo API сервис не вызывает | при надобности руками: `kubectl -n argo port-forward service/argo-workflows-server 2746`; API без токена отвечает 401 |
 | Шлюз моделей litellm или nginx | песочница и свои скрипты к vLLM | litellm: `GET /health/readiness` (готовность пода, за который держится `port-forward`); nginx: `GET /v1/models`, 404 — тоже ответ |
 

@@ -81,7 +81,7 @@ class Paths:
 class Bastion(BaseModel):
     """ssh-сессия к бастиону: даёт API-сервер на 8443 и SOCKS на 1080 (порты из ~/.ssh/config)."""
 
-    ssh_host: str = "fleetbastion"
+    ssh_host: str = "gigacode-bastion"
     socks_proxy: str = "socks5h://127.0.0.1:1080"
 
 

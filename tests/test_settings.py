@@ -8,7 +8,7 @@ def test_load_creates_defaults(tmp_path: Path) -> None:
     settings = Settings.load(paths)
     assert settings.fleet_remote.endswith("fleet.git")
     assert settings.allowed_contexts == ["internal"]
-    assert settings.bastion.ssh_host == "fleetbastion"
+    assert settings.bastion.ssh_host == "gigacode-bastion"
     assert paths.settings_file.exists()
     assert paths.worktrees.is_dir() and paths.logs.is_dir()
     assert paths.settings_file.read_text(encoding="utf-8").startswith("# Настройки Fleet Console")

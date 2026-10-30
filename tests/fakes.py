@@ -104,7 +104,7 @@ class FakeSupervisor:
         async def ok() -> bool:
             return True
 
-        self.forwards = [Forward("bastion", "бастион", ["ssh", "-N", "fleetbastion"], ok, hint="ssh -N fleetbastion")]
+        self.forwards = [Forward("bastion", "бастион", ["ssh", "-N", "gigacode-bastion"], ok, hint="ssh -N gigacode-bastion")]
         self.states = {"bastion": ForwardState(status="green")}
         self.restarted: list[str] = []
 
