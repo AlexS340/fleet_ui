@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 import shlex
 
@@ -20,12 +21,13 @@ from fleet_console.control.mlsc import set_planned_state
 from fleet_console.fleetref.git import Mirror
 from fleet_console.fleetref.manager import PrepareError, RevisionManager
 from fleet_console.compose import DatasetFetcher
+from fleet_console.compose.local_datasets import LocalDatasets
 from fleet_console.guard import SleepGuard, SleepReport
 from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import CommandError, Runner, SubprocessRunner
 from fleet_console.runs import BenchManager
-from fleet_console.settings import SECRET_NAMES, Paths, Settings, aws_secret_names, default_home, read_secret, secrets_env
+from fleet_console.settings import OVERLAY_DIR, SECRET_NAMES, Paths, Settings, aws_secret_names, default_home, read_secret, secrets_env
 from fleet_console.store import Store
 
 BASTION = "bastion"
@@ -57,6 +59,10 @@ class AppContext:
 
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
         return scan(worktree)
+
+    @cached_property
+    def local_datasets(self) -> LocalDatasets:
+        return LocalDatasets(self.runner, self.paths, self.settings, OVERLAY_DIR, self.store.event)
 
     # --- шлюз моделей ----------------------------------------------------
     def open_gateway(self, key: str) -> Gateway:
@@ -118,7 +124,7 @@ class AppContext:
 
     async def shutdown(self) -> None:
         # Задачи бенчей отменяем тоже, но их подпроцессы fleet живут в своих группах и переживут перезапуск: resume прицепится.
-        pending = [*self._tasks, *self.sessions.tasks.values(), *self.benches.tasks.values()]
+        pending = [*self._tasks, *self.sessions.tasks.values(), *self.benches.tasks.values(), *self.local_datasets.jobs.values()]
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)

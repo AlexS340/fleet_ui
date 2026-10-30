@@ -216,6 +216,11 @@ class SubprocessRunner:
             proc.kill()
             await proc.wait()
             return Result(tuple(argv), -1, "", f"таймаут {timeout} с")
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
         return Result(tuple(argv), proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace"))
 
     async def stream(

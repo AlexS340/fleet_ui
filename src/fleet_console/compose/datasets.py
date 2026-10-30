@@ -42,7 +42,8 @@ class FetchPlan:
 
 
 def plan_fetch(mapping: Mapping, datasets_root: Path, s3_datasets_root: str, tasks: tuple[str, ...] = ()) -> FetchPlan:
-    src = f"{s3_datasets_root.rstrip('/')}/{mapping.task_s3_base.strip('/')}/"
+    base = mapping.task_s3_base if mapping.task_s3_base.startswith("s3://") else f"{s3_datasets_root.rstrip('/')}/{mapping.task_s3_base.strip('/')}"
+    src = base.rstrip("/") + "/"
     root = Path(mapping.tasks_root)
     dst = root if root.is_absolute() else datasets_root / mapping.tasks_root
     return FetchPlan(mapping.name, src, dst, tuple(tasks))

@@ -136,6 +136,7 @@ class Settings(BaseModel):
     # Профиль ключей для чтения S3 из сервиса (список и скачивание): AWS_*_<профиль> из окружения, secrets.env или ~/.aws/credentials.
     # Ключ gcvmfleet, которым fleet пишет результаты, может не иметь права ListObjects — тогда укажите профиль только для чтения.
     s3_read_profile: str = "gcvmfleet"
+    s3_write_profile: str = "gcvmfleet"  # отправка локальных задач; нужен PutObject
     # Benchboard: прогон после замера виден в каталоге по модели и run_id; прямых ссылок на прогон у него нет.
     benchboard_url: str = "https://fleet-benchboard.sberai-rnd.ru"
     bench: Bench = Field(default_factory=Bench)

@@ -27,6 +27,27 @@ async def test_subprocess_timeout() -> None:
     assert result.returncode == -1 and "таймаут" in result.stderr
 
 
+async def test_cancelled_upload_command_stops_process(tmp_path: Path) -> None:
+    import asyncio
+    import os
+
+    import pytest
+
+    pid_file = tmp_path / "child.pid"
+    code = "import os,sys,time; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
+    running = asyncio.create_task(SubprocessRunner().run([sys.executable, "-c", code, str(pid_file)]))
+    for _ in range(100):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.exists()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
 async def test_fake_runner_prefix_and_calls(tmp_path: Path) -> None:
     fake = FakeRunner()
     fake.on("git", "fetch", stdout="ok")

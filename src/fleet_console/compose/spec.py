@@ -81,6 +81,7 @@ class BenchSpec:
     session: SessionLink | None = None
     preset: str = ""
     sha: str = ""
+    dataset_source: dict[str, str] = field(default_factory=dict)  # происхождение локально импортированного набора
 
     # --- пути -------------------------------------------------------------
     @property
