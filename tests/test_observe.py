@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import cluster_samples as samples
-from fleet_console.observe import ClusterObserver
-from fleet_console.observe import argo, mlsc, nginx, nodes, submitter
+
+from fleet_console.observe import ClusterObserver, argo, mlsc, nginx, nodes, submitter
 from fleet_console.runner import FakeRunner, Result
 from fleet_console.settings import Settings
 
@@ -149,6 +150,18 @@ def test_s3_ls_parse_and_scan_results(tmp_path) -> None:
     assert env == {"AWS_CONFIG_FILE": str(cfg), "AWS_PROFILE": "default", "AWS_ACCESS_KEY_ID": "AK", "AWS_SECRET_ACCESS_KEY": "SK"}
     assert cfg.read_text() == "[default]\nregion = ru-1\nendpoint_url = https://obs.example\ns3 =\n  addressing_style = virtual\n"
     assert "AWS_ACCESS_KEY_ID" not in s3.aws_env({}, cfg, "https://obs.example", "ru-1")  # без ключей aws сам скажет об ошибке
+
+
+def test_obs_endpoint_uses_compatible_required_checksums(tmp_path: Path) -> None:
+    from fleet_console.observe import s3
+
+    endpoint = "https://obs.ru-moscow-1.hc.sbercloud.ru"
+    env = s3.aws_env({}, tmp_path / "obs.cfg", endpoint, "ru-moscow-1")
+    assert env["AWS_REQUEST_CHECKSUM_CALCULATION"] == "when_required"
+    assert env["AWS_RESPONSE_CHECKSUM_VALIDATION"] == "when_required"
+    aws = s3.aws_env({}, tmp_path / "aws.cfg", "https://s3.amazonaws.com", "us-east-1")
+    assert "AWS_REQUEST_CHECKSUM_CALCULATION" not in aws
+    assert "AWS_RESPONSE_CHECKSUM_VALIDATION" not in aws
 
 
 async def test_s3_ls_and_cat_commands() -> None:

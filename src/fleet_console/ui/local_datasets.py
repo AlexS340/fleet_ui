@@ -126,6 +126,8 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run) -> None:
         with ui.expansion("Команда загрузки").classes("w-full"):
             command = ui.code("", language="shell").classes("w-full whitespace-pre-wrap break-all")
         state = ui.label().classes("w-full text-sm whitespace-pre-wrap break-all").mark("local-upload-state")
+        with ui.expansion("Лог отправки").classes("w-full") as log_box:
+            log_text = ui.code("", language="text").classes("w-full").style("max-height: 18rem; overflow: auto")
         with ui.row().classes("gap-2 flex-wrap"):
             upload = ui.button("Отправить в S3").props("unelevated no-caps").mark("local-upload")
             run = ui.button("Запустить на этих данных").props("flat no-caps").mark("local-run")
@@ -144,6 +146,10 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run) -> None:
             upload.set_enabled(valid and not active)
             run.set_enabled(bool(current.uploaded_at) and not active)
             root.set_enabled(not active and not current.s3_uri)
+            log = ctx.paths.logs / "datasets" / f"{item.id}.upload.log"
+            log_box.set_visibility(log.is_file())
+            if log.is_file():
+                log_text.set_content(log.read_text(encoding="utf-8")[-20_000:])
 
         async def send() -> None:
             try:

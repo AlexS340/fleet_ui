@@ -116,6 +116,22 @@ async def test_missing_write_credentials_never_calls_aws(tmp_path: Path, monkeyp
     assert "PutObject" in svc.get(item.id).error and not svc.runner.calls
 
 
+async def test_repeated_upload_errors_are_short_and_full_log_is_redacted(tmp_path: Path, monkeypatch) -> None:
+    svc = service(tmp_path)
+    task(tmp_path / "source")
+    item = svc.import_folder(tmp_path / "source", "sheet")
+    monkeypatch.setattr(local_module, "secrets_env", lambda *args: {
+        "AWS_ACCESS_KEY_ID_gcvmfleet": "secret-key", "AWS_SECRET_ACCESS_KEY_gcvmfleet": "secret-token",
+    })
+    error = "An error occurred (XAmzContentSHA256Mismatch) when calling the PutObject operation: checksum mismatch"
+    svc.runner.on("aws", result=Result((), 1, "", f"upload failed: a {error}\nupload failed: b {error}\nsecret-token"))
+    await svc.upload(item.id, "s3://bucket/harbor_datasets")
+    assert svc.get(item.id).error == error
+    log = (svc.paths.logs / "datasets" / f"{item.id}.upload.log").read_text()
+    assert "upload failed: a" in log and "upload failed: b" in log
+    assert "secret-token" not in log and "<secret>" in log
+
+
 async def test_preflight_checks_remote_task_and_redacts_errors(tmp_path: Path, monkeypatch) -> None:
     svc = service(tmp_path)
     task(tmp_path / "source")

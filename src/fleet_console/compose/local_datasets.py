@@ -231,8 +231,13 @@ class LocalDatasets:
                 raise ValueError(f"нет ключей профиля S3 {profile}; укажите профиль с правом PutObject в настройках")
             env = aws_env(values, self.paths.home / "aws-write.cfg", self.settings.s3_endpoint, self.settings.s3_region, profile=profile)
             result = await self.runner.run(argv, env=env, timeout=3600)
+            log = self.paths.logs / "datasets" / f"{dataset.id}.upload.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(scrub(result.command + "\n" + result.stdout + result.stderr, values.values()), encoding="utf-8")
             if not result.ok:
-                raise ValueError((result.stderr or result.stdout or f"код {result.returncode}")[-2000:])
+                output = (result.stderr or result.stdout).strip()
+                errors = list(dict.fromkeys(re.findall(r"An error occurred [^\n]+", output)))
+                raise ValueError("\n".join(errors[:3]) if errors else output[-2000:] or f"код {result.returncode}")
             dataset.uploaded_at = datetime.now(UTC).isoformat()
         except asyncio.CancelledError:
             dataset.error = "отправка прервана; повторите загрузку"

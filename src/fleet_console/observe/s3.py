@@ -7,11 +7,12 @@ fleet (`fleet/s3_upload.py`); они пишутся в отдельный AWS_CO
 
 from __future__ import annotations
 
+import re
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-import re
-import shlex
+from urllib.parse import urlparse
 
 from fleet_console.runner import CommandError, Runner
 
@@ -57,6 +58,11 @@ def aws_env(secrets: Mapping[str, str], config_file: Path, endpoint: str, region
         config_file.parent.mkdir(parents=True, exist_ok=True)
         config_file.write_text(text, encoding="utf-8")
     env = {"AWS_CONFIG_FILE": str(config_file), "AWS_PROFILE": "default"}
+    if (urlparse(endpoint).hostname or "").endswith(".hc.sbercloud.ru"):
+        # OBS отклоняет streaming-checksum новых AWS CLI с XAmzContentSHA256Mismatch.
+        # Обязательные проверки сохраняются; optional checksum/trailer не добавляется.
+        env["AWS_REQUEST_CHECKSUM_CALCULATION"] = "when_required"
+        env["AWS_RESPONSE_CHECKSUM_VALIDATION"] = "when_required"
     key, secret = secrets.get(f"AWS_ACCESS_KEY_ID_{profile}", ""), secrets.get(f"AWS_SECRET_ACCESS_KEY_{profile}", "")
     if key and secret:
         env["AWS_ACCESS_KEY_ID"], env["AWS_SECRET_ACCESS_KEY"] = key, secret
