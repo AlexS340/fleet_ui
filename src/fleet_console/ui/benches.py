@@ -39,6 +39,7 @@ from fleet_console.compose import (
     three_way,
     validate_yaml,
 )
+from fleet_console.compose.local_datasets import LocalDataset
 from fleet_console.compose.provenance import Candidate, build_index, layers, lookup, tree_nodes, value_at
 from fleet_console.compose.registry import Mapping, bench_slug, group_tasks_roots, list_mappings, registry_choices
 from fleet_console.context import AppContext
@@ -53,6 +54,7 @@ from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
 from fleet_console.store import BenchRun
 from fleet_console.ui.common import confirm_dialog, hint
 from fleet_console.ui.header import build_header
+from fleet_console.ui.local_datasets import local_panel
 
 STATUS_TEXT = {"running": "идёт", "attention": "требует внимания", "stopping": "останавливается", "stopped": "остановлен", "failed": "не удался", "done": "готов"}
 LEVEL_ICON = {"ok": ("check_circle", "text-positive"), "warn": ("warning", "text-warning"), "fail": ("cancel", "text-negative")}
@@ -148,6 +150,7 @@ async def benches_page(ctx: AppContext) -> None:
             "text-sm opacity-70"
         )
         ui.label("клик по строке — карточка прогона: что и где запущено, стадии с командами, логи, остановка и повтор").classes("text-xs opacity-60")
+        local_panel(ctx, lambda item: _new_bench_dialog(ctx, render, local=item))
 
     def render() -> None:
         runs = ctx.benches.runs()
@@ -190,7 +193,7 @@ def _facts_table(rows: list[dict[str, str]]) -> ui.table:
 # --- форма запуска -------------------------------------------------------------
 
 
-def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — форма целиком, чтобы состояние жило в замыкании
+def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None) -> None:  # noqa: C901 — форма целиком, чтобы состояние жило в замыкании
     revision = ctx.manager.current
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
         ui.label("Запустить бенч").classes("text-lg")
@@ -209,11 +212,13 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
             return f"{member} (overlay)" if member in overlay.get(group, set()) else member
 
         registry = registry_datasets(revision)
+        local_items = {item.id: item for item in ctx.local_datasets.all()}
 
         def dataset_options(members: list[str]) -> dict[str, str]:
             """Группы, затем бенчи только из реестра (путь подставится), затем свой путь."""
             options = {d: label_of("harbor/dataset", d) for d in members}
-            options |= {key: f"{m.name} · из реестра" + (" (overlay)" if m.origin == "overlay" else "") for key, m in registry.items()}
+            options |= {key: (f"{local_items[m.name].name} · из локальной папки" if m.name in local_items else
+                             f"{m.name} · из реестра" + (" (overlay)" if m.origin == "overlay" else "")) for key, m in registry.items()}
             return options | {CUSTOM_DATASET: CUSTOM_LABEL}
 
         # --- поля формы
@@ -248,6 +253,7 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
             custom_benchmark = ui.input("benchmark").classes("w-60")  # имена из реестра длинные: cowork-bench-ua-external-260902
             mapping_names = [*groups.get("datasets", []), *(m.name for m in list_mappings(revision.worktree, OVERLAY_DIR))]
             custom_mapping = ui.select({"": "маппинг по tasks_root"} | {m: m for m in mapping_names}, value="", label="реестр datasets").classes("w-56")
+        local_note = ui.label().classes("text-sm break-all").mark("local-origin")
         with ui.row().classes("gap-3 flex-wrap items-end"):
             jobs = ui.number("Реплики", value=1, min=1, precision=0).classes("w-28")
             apr = ui.number("Агентов на реплику", value=1, min=1, precision=0).classes("w-40")
@@ -295,12 +301,15 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                 custom_path.set_value(m.tasks_root)
                 custom_benchmark.set_value(bench_slug(m.benchmark))
                 custom_mapping.set_value(m.name if m.name in custom_mapping.options else "")
+            item = local_items.get(m.name) if m else None
+            local_note.set_text(f"Из локальной папки: {item.source} · " + ("задачи загружены в S3" if item.uploaded_at else "ещё не отправлены в S3") if item else "")
 
         def is_session() -> bool:
             return str(model_select.value or "").startswith(SESSION_PREFIX)
 
         def refresh_gpu() -> None:
-            custom_row.set_visibility(is_path_dataset())
+            selected_mapping = registry.get(str(dataset_select.value or ""))
+            custom_row.set_visibility(is_path_dataset() and not (selected_mapping and selected_mapping.name in local_items))
             model_name.set_visibility(not is_session())
             n = int(jobs.value or 1)
             if is_session():
@@ -374,6 +383,8 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
             if not draft.run_id:
                 base = preset_name or f"{session.model if session else recipe}-{dataset if isinstance(dataset, str) else dataset.benchmark}"
                 draft.run_id = make_bench_id(base, datetime.now(timezone.utc))
+            item = next((d for d in local_items.values() if isinstance(dataset, DatasetRef) and ctx.settings.datasets_root_path() is not None and
+                         (ctx.settings.datasets_root_path() / dataset.path).resolve() == Path(d.path).resolve()), None)
             return BenchSpec(
                 run_id=draft.run_id, worktree=revision.worktree, run_dir=ctx.paths.runs / draft.run_id, overlay=OVERLAY_DIR, recipe=recipe,
                 agent=str(agent_select.value), dataset=dataset, jobs=int(jobs.value or 1), agents_per_replica=int(apr.value or 1),
@@ -381,6 +392,8 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                 model_name=(model_name.value or "").strip() if not session else "", harbor_job=harbor_job,
                 extra=tuple(line.strip() for line in (extra.value or "").splitlines() if line.strip()), pod=draft.spec.pod if draft.spec else "",
                 session=session, preset=preset_name, sha=revision.info.sha,
+                dataset_source={"id": item.id, "source": item.source, "imported_at": item.imported_at, "s3_uri": item.s3_uri,
+                                "uploaded_at": item.uploaded_at} if item else {},
             )
 
         async def rebuild() -> None:
@@ -408,6 +421,10 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                     foreign_models=foreign, model_name=spec.effective_model or draft.preview.model, agent=spec.agent, recipe=spec.recipe,
                     dataset=spec.dataset_label, issues=load_issues(), session_status=session_status, overlay_drift=[d.summary for d in draft.drift],
                 )
+                if spec.dataset_source:
+                    item = ctx.local_datasets.get(spec.dataset_source["id"])
+                    problem = await ctx.local_datasets.remote_ready(item.id)
+                    draft.checks.append(Check("local_upload", "Локальные задачи в S3", "fail" if problem else "ok", problem or item.s3_uri))
             except BenchError as exc:
                 ui.notify(str(exc), type="negative", multi_line=True)
                 return
@@ -475,6 +492,11 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
                     lines.append(f"Mac на батарее ({ctx.guard.battery.percent}%): подключите зарядку.")
 
             async def start() -> None:
+                if spec.dataset_source:
+                    problem = await asyncio.to_thread(ctx.local_datasets.ready, spec.dataset_source["id"])
+                    if problem:
+                        ui.notify(problem, type="negative")
+                        return
                 run = await ctx.benches.start(spec, ref=revision.ref, preview=preview)
                 dialog.close()
                 ui.notify(f"Прогон {run.id} начат")
@@ -493,6 +515,9 @@ def _new_bench_dialog(ctx: AppContext, after) -> None:  # noqa: C901 — фор�
         accept.on_value_change(lambda _: refresh_start())
         dialog.on("hide", lambda _: discard_draft())
         fill_from_registry(dataset_select.value)
+        if local:
+            dataset_select.set_value(REGISTRY_DATASET + local.id)
+            fill_from_registry(dataset_select.value)
         refresh_gpu()
     dialog.open()
 
@@ -803,6 +828,11 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
             f"requeue {run.requeues}",
         ]
         ui.label(" · ".join(facts)).classes("text-sm")
+        spec_path = Path(run.dir) / "spec.json"
+        if spec_path.is_file():
+            origin = BenchSpec.from_json(spec_path.read_text(encoding="utf-8")).dataset_source
+            if origin:
+                ui.label(f"Данные из локальной папки: {origin['source']} · загружены в S3 {origin.get('uploaded_at', '')}").classes("text-sm break-all")
         if run.error:
             ui.label(run.error).classes("text-negative text-sm whitespace-pre-wrap")
         if run.status == "attention":

@@ -367,6 +367,67 @@ async def test_benches_page_offers_dataset_download(user: User) -> None:
         hidden.rename(tasks_dir)
 
 
+async def test_local_tasks_import_upload_and_run_form(user: User, tmp_path: Path, monkeypatch, request) -> None:
+    from importlib import import_module
+
+    from test_local_datasets import task
+
+    source = tmp_path / "local-source"
+    task(source)
+    monkeypatch.setattr(import_module("fleet_console.compose.local_datasets"), "secrets_env", lambda *args: {
+        "AWS_ACCESS_KEY_ID_gcvmfleet": "test-key", "AWS_SECRET_ACCESS_KEY_gcvmfleet": "test-secret",
+    })
+    fakes.CTX.runner.handlers.insert(0, (("aws", "s3", "cp"), fakes.Result((), 0, "uploaded")))
+    fakes.CTX.runner.handlers.insert(0, (("aws", "s3", "ls"), fakes.Result((), 0, "2026-10-30 12:00:00 123 task.toml")))
+    await fakes.CTX.manager.prepare("master")
+    await user.open("/runs")
+    user.find(marker="local-add").click()
+    await user.should_see("Добавить локальные задачи")
+    user.find(marker="local-folder").elements.pop().set_value(str(tmp_path / "missing"))
+    user.find(marker="local-check").click()
+    await user.should_see("Исправьте ошибки")
+    assert not user.find(marker="local-import").elements.pop().enabled
+    user.find(marker="local-folder").elements.pop().set_value(str(source))
+    user.find(marker="local-check").click()
+    await user.should_see("Минимальная проверка пройдена")
+    user.find(marker="local-name").elements.pop().set_value("Локальный набор")
+    user.find(marker="local-import").click()
+    await user.should_see("Добавлен набор")
+    item = fakes.CTX.local_datasets.all()[0]
+    from fleet_console.settings import OVERLAY_DIR
+    request.addfinalizer(lambda: (OVERLAY_DIR / "datasets" / f"{item.id}.yaml").unlink(missing_ok=True))
+    assert any(r.get("id") == item.id for t in user.find(kind=ui.table).elements for r in t.rows)
+    user.find(marker="local-datasets").trigger("rowClick", [None, {"id": item.id}])
+    await user.should_see("Пока только локальная копия")
+    assert not user.find(marker="local-run").elements.pop().enabled
+    next(i for i in user.find(kind=ui.input).elements if i.props.get("label") == "S3-префикс датасетов").set_value("s3://bucket/harbor_datasets")
+    user.find(marker="local-upload").click()
+    await asyncio.gather(*fakes.CTX.local_datasets.jobs.values())
+    await user.should_see("Загружено в S3")
+    user.find(marker="local-run").click()
+    await user.should_see("Из локальной папки:")
+    selected = _select(user, "Датасет · группа или реестр")
+    assert "из локальной папки" in selected.options[selected.value]
+    user.find("Превью и preflight").click()
+    await user.should_see("Локальные задачи в S3")
+    draft = next(fakes.CTX.paths.runs.glob("*/spec.json"))
+    from fleet_console.compose import BenchSpec
+    assert BenchSpec.from_json(draft.read_text()).dataset_source["source"] == str(source)
+    user.find(marker="accept-warnings").elements.pop().set_value(True)
+    user.find(marker="start-bench").click()
+    await user.should_see("Запустить прогон?")
+    user.find("Да, запустить").click()
+    await user.should_see("начат")
+    await asyncio.gather(*fakes.CTX.benches.tasks.values())
+    run = next(r for r in fakes.CTX.benches.runs() if r.id == draft.parent.name)
+    assert run.status == "done"
+    await user.open("/runs")
+    run_table = user.find(kind=ui.table)
+    run_table.elements = {next(t for t in run_table.elements if any(r.get("id") == run.id for r in t.rows))}
+    run_table.trigger("rowClick", [None, {"id": run.id}])
+    await user.should_see("Данные из локальной папки:")
+
+
 async def test_benches_form_offers_registry_benches_and_fills_path(user: User) -> None:
     from fleet_console.connect.kube import KubeStatus
 
