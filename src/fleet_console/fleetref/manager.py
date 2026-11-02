@@ -17,7 +17,7 @@ from fleet_console.runner import CommandError, Runner
 from fleet_console.settings import Paths, Settings
 from fleet_console.store import Store
 
-SyncGate = Callable[[], str | None]  # None = можно синхронизировать, иначе причина отказа
+SyncGate = Callable[[], str | None]  # None = SOCKS доступен, иначе uv sync пробует только прямое подключение
 
 
 class PrepareError(RuntimeError):
@@ -131,14 +131,15 @@ class RevisionManager:
                     raise PrepareError(f"worktree {worktree} не чистый — сервис в него не пишет, разберитесь руками")
                 synced_now = False
                 if not venv_ready(worktree):
-                    if reason := self.sync_gate():
-                        raise PrepareError(f"uv sync невозможен: {reason}")
+                    proxy = self.settings.bastion.socks_proxy or None
+                    if proxy and self.sync_gate():
+                        proxy = None
                     self.progress.phase = "sync"
                     result = await uv_sync(
                         self.runner,
                         worktree,
                         log_path=self.paths.logs / f"sync-{sha[:12]}.log",
-                        proxy=self.settings.bastion.socks_proxy or None,
+                        proxy=proxy,
                         on_line=self.progress.log.append,
                     )
                     if not result.ok:

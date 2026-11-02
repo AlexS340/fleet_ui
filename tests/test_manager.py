@@ -60,7 +60,7 @@ async def test_prepare_syncs_builds_profile_then_uses_cache(manager: RevisionMan
     assert ready.profile.layout == "legacy" and ready.profile.harbor_version is None  # мини-репозиторий без configs
     assert manager.is_ready(ready.info.sha) and manager.progress.phase == "done"
     sync_calls = [c for c in manager.runner.fake.calls if c[0][:2] == ("uv", "sync")]
-    assert len(sync_calls) == 1 and sync_calls[0][1]["env"]["HTTPS_PROXY"].startswith("socks5h://")
+    assert len(sync_calls) == 1 and sync_calls[0][1]["env"]["HTTPS_PROXY"] == ""
     assert "Installed 3 packages" in list(manager.progress.log)
 
     again = await manager.prepare("feat/x")
@@ -70,13 +70,22 @@ async def test_prepare_syncs_builds_profile_then_uses_cache(manager: RevisionMan
     assert actions.count("prepare") == 2 and "clone" in actions
 
 
-async def test_prepare_refuses_sync_when_gate_closed(manager: RevisionManager) -> None:
+async def test_prepare_works_directly_when_bastion_gate_closed(manager: RevisionManager) -> None:
     await manager.ensure_mirror()
     manager.gate["reason"] = "бастион не зелёный"  # type: ignore[attr-defined]
-    with pytest.raises(PrepareError, match="бастион"):
+    ready = await manager.prepare("master")
+    assert manager.is_ready(ready.info.sha) and manager.progress.phase == "done"
+
+
+async def test_prepare_does_not_retry_via_unavailable_bastion(manager: RevisionManager) -> None:
+    await manager.ensure_mirror()
+    manager.gate["reason"] = "бастион не зелёный"  # type: ignore[attr-defined]
+    manager.runner.fake.handlers = [h for h in manager.runner.fake.handlers if h[0][:2] != ("uv", "sync")]
+    manager.runner.fake.on("uv", "sync", returncode=2, stdout="cause: operation timed out")
+    with pytest.raises(PrepareError, match="кодом 2"):
         await manager.prepare("master")
-    assert manager.progress.phase == "error" and "бастион" in manager.progress.error
-    assert manager.store.events()[0].result == "error"
+    sync_calls = [c for c in manager.runner.fake.calls if c[0][:2] == ("uv", "sync")]
+    assert len(sync_calls) == 1 and sync_calls[0][1]["env"]["HTTPS_PROXY"] == ""
 
 
 async def test_prepare_sync_failure_and_bad_ref(manager: RevisionManager) -> None:

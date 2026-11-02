@@ -337,7 +337,9 @@ class FakeRunner:
     async def stream(self, argv: Argv, *, cwd=None, env=None, log_path=None, on_line=None) -> Result:
         result = await self._answer(argv, {"cwd": cwd, "env": dict(env or {}), "log_path": log_path})
         if log_path:
-            Path(log_path).write_text(result.stdout, encoding="utf-8")
+            log_path = Path(log_path)
+            with log_path.open("a", encoding="utf-8") as log:  # noqa: ASYNC230 — короткий лог FakeRunner в тестах
+                log.write(result.stdout)
         if on_line:
             for line in result.stdout.splitlines():
                 on_line(line)

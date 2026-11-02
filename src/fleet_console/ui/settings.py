@@ -17,7 +17,7 @@ def settings_page(ctx: AppContext) -> None:
         contexts = ui.input("Разрешённые kube context, через запятую", value=", ".join(s.allowed_contexts)).classes("w-full")
         namespace = ui.input("Namespace прогонов", value=s.namespace).classes("w-full")
         ssh_host = ui.input("ssh host бастиона (пусто — сервис не управляет сессией)", value=s.bastion.ssh_host).classes("w-full")
-        socks = ui.input("SOCKS-прокси для uv sync", value=s.bastion.socks_proxy).classes("w-full")
+        socks = ui.input("SOCKS-прокси для uv sync при ошибке прямого подключения", value=s.bastion.socks_proxy).classes("w-full")
         with ui.row().classes("gap-4 flex-wrap"):
             auto_fetch = ui.number("Авто-fetch, минут (0 — выключен)", value=s.auto_fetch_minutes, min=0, precision=0)
             ttl = ui.number("TTL worktree, дней", value=s.worktree_ttl_days, min=1, precision=0)

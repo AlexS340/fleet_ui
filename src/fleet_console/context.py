@@ -295,7 +295,7 @@ def build_context(home: Path | None = None) -> AppContext:
 
     def sync_gate() -> str | None:
         if host and supervisor.state(BASTION).status != "green":
-            return "ssh-сессия к бастиону не зелёная, а pypi-mirror.gitverse.ru доступен только через неё"
+            return "ssh-сессия к бастиону не зелёная, SOCKS пока недоступен"
         return None
 
     manager = RevisionManager(mirror, store, runner, paths, settings, sync_gate=sync_gate)

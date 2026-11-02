@@ -61,22 +61,50 @@ def worktree(tmp_path: Path) -> Path:
 
 def test_argv_env_and_venv(tmp_path: Path) -> None:
     assert fleet_argv(tmp_path, "--help") == ["uv", "run", "--project", str(tmp_path), "--no-sync", "fleet", "--help"]
-    assert proxy_env(None) == {} and proxy_env("socks5h://127.0.0.1:1080")["HTTPS_PROXY"] == "socks5h://127.0.0.1:1080"
+    assert all(value == "" for value in proxy_env(None).values())
+    assert proxy_env("socks5h://127.0.0.1:1080")["HTTPS_PROXY"] == "socks5h://127.0.0.1:1080"
+    assert proxy_env("socks5h://127.0.0.1:1080")["https_proxy"] == "socks5h://127.0.0.1:1080"
     assert not venv_ready(tmp_path)
     (tmp_path / ".venv" / "bin").mkdir(parents=True)
     (tmp_path / ".venv" / "bin" / "fleet").touch()
     assert venv_ready(tmp_path)
 
 
-async def test_uv_sync_uses_proxy_and_log(tmp_path: Path) -> None:
+async def test_uv_sync_prefers_direct_connection(tmp_path: Path) -> None:
     fake = FakeRunner()
     fake.on("uv", "sync", "--frozen", stdout="Resolved 1 package\nInstalled")
     lines: list[str] = []
     result = await uv_sync(fake, tmp_path, log_path=tmp_path / "sync.log", proxy="socks5h://p:1", on_line=lines.append)
-    assert result.ok and lines == ["Resolved 1 package", "Installed"]
-    argv, meta = fake.calls[0]
-    assert meta["cwd"] == tmp_path and meta["env"]["HTTPS_PROXY"] == "socks5h://p:1"
-    assert (tmp_path / "sync.log").exists()
+    assert result.ok and "Installed" in lines
+    assert len(fake.calls) == 1  # сломанный SOCKS не мешает рабочему прямому доступу
+    _argv, meta = fake.calls[0]
+    assert meta["cwd"] == tmp_path and meta["env"]["HTTPS_PROXY"] == ""
+    assert "напрямую" in (tmp_path / "sync.log").read_text()
+
+
+async def test_uv_sync_retries_network_failure_through_proxy(tmp_path: Path) -> None:
+    fake = FakeRunner()
+    fake.on("uv", "sync", result=lambda argv: Result(
+        argv, 2, "cause: error sending request for url (https://pypi-mirror.gitverse.ru/simple/hatchling/)"
+    ) if len(fake.calls) == 1 else Result(argv, 0, "Installed"))
+    lines: list[str] = []
+    result = await uv_sync(fake, tmp_path, log_path=tmp_path / "sync.log", proxy="socks5h://p:1", on_line=lines.append)
+    assert result.ok and len(fake.calls) == 2
+    assert fake.calls[0][1]["env"]["HTTPS_PROXY"] == ""
+    assert fake.calls[1][1]["env"]["HTTPS_PROXY"] == "socks5h://p:1"
+    assert "SOCKS" in "\n".join(lines) and "SOCKS" in (tmp_path / "sync.log").read_text()
+
+
+@pytest.mark.parametrize(("error", "proxy", "attempts"), [
+    ("error: No solution found when resolving dependencies", "socks5h://p:1", 1),
+    ("cause: operation timed out", None, 1),
+    ("cause: operation timed out", "socks5h://p:1", 2),
+])
+async def test_uv_sync_returns_failure(tmp_path: Path, error: str, proxy: str | None, attempts: int) -> None:
+    fake = FakeRunner()
+    fake.on("uv", "sync", result=Result(("uv", "sync"), 2, "", error))
+    result = await uv_sync(fake, tmp_path, log_path=tmp_path / "sync.log", proxy=proxy)
+    assert not result.ok and result.stderr == error and len(fake.calls) == attempts
 
 
 def test_parse_help_and_steps() -> None:

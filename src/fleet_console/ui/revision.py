@@ -16,7 +16,7 @@ PHASES = {
     "clone": "клонирую зеркало fleet",
     "fetch": "git fetch --prune",
     "worktree": "готовлю worktree",
-    "sync": "uv sync --frozen (первый раз ~30 с, нужен бастион)",
+    "sync": "uv sync --frozen (первый раз может занять несколько минут)",
     "profile": "собираю профиль ревизии: fleet --help, --print-config",
 }
 

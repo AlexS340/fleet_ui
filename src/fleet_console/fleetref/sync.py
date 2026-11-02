@@ -17,10 +17,10 @@ def venv_ready(worktree: Path) -> bool:
 
 
 def proxy_env(proxy: str | None) -> dict[str, str]:
-    """pypi-mirror.gitverse.ru доступен только через SOCKS бастиона."""
-    if not proxy:
-        return {}
-    return {"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "ALL_PROXY": proxy}
+    """Маршрут uv: явно задаём или отключаем прокси, включая унаследованные переменные."""
+    return {name: proxy or "" for name in (
+        "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy",
+    )}
 
 
 async def uv_sync(
@@ -31,11 +31,23 @@ async def uv_sync(
     proxy: str | None = None,
     on_line: LineHook | None = None,
 ) -> Result:
-    """`uv sync --frozen` в worktree; вывод — в лог и в on_line."""
-    return await runner.stream(
-        ["uv", "sync", "--frozen"],
-        cwd=worktree,
-        env=proxy_env(proxy),
-        log_path=log_path,
-        on_line=on_line,
-    )
+    """Сначала напрямую; при сетевой ошибке — одна попытка через SOCKS бастиона."""
+    for route in (None, proxy):
+        message = "uv sync: напрямую" if route is None else "Прямое подключение не удалось; повтор uv sync через SOCKS"
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(message + "\n")
+        if on_line:
+            on_line(message)
+        result = await runner.stream(
+            ["uv", "sync", "--frozen"],
+            cwd=worktree,
+            env=proxy_env(route),
+            log_path=log_path,
+            on_line=on_line,
+        )
+        network_error = any(marker in (result.stdout + result.stderr).lower() for marker in (
+            "error sending request", "operation timed out", "connection refused", "network is unreachable", "dns error",
+        ))
+        if result.ok or route is not None or not proxy or not network_error:
+            return result
+    return result
