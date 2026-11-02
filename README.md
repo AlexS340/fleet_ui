@@ -262,6 +262,24 @@ Kubeconfig остаётся с сервером `https://127.0.0.1:8443`; доб
 в S3 не проходит, preflight блокирует запуск. Основной Docker-образ должен быть заранее доступен кластеру;
 сборку и публикацию образов сервис не выполняет.
 
+Задачам с отдельным verifier или сетевой политикой может понадобиться Docker Buildx в раннере
+Harbor. В `gc-cli-harbor:v0.3.0_260910` плагина нет; для таких задач в **«Дополнительно»** задайте:
+
+```text
+system.agent_image=registry.mlrnd.ru/docker-mlrnd/sheet-taskgen/harbor-runner:buildx-20261102@sha256:6ace1a8ef0a848ef56e90d27084fbb5501bfa2cfbbd99d6f3025644d97bc87ab
+```
+
+Исходник этого раннера — `infra/harbor_runner/Dockerfile`. Это отдельный образ от
+`environment.docker_image` задачи; он добавляет Buildx к исходному раннеру Fleet.
+
+Для `network_mode = "allowlist"` остаётся несовместимость Fleet `18726c6f`: зеркало
+добавляет `extra_hosts` в контейнер, который Harbor подключает к сетевому sidecar.
+Docker отклоняет такое сочетание. Для тестовой задачи `02-030-fy2425-sales-review` с
+terminus2 на CPU проверен override `system.package_mirrors.extra_hosts=[]`: материализация
+успешна, allowlist задачи сохраняется. Это убирает привязку `raw.githubusercontent.com`
+к зеркалу только в этом прогоне; не применяйте его к задачам, которым нужна эта привязка.
+Полный GPU-прогон с этим override ещё не проверен.
+
 #### Полный конфиг
 
 Открывается из «Дополнительно» после превью. Правки живут только в каталоге этого прогона — рабочая копия fleet не
