@@ -250,7 +250,7 @@ def _layers_of(
 # --- индекс и поиск --------------------------------------------------------------------
 
 
-OVERRIDE_RE = re.compile(r"^\+?~?([A-Za-z0-9_.\[\]\-/@]+)=(.*)$")
+OVERRIDE_RE = re.compile(r"^\+{0,2}~?([A-Za-z0-9_.\[\]\-/@]+)=(.*)$")
 
 
 def override_candidates(overrides: list[str]) -> list[Candidate]:

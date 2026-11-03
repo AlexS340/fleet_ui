@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from nicegui import ui
 
+JOB_PRIORITY_OVERRIDE = "++mlsc.create_job.job.job_priority_class"
+
+
+def job_priority_select() -> ui.select:
+    return ui.select({"": "Из рецепта", "medium": "medium", "high": "high"}, value="", label="Приоритет джобы").classes("w-40")
+
 
 def hint(text: str) -> ui.icon:
     """Вопросик рядом с термином: объяснение по наведению, экран не перегружается."""

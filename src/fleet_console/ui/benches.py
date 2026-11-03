@@ -52,7 +52,7 @@ from fleet_console.presets import DatasetRef, compatibility, load_presets
 from fleet_console.runs import STAGE_TITLES, BenchError, dataset_of
 from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
 from fleet_console.store import BenchRun
-from fleet_console.ui.common import confirm_dialog, hint
+from fleet_console.ui.common import JOB_PRIORITY_OVERRIDE, confirm_dialog, hint, job_priority_select
 from fleet_console.ui.header import build_header
 from fleet_console.ui.local_datasets import local_panel
 
@@ -207,6 +207,7 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
         overlay = overlay_members()
         presets, preset_errors = load_presets(PRESETS_DIR)
         draft = Draft()
+        model_config_changed = False
 
         def label_of(group: str, member: str) -> str:
             return f"{member} (overlay)" if member in overlay.get(group, set()) else member
@@ -239,6 +240,7 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
         with ui.row().classes("w-full gap-3 flex-wrap items-end"):
             model_select = ui.select(model_options, value=next(iter(model_options), None), label="Модель", with_input=True).classes("flex-1 min-w-[18rem]")
             model_name = ui.input("served_model_name (пусто — из рецепта)").classes("flex-1 min-w-[14rem]")
+            priority = job_priority_select()
         with ui.row().classes("w-full gap-3 flex-wrap items-end"):
             agents = groups.get("harbor/agent", [])
             agent_select = ui.select({a: label_of("harbor/agent", a) for a in agents}, value=agents[0] if agents else None, label="Агент · harbor/agent", with_input=True).classes(
@@ -272,6 +274,8 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
         checks_box = ui.column().classes("w-full gap-1")
         accept = ui.checkbox("Принимаю предупреждения").mark("accept-warnings")
         accept.set_visibility(False)
+        refresh_note = ui.label("Параметры запуска изменились. Обновите превью и preflight.").classes("text-sm text-warning")
+        refresh_note.set_visibility(False)
         with ui.row().classes("gap-2 items-center"):
             preview_button = ui.button("Превью и preflight", on_click=lambda: rebuild()).props("unelevated no-caps")
             start_button = ui.button("Запустить", on_click=lambda: ask()).props("unelevated no-caps color=positive").mark("start-bench")
@@ -311,6 +315,7 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             selected_mapping = registry.get(str(dataset_select.value or ""))
             custom_row.set_visibility(is_path_dataset() and not (selected_mapping and selected_mapping.name in local_items))
             model_name.set_visibility(not is_session())
+            priority.set_visibility(bool(model_select.value) and not is_session())
             n = int(jobs.value or 1)
             if is_session():
                 s = ctx.sessions.get(model_select.value[len(SESSION_PREFIX):])
@@ -379,6 +384,9 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             if is_session():
                 session = ctx.benches.session_link(str(model_select.value)[len(SESSION_PREFIX):])
                 recipe = session.recipe
+            overrides = [line.strip() for line in (extra.value or "").splitlines() if line.strip()]
+            if not session and priority.value:
+                overrides.append(f"{JOB_PRIORITY_OVERRIDE}={priority.value}")
             preset_name = str(preset_select.value or "")
             if not draft.run_id:
                 base = preset_name or f"{session.model if session else recipe}-{dataset if isinstance(dataset, str) else dataset.benchmark}"
@@ -390,7 +398,7 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
                 agent=str(agent_select.value), dataset=dataset, jobs=int(jobs.value or 1), agents_per_replica=int(apr.value or 1),
                 task_limit=int(task_limit.value) if task_limit.value else None, profile=str(profile.value or "production"), inference=str(inference.value),
                 model_name=(model_name.value or "").strip() if not session else "", harbor_job=harbor_job,
-                extra=tuple(line.strip() for line in (extra.value or "").splitlines() if line.strip()), pod=draft.spec.pod if draft.spec else "",
+                extra=tuple(overrides), pod=draft.spec.pod if draft.spec else "",
                 session=session, preset=preset_name, sha=revision.info.sha,
                 dataset_source={"id": item.id, "source": item.source, "imported_at": item.imported_at, "s3_uri": item.s3_uri,
                                 "uploaded_at": item.uploaded_at} if item else {},
@@ -398,10 +406,13 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
 
         async def rebuild() -> None:
             """Черновик: exp.yaml → реестр → --print-config → превью и preflight."""
+            nonlocal model_config_changed
             busy.set_visibility(True)
             preview_button.disable()
+            start_button.disable()
             try:
                 spec = build_spec()
+                model_config_changed = False
                 if not spec.pod:
                     spec = BenchSpec(**{**spec.__dict__, "pod": await ctx.benches._pod()})
                 spec.write(force=not draft.manual)
@@ -469,12 +480,19 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
 
         def refresh_start() -> None:
             fails, warns = summary(draft.checks)
-            ok = draft.spec is not None and draft.resolved is not None and fails == 0 and (warns == 0 or bool(accept.value))
+            refresh_note.set_visibility(draft.preview is not None and model_config_changed)
+            ok = (preview_button.enabled and not model_config_changed and draft.spec is not None and draft.resolved is not None
+                  and fails == 0 and (warns == 0 or bool(accept.value)))
             start_button.enable() if ok else start_button.disable()
+
+        def mark_model_config_changed() -> None:
+            nonlocal model_config_changed
+            model_config_changed = True
+            refresh_start()
 
         def ask() -> None:
             spec, preview = draft.spec, draft.preview
-            if spec is None or preview is None:
+            if not start_button.enabled or spec is None or preview is None:
                 return
             gpu = preview.gpu_total
             stages = ("preflight → материализация → " + ("" if spec.session else "create_job → start_llm → check → ") + "upload → launch → исполнение"
@@ -486,6 +504,8 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
                 "стадии: " + stages,
                 f"результаты: {preview.s3}",
             ]
+            if preview.job_priority and not spec.session:
+                lines.insert(2, f"приоритет джобы {preview.job_priority}")
             if ctx.guard.supported:
                 lines.append("Прогон займёт часы: не закрывайте крышку Mac и не отключайте питание — caffeinate этого не остановит; без присмотра надёжнее сервер.")
                 if ctx.guard.battery and not ctx.guard.battery.on_ac:
@@ -512,6 +532,8 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
         dataset_select.on_value_change(lambda e: fill_from_registry(e.value))
         for element in (model_select, dataset_select, jobs, apr):
             element.on_value_change(lambda _: refresh_gpu())
+        for element in (model_select, model_name, priority, extra):
+            element.on_value_change(lambda _: mark_model_config_changed())
         accept.on_value_change(lambda _: refresh_start())
         dialog.on("hide", lambda _: discard_draft())
         fill_from_registry(dataset_select.value)

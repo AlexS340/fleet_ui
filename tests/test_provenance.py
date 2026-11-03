@@ -76,7 +76,7 @@ def test_layers_follow_hydra_order(tmp_path: Path) -> None:
 
 def test_lookup_winner_comments_and_overrides(tmp_path: Path) -> None:
     worktree, overlay, run_dir = make(tmp_path)
-    index = build_index(layers(EXP, run_dir, worktree, overlay), ["hydra.searchpath=[x]", "experiment.run_id=run-1"])
+    index = build_index(layers(EXP, run_dir, worktree, overlay), ["hydra.searchpath=[x]", "++experiment.run_id=run-1"])
 
     ns = lookup("system.namespace", index, "swe-bench")
     assert ns.winner is not None and ns.winner.path.endswith("system/cluster.yaml") and ns.winner.line == 4 and ns.certain

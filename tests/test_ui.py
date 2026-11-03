@@ -159,7 +159,8 @@ async def test_header_shows_sleep_guard(user: User) -> None:
         fakes.CTX.guard.last_sleep = None
 
 
-async def test_models_page_sessions(user: User) -> None:
+@pytest.mark.parametrize("job_priority", ["", "high"])
+async def test_models_page_sessions(user: User, job_priority: str) -> None:
     await user.open("/models")
     await user.should_see("Сессии моделей")
     user.find("Поднять модель").click()
@@ -169,15 +170,26 @@ async def test_models_page_sessions(user: User) -> None:
     user.find("Поднять модель").click()
     await user.should_see("Рецепт mlsc/model")
     await user.should_see("в рецепте: served_model_name GLM")
+    priority = _select(user, "Приоритет джобы")
+    assert priority.value == ""
+    priority.set_value(job_priority)
     user.find("Запустить подъём").click()
     await user.should_see("Занять GPU под модель?")
     await user.should_see("стадии: preflight → mlsc.create_job")
+    if job_priority == "high":
+        await user.should_see("приоритет джобы high")
     user.find("Да, поднять").click()
     await user.should_see("подъём начат")
     await asyncio.gather(*fakes.CTX.sessions.tasks.values())
     session = fakes.CTX.sessions.sessions()[0]
     assert session.status == "ready" and session.version_id == 777 and session.id.startswith("console-glm-")
-    assert [s.stage for s in fakes.CTX.sessions.stages(session.id)] == ["preflight", "create_job", "start_llm", "check"]
+    stages = fakes.CTX.sessions.stages(session.id)
+    assert [s.stage for s in stages] == ["preflight", "create_job", "start_llm", "check"]
+    for stage in stages[:2]:
+        if not job_priority:
+            assert "job_priority_class=" not in stage.command
+        else:
+            assert "++mlsc.create_job.job.job_priority_class=high" in stage.command
     assert "session:" + session.id in fakes.CTX.sleep_reasons()
     await fakes.CTX.sessions.stop(session.id)
     assert fakes.CTX.sessions.get(session.id).status == "stopped"
@@ -204,26 +216,42 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     numbers["Агентов на реплику"].set_value(2)
     numbers["Лимит задач (пусто — все)"].set_value(3)
     await user.should_see("GPU: 1 × 8 = 8 · лимит агентов 1 × 2 = 2")
+    priority = _select(user, "Приоритет джобы")
+    assert priority.value == ""
     user.find("Превью и preflight").click()
     await user.should_see("Что и где будет запущено")
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
     assert preview["GPU"] == "1 × a100plus.8gpu.80vG.96C.1456G = 8 GPU" and preview["Параллелизм"] == "лимит 2 = 1 реплик × 2 агентов"
     assert preview["Модель"].startswith("GLM · образ fleet-vllm:0.24.0 · очередь gigacode · поднимет сервис")
+    assert preview["Приоритет джобы"] == "medium"
+    (draft_dir,) = fakes.CTX.paths.runs.iterdir()
+    assert "job_priority_class=" not in (draft_dir / "overrides.txt").read_text()
     await user.should_see("Preflight: ✗ 0 · ⚠ 2")  # квота GPU и terminus-2 на Harbor 0.22
     await user.should_see("tasks → cowork (fleet)")
     start = user.find(marker="start-bench").elements.pop()
     assert not start.enabled  # предупреждения не приняты
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     assert start.enabled
+    priority.set_value("high")
+    assert not start.enabled
+    await user.should_see("Обновите превью и preflight")
+    user.find("Превью и preflight").click()
+    await user.should_not_see("Обновите превью и preflight")
+    preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
+    assert preview["Приоритет джобы"] == "high"
+    user.find(marker="accept-warnings").elements.pop().set_value(True)
     user.find(marker="start-bench").click()
     await user.should_see("Запустить прогон?")
+    await user.should_see("приоритет джобы high")
     await user.should_see("стадии: preflight → материализация → create_job → start_llm → check → upload → launch → исполнение → stop_llm → замер")
     user.find("Да, запустить").click()
     await user.should_see("начат")
     await asyncio.gather(*fakes.CTX.benches.tasks.values())
     run = fakes.CTX.benches.runs()[0]
     assert run.status == "done" and run.version_id == 777 and run.task_limit == 3 and run.agents_per_replica == 2 and run.id.startswith("glm-cowork-")
-    assert [s.stage for s in fakes.CTX.benches.stages(run.id)] == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "stop_llm", "measure"]
+    stages = fakes.CTX.benches.stages(run.id)
+    assert [s.stage for s in stages] == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "stop_llm", "measure"]
+    assert "++mlsc.create_job.job.job_priority_class=high" in stages[2].command
     assert fakes.CTX.store.get_run(run.id) is not None and run.preview["gpu_per_instance"] == 8 and run.preview["tasks_total"] is None
     exp = (fakes.CTX.paths.runs / run.id / "exp.yaml").read_text()
     assert "harbor/dataset: cowork" in exp and "task_limit: 3" in exp and (fakes.CTX.paths.runs / run.id / "resolved.yaml").exists()
@@ -259,6 +287,27 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.should_see("runner log line 2")
     user.find("Лог упавшего воркера модели").click()
     await user.should_see("MLSC: последний упавший воркер")
+
+
+async def test_bench_on_existing_session_ignores_selected_priority(user: User) -> None:
+    from fleet_console.connect.kube import KubeStatus
+    from fleet_console.store import Session
+
+    await fakes.CTX.manager.prepare("master")
+    fakes.CTX.kube_status = KubeStatus(context="internal", server="s", allowed=True, ready=True, permissions={"get nodes": True})
+    fakes.CTX.store.create_session(Session("ready-model", "glm", "ready", fakes.NOW.isoformat(), model="GLM", version_id=777))
+    await user.open("/runs")
+    user.find("Запустить бенч").click()
+    _select(user, "Приоритет джобы").set_value("high")
+    _select(user, "Модель").set_value("session:ready-model")
+    await user.should_see("модель уже поднята: сессия GLM")
+    await user.should_not_see("Приоритет джобы")
+    user.find("Превью и preflight").click()
+    await user.should_see("Что и где будет запущено")
+    (draft_dir,) = fakes.CTX.paths.runs.iterdir()
+    assert "job_priority_class=" not in (draft_dir / "overrides.txt").read_text()
+    preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
+    assert "сессия ready-model" in preview["Модель"] and "Приоритет джобы" not in preview
 
 
 async def test_benches_page_full_config_and_manual_edit(user: User) -> None:

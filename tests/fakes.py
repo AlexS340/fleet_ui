@@ -57,6 +57,7 @@ mlsc:
       image: fleet-vllm:0.24.0
       instance_type_name: a100plus.8gpu.80vG.96C.1456G
       queue_name: gigacode
+      job_priority_class: medium
 experiment:
   run_id: bench
   model_name: GLM
@@ -222,7 +223,8 @@ def fake_fleet(argv: tuple[str, ...]) -> Result:
     """`uv run … fleet`: create_job пишет version_id, materialize — tasks.json, --print-config отдаёт конфиг; остальное успешно."""
     overrides = {b.split("=", 1)[0]: b.split("=", 1)[1] for a, b in zip(argv, argv[1:]) if a == "-o" and "=" in b}
     if "--print-config" in argv:
-        return Result(argv, 0, RESOLVED)
+        priority = overrides.get("++mlsc.create_job.job.job_priority_class", "medium")
+        return Result(argv, 0, RESOLVED.replace("job_priority_class: medium", f"job_priority_class: {priority}"))
     steps = overrides.get("main.run", "[]").strip("[]").split(",")
     if steps[0] == "mlsc.create_job":
         Path(overrides["mlsc.version_id_file"]).write_text("777\n", encoding="utf-8")

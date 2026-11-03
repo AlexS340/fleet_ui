@@ -50,6 +50,7 @@ class Preview:
     s3: str = ""
     pending_dir: str = ""
     session: str = ""  # id сессии, если бенч на ней
+    job_priority: str = ""
 
     @property
     def gpu_total(self) -> int | None:
@@ -71,6 +72,7 @@ class Preview:
             ("Ревизия fleet", self.revision),
             ("Кластер", self.cluster),
             ("Модель", f"{self.model} · образ {self.model_image or '?'} · очередь {self.queue or '?'} · {model_src}"),
+            *([("Приоритет джобы", self.job_priority)] if self.job_priority and not self.session else []),
             ("GPU", f"{self.replicas} × {self.instance_type or '?'}{gpu}"),
             ("Инференс", f"{self.inference} · {self.gateway}"),
             ("Агент", f"{', '.join(self.agents) or '?'} · раннер {self.agent_image or '?'}"),
@@ -152,4 +154,5 @@ def from_resolved(
         s3=str(system.get("s3_base_directory") or ""),
         pending_dir=str(system.get("pending_dir") or ""),
         session=session,
+        job_priority=str(job.get("job_priority_class") or "") if not session else "",
     )

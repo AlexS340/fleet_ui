@@ -13,7 +13,7 @@ from fleet_console.context import AppContext
 from fleet_console.models import SessionError, sandbox
 from fleet_console.models.compose import recipe_summary
 from fleet_console.store import Session
-from fleet_console.ui.common import confirm_dialog, hint
+from fleet_console.ui.common import JOB_PRIORITY_OVERRIDE, confirm_dialog, hint, job_priority_select
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
 
 GATEWAY_OPTIONS = {"litellm": "litellm — маршрут fleet по умолчанию", "nginx": "nginx — vllm-proxy"}
@@ -119,6 +119,7 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
             replicas = ui.number("Реплики", value=1, min=1, precision=0).classes("w-28")
             ttl = ui.number("Время жизни, мин", value=ctx.settings.session_ttl_minutes, min=5, precision=0).classes("w-40")
             inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value="litellm", label="Маршрут").classes("w-32")
+            priority = job_priority_select()
         with ui.expansion("Дополнительно").classes("w-full"):
             extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение").classes("w-full").props("autogrow")
         gpu_label = ui.label().classes("text-sm")
@@ -142,12 +143,17 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
             n = int(replicas.value or 1)
             gpu = summary.get("gpu_per_instance")
             name = (model.value or "").strip() or summary.get("served_model_name", "(из рецепта)")
+            overrides = [line.strip() for line in (extra.value or "").splitlines() if line.strip()]
+            job_priority = priority.value
             lines = [
                 f"рецепт {recipe.value}, модель {name}, маршрут {inference.value}",
                 f"реплик {n}" + (f" × {gpu} GPU = {n * gpu} GPU" if gpu else ""),
                 f"время жизни {int(ttl.value or 0)} мин, затем уведомление и гашение через {ctx.settings.session_grace_minutes} мин",
                 "стадии: preflight → mlsc.create_job → mlsc.start_llm → mlsc.check_llm_works; команды видны в карточке",
             ]
+            if job_priority:
+                overrides.append(f"{JOB_PRIORITY_OVERRIDE}={job_priority}")
+                lines.insert(2, f"приоритет джобы {job_priority}")
 
             async def start() -> None:
                 session = await ctx.sessions.start(
@@ -157,7 +163,7 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
                     replicas=n,
                     inference=inference.value,
                     ttl_minutes=int(ttl.value or 0) or None,
-                    extra=tuple(line.strip() for line in (extra.value or "").splitlines() if line.strip()),
+                    extra=tuple(overrides),
                 )
                 dialog.close()
                 ui.notify(f"Сессия {session.id}: подъём начат")
