@@ -92,3 +92,17 @@ def test_growth_and_unknown_legacy_gpu_are_conservative(tmp_path):
     store.update_session("old", status="stopped")
     assert store.admit("b", Quotas())
     store.close()
+
+
+def test_crash_after_terminal_status_releases_reservation_on_next_admission(tmp_path):
+    path = tmp_path / "db"
+    store = Store(path)
+    enqueue(store, "finished")
+    enqueue(store, "waiting")
+    assert store.admit("finished", Quotas())
+    store.update_bench("finished", status="stopped")
+    store.close()  # процесс оборвался до release
+    store = Store(path)
+    assert store.admit("waiting", Quotas())
+    assert store.request("finished")["state"] == "released"
+    store.close()

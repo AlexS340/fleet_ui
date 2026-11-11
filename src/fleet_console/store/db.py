@@ -335,7 +335,7 @@ class Store:
 
     def migrate_owner(self, owner_id: str) -> None:
         with self.conn:
-            for table in ("runs", "sessions", "bench_runs", "drafts"):
+            for table in ("runs", "sessions", "bench_runs", "drafts", "requests"):
                 self.conn.execute(f"UPDATE {table} SET owner_id = ? WHERE owner_id = ?", (owner_id, LOCAL_OWNER))
 
     def reserve_draft(self, draft_id: str, owner_id: str, sha: str = "") -> None:
@@ -380,6 +380,7 @@ class Store:
         """Проверка обеих квот и резерв в одной SQLite write-транзакции, включая разные соединения."""
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
+            self._release_finished()
             request = self.request(request_id)
             if request is None or request["state"] != "queued":
                 return False
@@ -410,6 +411,18 @@ class Store:
 
     def queued(self, kind: str) -> list[str]:
         return [r["id"] for r in self.conn.execute("SELECT id FROM requests WHERE kind=? AND state='queued' ORDER BY created_at, rowid", (kind,))]
+
+    def _release_finished(self) -> None:
+        """Восстановление после сбоя между сохранением терминального статуса и release.
+
+        Вызывается внутри транзакции допуска: статус stopped уже означает подтверждённую остановку.
+        Сессия удерживает общий слот, пока её последний бенч не завершён.
+        """
+        self.conn.execute("UPDATE requests SET state='released' WHERE kind='bench' AND state='reserved'"
+                          " AND id IN (SELECT id FROM bench_runs WHERE status IN ('done','stopped','failed'))")
+        self.conn.execute("UPDATE requests SET state='released' WHERE kind='session' AND state='reserved'"
+                          " AND id IN (SELECT id FROM sessions WHERE status IN ('stopped','failed'))"
+                          " AND id NOT IN (SELECT session_id FROM requests WHERE state='reserved' AND session_id IS NOT NULL)")
 
     def release(self, request_id: str) -> None:
         with self.conn:
