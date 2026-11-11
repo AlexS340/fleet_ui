@@ -92,7 +92,7 @@ class Cluster(BaseModel):
     poll_seconds: int = 30
     mlsc_namespace: str = "vllm-proxy"
     mlsc_deployment: str = "litellm-noauth"  # под ищется по деплойменту: имя с хэшем ReplicaSet протухает
-    mlsc_base_url: str = "https://text-coordinator-proxy.mlrnd.ru/mlc/"
+    mlsc_base_url: str = "https://text-coordinator-proxy.sberai-rnd.ru/mlc/"
     nginx_configmap: str = "nginx-model-upstreams-runtime"
     nginx_key: str = "model-upstreams.conf"
     submitter_pod: str = "fleet-submitter-python"
@@ -117,6 +117,19 @@ class Auth(BaseModel):
     mode: Literal["local", "test", "shared"] = "local"
     legacy_owner: str = ""
     admins: list[str] = Field(default_factory=list)
+
+
+class Quotas(BaseModel):
+    user_runs: int = Field(default=1, ge=1)
+    total_runs: int = Field(default=2, ge=1)
+    user_gpus: int = Field(default=8, ge=1)
+    total_gpus: int = Field(default=16, ge=1)
+
+
+class Results(BaseModel):
+    # Отдельный закрытый bucket/prefix, недоступный учётным записям общего Benchboard.
+    # Права bucket настраивает оператор; Console не меняет IAM/ACL.
+    private_s3_root: str = ""
 
 
 class Settings(BaseModel):
@@ -148,6 +161,8 @@ class Settings(BaseModel):
     benchboard_url: str = "https://fleet-benchboard.sberai-rnd.ru"
     bench: Bench = Field(default_factory=Bench)
     auth: Auth = Field(default_factory=Auth)
+    quotas: Quotas = Field(default_factory=Quotas)
+    results: Results = Field(default_factory=Results)
 
     def datasets_root_path(self) -> Path | None:
         raw = self.datasets_root.strip() or os.environ.get("FLEET_DATASETS_ROOT", "").strip()
@@ -158,6 +173,9 @@ class Settings(BaseModel):
         """Прочитать settings.yaml; если файла нет — записать дефолты."""
         if paths.settings_file.exists():
             data = yaml.safe_load(paths.settings_file.read_text(encoding="utf-8")) or {}
+            cluster = data.get("cluster") or {}
+            if str(cluster.get("mlsc_base_url", "")).rstrip("/") == "https://text-coordinator-proxy.mlrnd.ru/mlc":
+                cluster["mlsc_base_url"] = Cluster().mlsc_base_url
             return cls.model_validate(data)
         settings = cls()
         settings.save(paths)

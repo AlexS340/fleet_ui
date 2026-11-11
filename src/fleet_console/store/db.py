@@ -33,7 +33,24 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS drafts (
     id TEXT PRIMARY KEY,
-    owner_id TEXT NOT NULL
+    owner_id TEXT NOT NULL,
+    sha TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS revision_choices (
+    owner_id TEXT PRIMARY KEY,
+    sha TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS requests (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('bench', 'session')),
+    owner_id TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    gpu INTEGER NOT NULL CHECK (gpu >= 0),
+    slots INTEGER NOT NULL DEFAULT 1,
+    session_id TEXT,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'reserved', 'released')),
+    created_at TEXT NOT NULL,
+    UNIQUE(owner_id, kind, request_key)
 );
 CREATE TABLE IF NOT EXISTS measurements (
     run_id TEXT PRIMARY KEY REFERENCES bench_runs(id),
@@ -128,8 +145,8 @@ CREATE TABLE IF NOT EXISTS bench_stages (
 );
 """
 
-ACTIVE_SESSION_STATUSES = ("starting", "ready", "stopping", "attention")
-ACTIVE_BENCH_STATUSES = ("running", "attention", "stopping")
+ACTIVE_SESSION_STATUSES = ("queued", "starting", "ready", "stopping", "attention")
+ACTIVE_BENCH_STATUSES = ("queued", "running", "attention", "stopping")
 
 
 def _now() -> str:
@@ -298,6 +315,8 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
         with self.conn:
+            if not any(row["name"] == "sha" for row in self.conn.execute("PRAGMA table_info(drafts)")):
+                self.conn.execute("ALTER TABLE drafts ADD COLUMN sha TEXT NOT NULL DEFAULT ''")
             for table in ("runs", "sessions", "bench_runs"):
                 if not any(row["name"] == "owner_id" for row in self.conn.execute(f"PRAGMA table_info({table})")):
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT NOT NULL DEFAULT '{LOCAL_OWNER}'")
@@ -319,9 +338,111 @@ class Store:
             for table in ("runs", "sessions", "bench_runs", "drafts"):
                 self.conn.execute(f"UPDATE {table} SET owner_id = ? WHERE owner_id = ?", (owner_id, LOCAL_OWNER))
 
-    def reserve_draft(self, draft_id: str, owner_id: str) -> None:
+    def reserve_draft(self, draft_id: str, owner_id: str, sha: str = "") -> None:
         with self.conn:
-            self.conn.execute("INSERT INTO drafts (id, owner_id) VALUES (?, ?)", (draft_id, owner_id))
+            self.conn.execute("INSERT INTO drafts (id, owner_id, sha) VALUES (?, ?, ?)", (draft_id, owner_id, sha))
+
+    def select_revision(self, owner_id: str, sha: str) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO revision_choices VALUES (?, ?) ON CONFLICT(owner_id) DO UPDATE SET sha=excluded.sha", (owner_id, sha))
+
+    def selected_revision(self, owner_id: str) -> str | None:
+        row = self.conn.execute("SELECT sha FROM revision_choices WHERE owner_id=?", (owner_id,)).fetchone()
+        return row["sha"] if row else None
+
+    def request(self, request_id: str):
+        return self.conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+
+    def request_by_key(self, owner_id: str, kind: str, key: str):
+        return self.conn.execute("SELECT * FROM requests WHERE owner_id=? AND kind=? AND request_key=?", (owner_id, kind, key)).fetchone()
+
+    def enqueue(self, obj: BenchRun | Session, gpu: int, request_key: str) -> bool:
+        """Заявка и объект фиксируются вместе, до любого внешнего действия."""
+        kind = "bench" if isinstance(obj, BenchRun) else "session"
+        table = "bench_runs" if kind == "bench" else "sessions"
+        session_id = obj.session_id if kind == "bench" else None
+        columns = [f.name for f in fields(obj)]
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO requests VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (obj.id, kind, obj.owner_id, request_key, gpu, 0 if session_id else 1, session_id, obj.created_at),
+            )
+            if not cur.rowcount:
+                return False
+            self.conn.execute(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                              [getattr(obj, c) for c in columns])
+            if kind == "bench":
+                self._adopt_run(obj.id, obj.version_id, obj.model, "запущен сервисом", obj.owner_id)
+                self.conn.execute("DELETE FROM drafts WHERE id=? AND owner_id=?", (obj.id, obj.owner_id))
+        return True
+
+    def admit(self, request_id: str, quotas) -> bool:
+        """Проверка обеих квот и резерв в одной SQLite write-транзакции, включая разные соединения."""
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            request = self.request(request_id)
+            if request is None or request["state"] != "queued":
+                return False
+            active = list(self.conn.execute("SELECT owner_id, gpu, slots FROM requests WHERE state='reserved'"))
+            # Старые активные объекты без резерва: неизвестный расход блокирует новые GPU,
+            # пока оператор не завершит их. Терминальные записи историю квот не занимают.
+            for table, statuses in (("bench_runs", ACTIVE_BENCH_STATUSES), ("sessions", ACTIVE_SESSION_STATUSES)):
+                active += list(self.conn.execute(
+                    f"SELECT owner_id, ? AS gpu, 1 AS slots FROM {table} WHERE status IN ({','.join('?' * len(statuses))})"
+                    " AND id NOT IN (SELECT id FROM requests)", (quotas.total_gpus, *statuses),
+                ))
+            if request["session_id"]:
+                session = self.get_session(request["session_id"])
+                if session is None or session.status != "ready" or session.owner_id != request["owner_id"]:
+                    return False
+                if self.conn.execute("SELECT 1 FROM requests WHERE session_id=? AND state='reserved'", (session.id,)).fetchone():
+                    return False
+            own = [r for r in active if r["owner_id"] == request["owner_id"]]
+            if (sum(r["slots"] for r in active) + request["slots"] > quotas.total_runs
+                    or sum(r["slots"] for r in own) + request["slots"] > quotas.user_runs
+                    or sum(r["gpu"] for r in active) + request["gpu"] > quotas.total_gpus
+                    or sum(r["gpu"] for r in own) + request["gpu"] > quotas.user_gpus):
+                return False
+            self.conn.execute("UPDATE requests SET state='reserved' WHERE id=?", (request_id,))
+            table, status = ("bench_runs", "running") if request["kind"] == "bench" else ("sessions", "starting")
+            self.conn.execute(f"UPDATE {table} SET status=? WHERE id=?", (status, request_id))
+            return True
+
+    def queued(self, kind: str) -> list[str]:
+        return [r["id"] for r in self.conn.execute("SELECT id FROM requests WHERE kind=? AND state='queued' ORDER BY created_at, rowid", (kind,))]
+
+    def release(self, request_id: str) -> None:
+        with self.conn:
+            request = self.request(request_id)
+            if request and request["kind"] == "session" and self.conn.execute(
+                "SELECT 1 FROM requests WHERE session_id=? AND state='reserved'", (request_id,),
+            ).fetchone():
+                return
+            self.conn.execute("UPDATE requests SET state='released' WHERE id=?", (request_id,))
+            if request and request["session_id"]:
+                session = self.get_session(request["session_id"])
+                if session and session.status == "stopped":
+                    self.conn.execute("UPDATE requests SET state='released' WHERE id=?", (session.id,))
+
+    def grow_reservation(self, request_id: str, gpu: int, quotas) -> None:
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            request = self.request(request_id)
+            if request is None:
+                return  # управление прежними усыновлёнными ресурсами
+            if request["state"] != "reserved":
+                raise ValueError("Ресурсы этой заявки не зарезервированы")
+            if gpu <= request["gpu"]:
+                return  # уменьшение освобождается только после подтверждённого гашения
+            rows = list(self.conn.execute("SELECT owner_id, gpu FROM requests WHERE state='reserved' AND id<>?", (request_id,)))
+            if (gpu + sum(r["gpu"] for r in rows) > quotas.total_gpus
+                    or gpu + sum(r["gpu"] for r in rows if r["owner_id"] == request["owner_id"]) > quotas.user_gpus):
+                raise ValueError("Для увеличения числа реплик не хватает квоты GPU")
+            self.conn.execute("UPDATE requests SET gpu=? WHERE id=?", (gpu, request_id))
+
+    def requeue_request(self, request_id: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE requests SET state='queued' WHERE id=? AND state='released'", (request_id,))
 
     def draft_owner(self, draft_id: str) -> str | None:
         row = self.conn.execute("SELECT owner_id FROM drafts WHERE id = ?", (draft_id,)).fetchone()
