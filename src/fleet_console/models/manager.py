@@ -19,9 +19,11 @@ import sys
 from fleet_console.fleetref.manager import ReadyRevision
 from fleet_console.fleetref.profile import DUMMY_ENV
 from fleet_console.models.compose import SessionSpec, make_run_id, recipe_summary, write_config
+from fleet_console.auth import Access
 from fleet_console.runner import Runner
 from fleet_console.settings import Paths, Settings, scrub
 from fleet_console.store import Session, Store
+from fleet_console.store.db import LOCAL_OWNER
 
 Clock = Callable[[], datetime]
 PodFinder = Callable[[], Awaitable[str]]
@@ -113,6 +115,7 @@ class SessionManager:
         inference: str = "litellm",
         ttl_minutes: int | None = None,
         extra: tuple[str, ...] = (),
+        access: Access | None = None,
     ) -> Session:
         groups = revision.profile.groups
         if recipe not in groups.get("mlsc/model", []):
@@ -123,6 +126,7 @@ class SessionManager:
             raise SessionError("нет MLSC_TOKEN: задайте в окружении сервиса или в secrets.env")
         agent, dataset = self.stubs(groups)
         now = self.clock()
+        pod = await self.mlsc_pod()
         base = run_id = make_run_id(model_name or recipe, now)
         suffix = 2
         while self.store.get_session(run_id) is not None:  # две сессии в одну секунду — редкость, но id должен быть уникален
@@ -131,7 +135,7 @@ class SessionManager:
         run_dir = self.paths.runs / run_id
         write_config(run_dir)
         spec = SessionSpec(
-            run_id, revision.worktree, run_dir, recipe, replicas, inference, agent, dataset, await self.mlsc_pod(), model_name, tuple(extra)
+            run_id, revision.worktree, run_dir, recipe, replicas, inference, agent, dataset, pod, model_name, tuple(extra)
         )
         ttl = ttl_minutes or self.settings.session_ttl_minutes
         # Пустое имя — served_model_name из рецепта: под ним модель видна в litellm, карточке и песочнице.
@@ -139,15 +143,15 @@ class SessionManager:
         session = Session(
             id=run_id, recipe=recipe, status="starting", created_at=_iso(now), ref=revision.ref, sha=revision.info.sha,
             worktree=str(revision.worktree), model=model, replicas=replicas, inference=inference, ttl_minutes=ttl,
-            stage="preflight", dir=str(run_dir),
+            stage="preflight", dir=str(run_dir), owner_id=access.id if access else LOCAL_OWNER,
         )
         self.store.create_session(session)
         self.store.event("session_start", run_id, "ok", f"{recipe} × {replicas}, {inference}, ttl {ttl} мин")
         self._launch(run_id, spec, "preflight")
         return session
 
-    async def stop(self, session_id: str, reason: str = "по кнопке", force: bool = False) -> Session:
-        session = self.get(session_id)
+    async def stop(self, session_id: str, reason: str = "по кнопке", force: bool = False, *, access: Access | None = None) -> Session:
+        session = access.session(session_id) if access else self.get(session_id)
         if session_id in self.paused() and not force:
             raise SessionError("на сессии идёт бенч: остановите прогон или подтвердите гашение под идущим бенчем")
         task = self.tasks.pop(session_id, None)
@@ -166,17 +170,17 @@ class SessionManager:
         self.store.event("session_stop", session_id, "ok" if ok else "error", reason)
         return self.get(session_id)
 
-    async def extend(self, session_id: str, minutes: int) -> Session:
-        session = self.get(session_id)
+    async def extend(self, session_id: str, minutes: int, *, access: Access | None = None) -> Session:
+        session = access.session(session_id) if access else self.get(session_id)
         base = max(self.clock(), _parse(session.expires_at)) if session.expires_at else self.clock()
         self.store.update_session(session_id, expires_at=_iso(base + timedelta(minutes=minutes)), warned=0)
         self.store.event("session_extend", session_id, "ok", f"+{minutes} мин")
         return self.get(session_id)
 
-    async def set_replicas(self, session_id: str, count: int) -> Session:
+    async def set_replicas(self, session_id: str, count: int, *, access: Access | None = None) -> Session:
         if count < 0:
             raise SessionError("число реплик должно быть ≥ 0")
-        session = self.get(session_id)
+        session = access.session(session_id) if access else self.get(session_id)
         if session.version_id is None:
             raise SessionError("версия MLSC ещё не создана")
         ok = await self._stage(session_id, await self.spec(session), "start_llm", jobs=count)

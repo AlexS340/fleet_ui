@@ -31,6 +31,12 @@ def _title(ref: str, sha: str) -> str:
 
 async def revision_page(ctx: AppContext) -> None:
     build_header(ctx)
+    if not ctx.access.admin:
+        with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-3"):
+            ui.label("Ревизия fleet").classes("text-xl")
+            revision = ctx.manager.current
+            ui.label(_title(revision.ref, revision.info.sha) if revision else "Ревизия ещё не подготовлена")
+        return
     state = {"ref": "", "info": ""}
 
     @ui.refreshable
@@ -105,6 +111,7 @@ async def revision_page(ctx: AppContext) -> None:
         await show_info()
 
     async def prepare() -> None:
+        ctx.access.require_admin()
         if not state["ref"]:
             ui.notify("Выберите ветку и коммит или введите SHA")
             return

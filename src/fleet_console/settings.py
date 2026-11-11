@@ -8,6 +8,7 @@ import configparser
 import os
 from pathlib import Path
 import re
+from typing import Literal
 
 from pydantic import BaseModel, Field
 import yaml
@@ -112,6 +113,12 @@ class Bench(BaseModel):
     startup_grace_seconds: int = 90  # после submitter_launch: сабмиттер стартует асинхронно, workflows появляются не сразу
 
 
+class Auth(BaseModel):
+    mode: Literal["local", "test", "shared"] = "local"
+    legacy_owner: str = ""
+    admins: list[str] = Field(default_factory=list)
+
+
 class Settings(BaseModel):
     """Настройки сервиса; файл создаётся с дефолтами при первом запуске."""
 
@@ -140,6 +147,7 @@ class Settings(BaseModel):
     # Benchboard: прогон после замера виден в каталоге по модели и run_id; прямых ссылок на прогон у него нет.
     benchboard_url: str = "https://fleet-benchboard.sberai-rnd.ru"
     bench: Bench = Field(default_factory=Bench)
+    auth: Auth = Field(default_factory=Auth)
 
     def datasets_root_path(self) -> Path | None:
         raw = self.datasets_root.strip() or os.environ.get("FLEET_DATASETS_ROOT", "").strip()

@@ -22,6 +22,7 @@ from typing import Any
 
 import yaml
 
+from fleet_console.auth import Access, AccessDenied
 from fleet_console.compose import BenchSpec, Preview, SessionLink
 from fleet_console.fleetref.profile import DUMMY_ENV
 from fleet_console.models import SessionManager
@@ -33,6 +34,7 @@ from fleet_console.presets import DatasetRef
 from fleet_console.runner import CommandError, Runner, StageFiles, attach, kill_stage
 from fleet_console.settings import Paths, Settings, scrub
 from fleet_console.store import BenchRun, Store
+from fleet_console.store.db import LOCAL_OWNER
 
 Clock = Callable[[], datetime]
 PodFinder = Callable[[], Awaitable[str]]
@@ -67,6 +69,7 @@ STAGE_TITLES = {
 BEFORE_GPU = ("preflight", "materialize")
 REQUEUED_RE = re.compile(r"Перенесено submitted → pending: (\d+)/(\d+)")
 MEASURE_RE = re.compile(r"^\s*(\S+/\S+): (\d+(?:\.\d+)?)% \((.*)\)\s*$")  # строка benchboard на лист benchmark/agent
+MEASURE_COUNTS = re.compile(r"^[\d.eE+-]+/(\d+), failed=(\d+), timeout=(\d+), no_attempt=(\d+)")
 
 
 class BenchError(RuntimeError):
@@ -173,10 +176,14 @@ class BenchManager:
         """Окружение `aws` CLI: ключи fleet и свой config с endpoint — команда повторяется в терминале как есть."""
         return aws_env(self.secrets(), self.paths.home / "aws.cfg", self.settings.s3_endpoint, self.settings.s3_region, profile=self.settings.s3_read_profile)
 
-    async def task_workflows(self, run_id: str) -> list[TaskWorkflow]:
+    async def task_workflows(self, run_id: str, *, access: Access | None = None) -> list[TaskWorkflow]:
+        if access:
+            access.run(run_id)
         return await argo.list_tasks(self.runner, self.settings.namespace, run_id)
 
-    async def task_log(self, workflow: str, container: str = "main") -> str:
+    async def task_log(self, workflow: str, container: str = "main", *, run_id: str | None = None, access: Access | None = None) -> str:
+        if access and (run_id is None or not any(task.name == workflow for task in await self.task_workflows(run_id, access=access))):
+            raise AccessDenied()
         return await argo.pod_logs(self.runner, self.settings.namespace, workflow, container)
 
     def s3_base(self, run_id: str) -> str:
@@ -185,18 +192,28 @@ class BenchManager:
             raise BenchError("в превью прогона нет пути S3: конфиг не собирался")
         return base
 
-    async def s3_objects(self, run_id: str) -> list[S3Object]:
+    async def s3_objects(self, run_id: str, *, access: Access | None = None) -> list[S3Object]:
+        if access:
+            access.run(run_id)
         return await s3.ls(self.runner, self.s3_base(run_id), self.aws_env())
 
-    async def s3_text(self, uri: str) -> str:
+    async def s3_text(self, uri: str, *, run_id: str | None = None, access: Access | None = None) -> str:
+        if access:
+            if run_id is None:
+                raise AccessDenied()
+            access.run(run_id)
+            base = self.s3_base(run_id).rstrip("/") + "/"
+            if not uri.startswith(base) or any(part in {"", ".", ".."} for part in uri[len(base):].split("/")):
+                raise AccessDenied()
         return await s3.cat(self.runner, uri, self.aws_env())
 
-    async def model_log(self, run_id: str) -> str:
+    async def model_log(self, run_id: str, *, access: Access | None = None) -> str:
         """Последний упавший воркер версии MLSC — единственный лог модели, который отдаёт API."""
-        run = self.get(run_id)
+        run = access.run(run_id) if access else self.get(run_id)
         version_id = run.version_id
-        if version_id is None and run.session_id:
-            version_id = self.sessions.get(run.session_id).version_id
+        if run.session_id:
+            session = access.session(run.session_id) if access else self.sessions.get(run.session_id)
+            version_id = session.version_id
         if version_id is None:
             raise BenchError("version_id модели неизвестен: модель ещё не создавалась")
         token = self.secrets().get("MLSC_TOKEN", "")
@@ -211,7 +228,41 @@ class BenchManager:
             text = (Path(self.get(run_id).dir) / "logs" / "measure.log").read_text(encoding="utf-8", errors="replace")
         except OSError:
             return []
-        return [line.strip() for line in text.splitlines() if MEASURE_RE.match(line)]
+        last_measure = text.rsplit("Measure-run: ", 1)[-1]
+        return [line.strip() for line in last_measure.splitlines() if MEASURE_RE.match(line)]
+
+    async def save_measurement(self, run_id: str, *, measured_at: str | None = None, read_s3: bool = True) -> None:
+        run = self.get(run_id)
+        results = []
+        for line in self.measure_summary(run_id):
+            match = MEASURE_RE.fullmatch(line)
+            leaf, score, counts = match.groups()
+            totals = MEASURE_COUNTS.match(counts)
+            if totals is None or any(part in {"", ".", ".."} for part in leaf.split("/")):
+                continue
+            planned, errors, timeouts, unattempted = map(int, totals.groups())
+            result = {"leaf": leaf, "score": float(score), "planned": planned, "infra_errors": errors,
+                      "timeouts": timeouts, "unattempted": unattempted, "succeeded": None}
+            if read_s3 and run.preview.get("s3"):
+                try:
+                    uri = f"{self.s3_base(run_id).rstrip('/')}/{leaf}/_viewer/summary.json"
+                    summary = json.loads(await self.s3_text(uri))
+                    count = summary["resolved_tasks"]
+                    if summary.get("run_id") == run_id and type(count) is int and 0 <= count <= planned:
+                        result["succeeded"] = count
+                except (CommandError, OSError, ValueError, TypeError, KeyError):
+                    pass  # старые/неполные артефакты: score и infra-ошибки остаются доступны из лога
+            results.append(result)
+        if results:
+            self.store.save_measurement(run_id, run.sha, measured_at or _iso(self.clock()), results)
+
+    async def restore_measurements(self) -> None:
+        for run in self.runs():
+            if run.status != "done" or self.store.measurement(run.id):
+                continue
+            stage = next((s for s in reversed(self.stages(run.id)) if s.stage == "measure"), None)
+            if stage and stage.returncode == 0:
+                await self.save_measurement(run.id, measured_at=stage.finished_at, read_s3=False)
 
     async def _pod(self) -> str:
         try:
@@ -248,11 +299,15 @@ class BenchManager:
         return (data if isinstance(data, dict) else None), ""
 
     # --- действия ------------------------------------------------------------
-    async def start(self, spec: BenchSpec, *, ref: str, preview: Preview) -> BenchRun:
+    async def start(self, spec: BenchSpec, *, ref: str, preview: Preview, access: Access | None = None) -> BenchRun:
         if self.store.get_bench(spec.run_id) is not None:
             raise BenchError(f"прогон {spec.run_id} уже есть")
-        if spec.session and self.sessions.get(spec.session.id).status != "ready":
-            raise BenchError("сессия модели не готова")
+        if access:
+            access.draft(spec.run_id)
+        if spec.session:
+            session = access.session(spec.session.id) if access else self.sessions.get(spec.session.id)
+            if session.status != "ready":
+                raise BenchError("сессия модели не готова")
         spec.write()
         now = self.clock()
         run = BenchRun(
@@ -262,16 +317,17 @@ class BenchManager:
             jobs=spec.effective_jobs, agents_per_replica=spec.agents_per_replica, task_limit=spec.task_limit, inference=spec.inference,
             session_id=spec.session.id if spec.session else None, stage="preflight", preview_json=preview.to_json(),
             version_id=spec.session.version_id if spec.session else None,
+            owner_id=access.id if access else LOCAL_OWNER,
         )
-        self.store.create_bench(run)
-        self.store.adopt_run(run.id, run.version_id, model=run.model, note=f"запущен сервисом · пресет {spec.preset}" if spec.preset else "запущен сервисом")
+        note = f"запущен сервисом · пресет {spec.preset}" if spec.preset else "запущен сервисом"
+        self.store.create_bench(run, own_note=note)
         self.store.event("bench_start", run.id, "ok", f"{run.model} × {spec.dataset_label} × {spec.agent}; {run.jobs} × {run.agents_per_replica}")
         self._launch(run.id, spec, 0)
         return run
 
-    async def retry(self, run_id: str) -> BenchRun:
+    async def retry(self, run_id: str, *, access: Access | None = None) -> BenchRun:
         """«Повторить стадию»: с той, на которой упали."""
-        run = self.get(run_id)
+        run = access.run(run_id) if access else self.get(run_id)
         if run.status not in {"attention", "failed", "stopped"}:
             raise BenchError("повторять можно только упавшую или остановленную стадию")
         if not run.stage:
@@ -282,9 +338,9 @@ class BenchManager:
         self._launch(run_id, spec, position(self.plan_of(run), run.stage, run.requeues))
         return self.get(run_id)
 
-    async def stop(self, run_id: str, reason: str = "по кнопке") -> BenchRun:
+    async def stop(self, run_id: str, reason: str = "по кнопке", *, access: Access | None = None) -> BenchRun:
         """Остановка: убить стадию, лимит 0 → сабмиттер → Terminate workflows → mlsc.stop_llm, если модель своя."""
-        run = self.get(run_id)
+        run = access.run(run_id) if access else self.get(run_id)
         task = self.tasks.pop(run_id, None)
         if task is not None and not task.done():
             task.cancel()
@@ -311,15 +367,17 @@ class BenchManager:
         self.store.event("bench_stop", run_id, "ok" if not failed else "error", reason + ("; " + "; ".join(failed) if failed else ""))
         return self.get(run_id)
 
-    async def measure(self, run_id: str) -> BenchRun:
+    async def measure(self, run_id: str, *, access: Access | None = None) -> BenchRun:
         """Замер по кнопке для остановленного или упавшего прогона: что долетело до S3, то и посчитается."""
-        run = self.get(run_id)
+        run = access.run(run_id) if access else self.get(run_id)
         if run.active:
             raise BenchError("прогон ещё идёт: замер будет последней стадией")
         spec = await self.spec_of(run)
         previous = run.status
         self.store.update_bench(run_id, status="running", stage="measure")
         ok = await self._stage(run_id, spec, "measure")
+        if ok:
+            await self.save_measurement(run_id)
         self.store.update_bench(run_id, status="done" if ok else previous, stage="" if ok else "measure", error="" if ok else "замер завершился с ошибкой — см. лог")
         self.store.event("bench_measure", run_id, "ok" if ok else "error")
         return self.get(run_id)
@@ -354,7 +412,7 @@ class BenchManager:
                     self._attention(run.id, "сервис перезапущен во время mlsc.create_job, version_id не записан — проверьте MLSC руками")
                     continue
                 self.store.update_bench(run.id, version_id=version_id)
-                self.store.adopt_run(run.id, version_id, model=run.model, note="запущен сервисом")
+                self.store.adopt_run(run.id, version_id, model=run.model, note="запущен сервисом", owner_id=run.owner_id)
                 self._launch(run.id, spec, position(stages, "start_llm", run.requeues))
                 continue
             self.store.event("bench_resume", run.id, "ok", f"стадия {open_stage.stage} повторяется")
@@ -429,9 +487,11 @@ class BenchManager:
                 return False
             run = self.get(run_id)
             self.store.update_bench(run_id, version_id=version_id)
-            self.store.adopt_run(run_id, version_id, model=run.model, note="запущен сервисом")
+            self.store.adopt_run(run_id, version_id, model=run.model, note="запущен сервисом", owner_id=run.owner_id)
         if ok and stage == "requeue":
             self.store.update_bench(run_id, requeues=self.get(run_id).requeues + 1)
+        if ok and stage == "measure":
+            await self.save_measurement(run_id)
         if not ok:
             self._fail(run_id, stage, spec)
         return ok

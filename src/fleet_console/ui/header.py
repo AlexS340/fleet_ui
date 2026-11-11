@@ -25,24 +25,28 @@ def build_header(ctx: AppContext) -> None:
         ok = ks.allowed and ks.ready and not ks.missing_permissions
         kube_color = "positive" if ok else ("negative" if ks.error else "grey-7")
         _chip(f"{ks.context or 'context?'} · {ctx.settings.namespace}", kube_color, lambda: _kube_dialog(ctx, holder))
-        for fwd in ctx.supervisor.forwards:
-            st = ctx.supervisor.state(fwd.name)
-            _chip(fwd.title, STATUS_COLORS[st.status], lambda name=fwd.name: _forward_dialog(ctx, name, holder))
+        if ctx.access.admin:
+            for fwd in ctx.supervisor.forwards:
+                st = ctx.supervisor.state(fwd.name)
+                _chip(fwd.title, STATUS_COLORS[st.status], lambda name=fwd.name: _forward_dialog(ctx, name, holder))
         guard = ctx.guard
-        if guard.reasons:  # чип виден только пока есть что беречь
+        if ctx.access.admin and guard.reasons:
             ok = guard.active or not guard.supported
             _chip(f"без сна · {len(guard.reasons)}", "positive" if ok else "negative", lambda: _guard_dialog(ctx, holder))
             if guard.battery and not guard.battery.on_ac:
                 _chip(f"батарея {guard.battery.percent}%", "warning", lambda: _guard_dialog(ctx, holder))
-        if guard.last_sleep is not None:
+        if ctx.access.admin and guard.last_sleep is not None:
             _chip(f"Mac спал {guard.last_sleep.minutes} мин", "warning", lambda: _sleep_dialog(ctx, holder, status_row.refresh))
         ui.link(_cluster_text(ctx), "/cluster").classes("text-white")
         ui.link("Модели", "/models").classes("text-white")
         ui.link(_benches_text(ctx), "/runs").classes("text-white")
+        ui.link("Мои замеры", "/measurements").classes("text-white")
         ui.label(_fetch_text(ctx)).classes("text-sm text-white opacity-80 hidden sm:inline")  # на узком экране шапка в 2 строки
-        ui.button("Актуализировать", on_click=fetch).props("flat dense no-caps").classes("text-white")
+        if ctx.access.admin:
+            ui.button("Актуализировать", on_click=fetch).props("flat dense no-caps").classes("text-white")
 
     async def fetch() -> None:
+        ctx.access.require_admin()
         await _fetch(ctx)
         status_row.refresh()
 
@@ -50,7 +54,10 @@ def build_header(ctx: AppContext) -> None:
         ui.link("Fleet Console", "/").classes("text-lg text-white no-underline mr-2")
         status_row()
         ui.space()
-        ui.link("Настройки", "/settings").classes("text-white")
+        if ctx.access.admin:
+            ui.link("Настройки", "/settings").classes("text-white")
+        if ctx.settings.auth.mode != "local":
+            ui.label(ctx.access.identity.name or ctx.access.id).classes("text-sm text-white")
     ui.timer(2.0, status_row.refresh)
 
 
@@ -59,7 +66,7 @@ def _chip(text: str, color: str, on_click) -> None:
 
 
 def _benches_text(ctx: AppContext) -> str:
-    active = ctx.benches.runs(active_only=True) if ctx.benches is not None else []
+    active = [r for r in ctx.benches.runs(active_only=True) if ctx.access.allows(r)] if ctx.benches is not None else []
     attention = sum(1 for r in active if r.status == "attention")
     text = "Прогоны" + (f" · идёт {len(active)}" if active else "")
     return text + (f" · ⚠ {attention}" if attention else "")

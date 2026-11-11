@@ -5,13 +5,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 
 from nicegui import ui
 
+from fleet_console.auth import AccessDenied
 from fleet_console.connect.gateway import Gateway, list_models, snippets
 from fleet_console.context import AppContext
 from fleet_console.models import SessionError, sandbox
 from fleet_console.models.compose import recipe_summary
+from fleet_console.settings import scrub
 from fleet_console.store import Session
 from fleet_console.ui.common import JOB_PRIORITY_OVERRIDE, confirm_dialog, hint, job_priority_select
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
@@ -35,14 +38,15 @@ STATUS_TEXT = {
 }
 
 
-async def models_page(ctx: AppContext) -> None:
+async def models_page(ctx: AppContext, session_id: str | None = None) -> None:
     build_header(ctx)
     state: dict = {"gateway": None, "models": [], "on_models": None}
     with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-4"):
         ui.label("Модели").classes("text-xl")
-        _sessions_card(ctx)
-        _gateway_card(ctx, state)
-        _sandbox_card(ctx, state)
+        _sessions_card(ctx, session_id)
+        if ctx.access.admin:
+            _gateway_card(ctx, state)
+            _sandbox_card(ctx, state)
 
 
 # --- сессии моделей ------------------------------------------------------
@@ -62,7 +66,7 @@ def _when_iso(text: str | None) -> str:
     return datetime.fromisoformat(text).astimezone().strftime("%d.%m %H:%M") if text else "—"
 
 
-def _sessions_card(ctx: AppContext) -> None:
+def _sessions_card(ctx: AppContext, session_id: str | None) -> None:
     """Главное действие страницы — поднять модель; таблица сессий и карточка по клику."""
     with ui.card().classes("w-full"):
         with ui.row().classes("w-full items-center gap-3"):
@@ -75,12 +79,12 @@ def _sessions_card(ctx: AppContext) -> None:
         empty = ui.label("Сессий нет. «Поднять модель» создаёт версию в MLSC шагами fleet и гасит её по таймеру.").classes(
             "text-sm opacity-70"
         )
-        ui.label("клик по строке — карточка сессии: стадии и их команды, логи, продление, реплики, гашение").classes("text-xs opacity-60")
+        ui.label("клик по строке — стадии, логи и управление сессией").classes("text-xs opacity-60")
 
     def render() -> None:
         versions = {v.version_id: v for v in ctx.observer.mlsc.data or []}
         rows = []
-        for s in ctx.sessions.sessions()[:20]:
+        for s in [item for item in ctx.sessions.sessions() if ctx.access.allows(item)][:20]:
             v = versions.get(s.version_id) if s.version_id is not None else None
             rows.append(
                 {
@@ -98,6 +102,8 @@ def _sessions_card(ctx: AppContext) -> None:
 
     render()
     ui.timer(3.0, render)
+    if session_id:
+        _session_dialog(ctx, session_id, render)
 
 
 def _new_session_dialog(ctx: AppContext, after) -> None:
@@ -120,14 +126,14 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
             ttl = ui.number("Время жизни, мин", value=ctx.settings.session_ttl_minutes, min=5, precision=0).classes("w-40")
             inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value="litellm", label="Маршрут").classes("w-32")
             priority = job_priority_select()
-        with ui.expansion("Дополнительно").classes("w-full"):
+        with ui.expansion("Дополнительно").classes("w-full").set_visibility(ctx.access.admin):
             extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение").classes("w-full").props("autogrow")
         gpu_label = ui.label().classes("text-sm")
         summary: dict = {}
 
         def refresh_recipe() -> None:
             summary.clear()
-            summary.update(recipe_summary(revision.worktree, recipe.value) if recipe.value else {})
+            summary.update(recipe_summary(revision.worktree, recipe.value) if recipe.value in recipes else {})
             info.set_text(
                 f"в рецепте: served_model_name {summary.get('served_model_name', '?')}, инстанс {summary.get('instance_type_name', '?')}"
             )
@@ -143,7 +149,12 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
             n = int(replicas.value or 1)
             gpu = summary.get("gpu_per_instance")
             name = (model.value or "").strip() or summary.get("served_model_name", "(из рецепта)")
-            overrides = [line.strip() for line in (extra.value or "").splitlines() if line.strip()]
+            if not ctx.access.admin and (
+                not re.fullmatch(r"[A-Za-z0-9_.-]*", (model.value or "").strip()) or inference.value not in {"litellm", "nginx"}
+            ):
+                ui.notify("Проверьте имя модели и маршрут", type="negative")
+                return
+            overrides = [line.strip() for line in (extra.value or "").splitlines() if line.strip()] if ctx.access.admin else []
             job_priority = priority.value
             lines = [
                 f"рецепт {recipe.value}, модель {name}, маршрут {inference.value}",
@@ -151,19 +162,25 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
                 f"время жизни {int(ttl.value or 0)} мин, затем уведомление и гашение через {ctx.settings.session_grace_minutes} мин",
                 "стадии: preflight → mlsc.create_job → mlsc.start_llm → mlsc.check_llm_works; команды видны в карточке",
             ]
-            if job_priority:
+            if job_priority in {"medium", "high"}:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={job_priority}")
                 lines.insert(2, f"приоритет джобы {job_priority}")
+
+            selected_recipe = recipe.value
+            selected_name = (model.value or "").strip()
+            selected_inference = inference.value
+            selected_ttl = int(ttl.value or 0) or None
 
             async def start() -> None:
                 session = await ctx.sessions.start(
                     revision,
-                    recipe=recipe.value,
-                    model_name=(model.value or "").strip(),
+                    recipe=selected_recipe,
+                    model_name=selected_name,
                     replicas=n,
-                    inference=inference.value,
-                    ttl_minutes=int(ttl.value or 0) or None,
+                    inference=selected_inference,
+                    ttl_minutes=selected_ttl,
                     extra=tuple(overrides),
+                    access=ctx.access,
                 )
                 dialog.close()
                 ui.notify(f"Сессия {session.id}: подъём начат")
@@ -177,9 +194,15 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
 
 
 def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
-    s = ctx.sessions.get(session_id)
+    try:
+        s = ctx.access.session(session_id)
+    except AccessDenied as exc:
+        ui.notify(str(exc), type="negative")
+        return
     versions = {v.version_id: v for v in ctx.observer.mlsc.data or []}
-    v = versions.get(s.version_id) if s.version_id is not None else None
+    secrets = ctx.benches.secrets().values()
+    version_id = s.version_id
+    v = versions.get(version_id) if version_id is not None else None
 
     def refresh() -> None:
         dialog.close()
@@ -189,7 +212,7 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
     async def do(coro) -> None:
         try:
             await coro
-        except SessionError as exc:
+        except (AccessDenied, SessionError) as exc:
             ui.notify(str(exc), type="negative", multi_line=True)
             return
         refresh()
@@ -209,12 +232,12 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
         ]
         ui.label(" · ".join(facts)).classes("text-sm")
         if s.error:
-            ui.label(s.error).classes("text-negative text-sm whitespace-pre-wrap")
+            ui.label(scrub(s.error, secrets)).classes("text-negative text-sm whitespace-pre-wrap")
         ui.label(f"каталог: {s.dir}").classes("text-xs opacity-60 break-all")
         if s.active:
             with ui.row().classes("items-end gap-2 flex-wrap"):
                 if s.status in ("ready", "attention"):
-                    ui.button("Продлить +60 мин", on_click=lambda: do(ctx.sessions.extend(s.id, 60))).props("flat no-caps")
+                    ui.button("Продлить +60 мин", on_click=lambda: do(ctx.sessions.extend(s.id, 60, access=ctx.access))).props("flat no-caps")
                     replicas = ui.number("Реплики", value=s.replicas, min=0, precision=0).classes("w-28")
 
                     def ask_replicas() -> None:
@@ -222,7 +245,7 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
                         confirm_dialog(
                             f"Сессии выставить {n} реплик",
                             [f"сейчас {s.replicas}; mlsc.start_llm с experiment.jobs={n}", "0 — то же, что погасить"],
-                            lambda: ctx.sessions.set_replicas(s.id, n),
+                            lambda: ctx.sessions.set_replicas(s.id, n, access=ctx.access),
                             refresh,
                         )
 
@@ -235,7 +258,7 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
                 )
                 ui.button(
                     label,
-                    on_click=lambda: confirm_dialog(f"{label}: {s.id}", [detail], lambda: ctx.sessions.stop(s.id), refresh, button=label),
+                    on_click=lambda: confirm_dialog(f"{label}: {s.id}", [detail], lambda: ctx.sessions.stop(s.id, access=ctx.access), refresh, button=label),
                 ).props("flat no-caps color=negative")
         ui.label("Стадии").classes("mt-2")
         stages = ctx.sessions.stages(s.id)
@@ -244,21 +267,22 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
         for st in stages:
             result = "идёт" if st.returncode is None else f"код {st.returncode}"
             with ui.expansion(f"{st.stage} · {result} · {_when_iso(st.started_at)}").classes("w-full"):
-                ui.code(st.command, language="bash").classes("w-full")
+                ui.code(scrub(st.command, secrets), language="bash").classes("w-full")
                 if st.log_path:
-                    ui.button("Хвост лога", on_click=lambda p=st.log_path: _log_tail_dialog(p)).props("flat dense no-caps")
+                    ui.button("Хвост лога", on_click=lambda p=st.log_path: _log_tail_dialog(ctx, s.id, p)).props("flat dense no-caps")
         ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
     dialog.open()
 
 
-def _log_tail_dialog(path: str, lines: int = 80) -> None:
+def _log_tail_dialog(ctx: AppContext, session_id: str, path: str, lines: int = 80) -> None:
+    ctx.access.session(session_id)
     try:
         text = "\n".join(Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]) or "(пусто)"
     except OSError as exc:
         text = f"лог не прочитать: {exc}"
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
         ui.label(path).classes("text-xs opacity-60 break-all")
-        ui.label(text).classes("font-mono text-xs whitespace-pre-wrap w-full")
+        ui.label(scrub(text, ctx.benches.secrets().values())).classes("font-mono text-xs whitespace-pre-wrap w-full")
         ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
     dialog.open()
 

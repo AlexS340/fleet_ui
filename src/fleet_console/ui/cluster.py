@@ -10,10 +10,12 @@ from datetime import datetime, timezone
 
 from nicegui import ui
 
+from fleet_console.auth import AccessDenied
 from fleet_console.context import AppContext
 from fleet_console.observe import Source
 from fleet_console.observe.argo import argo_ui_url
 from fleet_console.observe.submitter import ROOT
+from fleet_console.settings import scrub
 from fleet_console.ui.common import confirm_dialog, hint
 from fleet_console.ui.header import build_header
 
@@ -86,7 +88,7 @@ class _Card:
 
     def __init__(self, source: Source, columns: list[dict] | None = None, row_key: str = "id") -> None:
         self.source = source
-        with ui.card().classes("w-full"):
+        with ui.card().classes("w-full") as self.container:
             with ui.row().classes("w-full items-baseline gap-2"):
                 ui.label(source.title).classes("text-lg")
                 if source.title in HINTS:
@@ -146,13 +148,16 @@ async def cluster_page(ctx: AppContext) -> None:
         sub.table.on("rowClick", lambda e: _log_dialog(ctx, e.args[1]["run"]))
         nodes = _Card(obs.nodes)
     cards = (runs, mlsc, route, sub, nodes)
+    if not ctx.access.admin:
+        route.container.set_visibility(False)
 
     def render() -> None:
         state["version"] = obs.version
         _render_runs(runs, ctx, state["only_active"])
         _render_mlsc(mlsc, ctx)
-        _render_nginx(route)
-        _render_submitter(sub, state["only_active"])
+        if ctx.access.admin:
+            _render_nginx(route)
+        _render_submitter(sub, ctx, state["only_active"])
         _render_nodes(nodes)
 
     def tick() -> None:
@@ -170,10 +175,10 @@ def _render_runs(card: _Card, ctx: AppContext, only_active: bool) -> None:
     if card.source.data is None:
         card.render()
         return
-    all_runs = card.source.data
+    own = {key: item for key, item in ctx.store.own_runs().items() if ctx.access.allows(item)}
+    all_runs = [r for r in card.source.data if ctx.access.admin or r.run_name in own]
     shown = [r for r in all_runs if r.active] if only_active else all_runs
     base = ctx.settings.argo_ui_url.rstrip("/")
-    own = ctx.store.own_runs()
     rows = [
         {
             "run": r.run_name,
@@ -207,7 +212,7 @@ def _render_runs(card: _Card, ctx: AppContext, only_active: bool) -> None:
         if o.run_id not in seen
     ]
     summary = "" if rows else f"активных прогонов нет (всего {len(all_runs)})"
-    note = "клик по строке — усыновить чужой прогон или забыть свой"
+    note = "клик по строке — усыновить чужой прогон или забыть свой" if ctx.access.admin else "клик по строке — управление прогоном"
     if len(shown) < len(all_runs):
         note += f" · скрыто завершённых прогонов: {len(all_runs) - len(shown)}"
     card.render(rows, summary, note)
@@ -217,8 +222,8 @@ def _render_mlsc(card: _Card, ctx: AppContext) -> None:
     if card.source.data is None:
         card.render()
         return
-    versions = card.source.data
-    own = ctx.store.own_runs().values()
+    own = [o for o in ctx.store.own_runs().values() if ctx.access.allows(o)]
+    versions = [v for v in card.source.data if ctx.access.admin or any(o.version_id == v.version_id for o in own)]
     rows = [
         {
             "id": v.version_id,
@@ -243,11 +248,12 @@ def _render_nginx(card: _Card) -> None:
     card.render(rows, "" if rows else "в маршруте нет ни одной модели")
 
 
-def _render_submitter(card: _Card, only_active: bool) -> None:
+def _render_submitter(card: _Card, ctx: AppContext, only_active: bool) -> None:
     if card.source.data is None:
         card.render()
         return
-    all_runs = card.source.data
+    own = {key for key, item in ctx.store.own_runs().items() if ctx.access.allows(item)}
+    all_runs = [r for r in card.source.data if ctx.access.admin or r.run_id in own]
     shown = [r for r in all_runs if r.alive] if only_active else all_runs  # на поде сотни каталогов старых прогонов
     rows = [
         {
@@ -286,6 +292,11 @@ def _run_dialog(ctx: AppContext, row: dict, on_change) -> None:  # noqa: ANN001 
     """Чужой прогон — усыновить (run_id, version_id MLSC, заметка); свой — забыть."""
     run_id = row["run"]
     own = ctx.store.get_run(run_id)
+    observed = next((r for r in ctx.observer.runs.data or [] if r.run_name == run_id), None)
+    if not ctx.access.allows(own) and not (ctx.access.admin and observed):
+        ui.notify("Объект недоступен", type="negative")
+        return
+    row = {"running": observed.running if observed else 0, "pending": observed.pending if observed else 0}
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
         ui.label(run_id).classes("text-lg break-all")
         if own:
@@ -298,8 +309,11 @@ def _run_dialog(ctx: AppContext, row: dict, on_change) -> None:  # noqa: ANN001 
             note = ui.input("Заметка").classes("w-full")
 
             def adopt() -> None:
+                ctx.access.require_admin()
+                if ctx.store.get_run(run_id) or ctx.store.get_bench(run_id):
+                    raise AccessDenied()
                 version_id = int(version.value) if version.value else None
-                ctx.store.adopt_run(run_id, version_id, model=row.get("model", ""), note=note.value.strip())
+                ctx.store.adopt_run(run_id, version_id, model=observed.model or "", note=note.value.strip(), owner_id=ctx.access.id)
                 ctx.store.event("adopt_run", run_id, "ok", f"version_id={version_id}")
                 dialog.close()
                 on_change()
@@ -312,7 +326,11 @@ def _run_dialog(ctx: AppContext, row: dict, on_change) -> None:  # noqa: ANN001 
 def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change) -> None:
     """Свой прогон: лимит агентов, реплики модели, остановка, «забыть». Всё разрушительное — через подтверждение."""
     run_id = own.run_id
-    version = next((v for v in ctx.observer.mlsc.data or [] if own.owns_version(v.version_id, v.application)), None)
+    bench = ctx.store.get_bench(run_id)
+    shared = ctx.settings.auth.mode != "local"
+    version = next((v for v in ctx.observer.mlsc.data or [] if (
+        (not bench or bench.own_model) and v.version_id == own.version_id if shared else own.owns_version(v.version_id, v.application)
+    )), None)
     sub = next((s for s in ctx.observer.submitter.data or [] if s.run_id == run_id), None)
     adopted = _when(datetime.fromisoformat(own.adopted_at))
     facts = ["свой", f"усыновлён {adopted}", f"задач идёт {row.get('running', 0)}, в очереди {row.get('pending', 0)}"]
@@ -326,7 +344,7 @@ def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change)
             _confirm(
                 f"Записать лимит агентов {n} для {run_id}",
                 [f"файл {ROOT}/{run_id}/agents_limit на поде {ctx.settings.cluster.submitter_pod}", "0 — пауза: сабмиттер перестаёт слать задачи"],
-                lambda: ctx.set_agent_limit(run_id, n),
+                lambda: _owned_limit(ctx, run_id, n),
                 on_change,
             )
 
@@ -348,7 +366,7 @@ def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change)
                 _confirm(
                     f"Версии {version.version_id} выставить {n} инстансов",
                     [f"сейчас план {version.planned}, факт {version.current}", f"{gpu} GPU на инстанс → {n * gpu} GPU", "0 — погасить модель"],
-                    lambda: ctx.set_replicas(version.version_id, n),
+                    lambda: _owned_replicas(ctx, run_id, version.version_id, n),
                     on_change,
                 )
 
@@ -361,6 +379,8 @@ def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change)
         ui.label(f"живой версии MLSC у прогона не видно ({hint})").classes("text-xs opacity-70")
 
     def forget() -> None:
+        ctx.access.require_admin()
+        ctx.access.require(ctx.store.get_run(run_id))
         ctx.store.forget_run(run_id)
         ctx.store.event("forget_run", run_id, "ok")
         dialog.close()
@@ -369,10 +389,23 @@ def _own_controls(ctx: AppContext, dialog: ui.dialog, own, row: dict, on_change)
 
     with ui.row().classes("gap-2 mt-2"):
         ui.button("Остановить прогон", on_click=lambda: _stop_dialog(ctx, run_id, row, version, on_change)).props("flat no-caps color=negative")
-        ui.button("Забыть", on_click=forget).props("flat no-caps")
+        if ctx.access.admin and (not shared or not bench):
+            ui.button("Забыть", on_click=forget).props("flat no-caps")
 
 
 _confirm = confirm_dialog
+
+
+async def _owned_limit(ctx: AppContext, run_id: str, count: int):
+    ctx.access.require(ctx.store.get_run(run_id))
+    return await ctx.set_agent_limit(run_id, count)
+
+
+async def _owned_replicas(ctx: AppContext, run_id: str, version_id: int, count: int):
+    own = ctx.access.require(ctx.store.get_run(run_id))
+    if ctx.settings.auth.mode != "local" and own.version_id != version_id:
+        raise AccessDenied()
+    return await ctx.set_replicas(version_id, count)
 
 
 def _stop_dialog(ctx: AppContext, run_id: str, row: dict, version, on_change) -> None:
@@ -393,7 +426,13 @@ def _stop_dialog(ctx: AppContext, run_id: str, row: dict, version, on_change) ->
         log = ui.label().classes("text-sm whitespace-pre-wrap font-mono")
 
         async def run() -> None:
+            ctx.access.require(ctx.store.get_run(run_id))
             log.set_text("останавливаю…")
+            if ctx.settings.auth.mode != "local" and ctx.store.get_bench(run_id):
+                bench = await ctx.benches.stop(run_id, access=ctx.access)
+                log.set_text(bench.error or "Прогон остановлен")
+                on_change()
+                return
             version_id = version.version_id if version and stop_model and stop_model.value else None
             report = await ctx.stop_own_run(run_id, version_id)
             lines = ["✓ " + s for s in report.steps] + ["✗ " + f for f in report.failed]
@@ -408,12 +447,18 @@ def _stop_dialog(ctx: AppContext, run_id: str, row: dict, version, on_change) ->
 
 
 async def _log_dialog(ctx: AppContext, run_id: str) -> None:
+    if not ctx.access.admin and not ctx.access.allows(ctx.store.get_run(run_id)):
+        ui.notify("Объект недоступен", type="negative")
+        return
+    if not any(item.run_id == run_id for item in ctx.observer.submitter.data or []):
+        return
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
         ui.label(f"run_logs.txt · {run_id}").classes("text-lg")
         log = ui.label("читаю…").classes("font-mono text-xs whitespace-pre-wrap w-full")
     dialog.open()
     try:
-        log.set_text(await ctx.observer.submitter_log(run_id) or "(пусто)")
+        text = await ctx.observer.submitter_log(run_id)
+        log.set_text(scrub(text, ctx.benches.secrets().values()) or "(пусто)")
     except Exception as exc:  # noqa: BLE001 — ошибку kubectl показываем в диалоге
         log.set_text(str(exc))
         log.classes("text-negative")

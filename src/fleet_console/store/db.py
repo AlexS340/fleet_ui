@@ -9,6 +9,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+LOCAL_OWNER = "@local"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,6 +26,26 @@ CREATE TABLE IF NOT EXISTS revisions (
     profile_json TEXT NOT NULL,
     synced_at TEXT NOT NULL,
     last_used_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin'))
+);
+CREATE TABLE IF NOT EXISTS drafts (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS measurements (
+    run_id TEXT PRIMARY KEY REFERENCES bench_runs(id),
+    sha TEXT NOT NULL,
+    measured_at TEXT NOT NULL,
+    results_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS measurement_links (
+    digest TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES measurements(run_id),
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
@@ -142,6 +164,7 @@ class OwnRun:
     model: str
     note: str
     adopted_at: str
+    owner_id: str = LOCAL_OWNER
 
     def owns_version(self, version_id: int, application: str) -> bool:
         """Версия MLSC этого прогона: по version_id или по run_id в имени приложения (шаблон job_base.yaml fleet)."""
@@ -171,6 +194,7 @@ class Session:
     expires_at: str | None = None
     stopped_at: str | None = None
     warned: int = 0
+    owner_id: str = LOCAL_OWNER
 
     @property
     def active(self) -> bool:
@@ -226,6 +250,7 @@ class BenchRun:
     started_at: str | None = None
     attention_at: str | None = None
     finished_at: str | None = None
+    owner_id: str = LOCAL_OWNER
 
     @property
     def active(self) -> bool:
@@ -270,7 +295,80 @@ class Store:
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        with self.conn:
+            for table in ("runs", "sessions", "bench_runs"):
+                if not any(row["name"] == "owner_id" for row in self.conn.execute(f"PRAGMA table_info({table})")):
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT NOT NULL DEFAULT '{LOCAL_OWNER}'")
+
+    def register_user(self, user_id: str, admin: bool = False) -> None:
+        if not admin and self.conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            return
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
+            if admin:
+                self.conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", (user_id,))
+
+    def is_admin(self, user_id: str) -> bool:
+        row = self.conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+        return row is not None and row["role"] == "admin"
+
+    def migrate_owner(self, owner_id: str) -> None:
+        with self.conn:
+            for table in ("runs", "sessions", "bench_runs", "drafts"):
+                self.conn.execute(f"UPDATE {table} SET owner_id = ? WHERE owner_id = ?", (owner_id, LOCAL_OWNER))
+
+    def reserve_draft(self, draft_id: str, owner_id: str) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO drafts (id, owner_id) VALUES (?, ?)", (draft_id, owner_id))
+
+    def draft_owner(self, draft_id: str) -> str | None:
+        row = self.conn.execute("SELECT owner_id FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+        return row["owner_id"] if row else None
+
+    def delete_draft(self, draft_id: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
+
+    def save_measurement(self, run_id: str, sha: str, measured_at: str, results: list[dict]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO measurements VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET"
+                " sha=excluded.sha, measured_at=excluded.measured_at, results_json=excluded.results_json",
+                (run_id, sha, measured_at, json.dumps(results, ensure_ascii=False)),
+            )
+
+    def measurements(self, owner_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT m.* FROM measurements m JOIN bench_runs b ON b.id=m.run_id"
+            " WHERE b.owner_id=? ORDER BY m.measured_at DESC", (owner_id,),
+        ).fetchall()
+
+    def measurement(self, run_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM measurements WHERE run_id=?", (run_id,)).fetchone()
+
+    def add_measurement_link(self, digest: str, run_id: str, expires_at: str) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO measurement_links (digest, run_id, expires_at) VALUES (?, ?, ?)", (digest, run_id, expires_at))
+
+    def measurement_links(self, run_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT digest, expires_at, revoked_at FROM measurement_links WHERE run_id=? ORDER BY expires_at DESC", (run_id,),
+        ).fetchall()
+
+    def revoke_measurement_link(self, run_id: str, digest: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE measurement_links SET revoked_at=? WHERE run_id=? AND digest=? AND revoked_at IS NULL",
+                (_now(), run_id, digest),
+            )
+
+    def shared_measurement(self, digest: str, now: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT m.* FROM measurements m JOIN measurement_links l ON l.run_id=m.run_id"
+            " WHERE l.digest=? AND l.expires_at>? AND l.revoked_at IS NULL", (digest, now),
+        ).fetchone()
 
     def close(self) -> None:
         self.conn.close()
@@ -315,13 +413,18 @@ class Store:
         return [self._revision(r) for r in rows]
 
     # --- свои прогоны ----------------------------------------------------
-    def adopt_run(self, run_id: str, version_id: int | None = None, model: str = "", note: str = "") -> None:
+    def adopt_run(self, run_id: str, version_id: int | None = None, model: str = "", note: str = "", *, owner_id: str = LOCAL_OWNER) -> None:
         with self.conn:
-            self.conn.execute(
-                "INSERT INTO runs (run_id, version_id, model, note, adopted_at) VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT(run_id) DO UPDATE SET version_id=excluded.version_id, model=excluded.model, note=excluded.note",
-                (run_id, version_id, model, note, _now()),
-            )
+            self._adopt_run(run_id, version_id, model, note, owner_id)
+
+    def _adopt_run(self, run_id: str, version_id: int | None, model: str, note: str, owner_id: str) -> None:
+        result = self.conn.execute(
+            "INSERT INTO runs (run_id, version_id, model, note, adopted_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(run_id) DO UPDATE SET version_id=excluded.version_id, model=excluded.model, note=excluded.note"
+            " WHERE runs.owner_id=excluded.owner_id", (run_id, version_id, model, note, _now(), owner_id),
+        )
+        if result.rowcount == 0:
+            raise ValueError("Прогон уже зарегистрирован за другим владельцем")
 
     def get_run(self, run_id: str) -> OwnRun | None:
         row = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -379,13 +482,16 @@ class Store:
         return [Stage(**dict(r)) for r in rows]
 
     # --- бенч-прогоны ----------------------------------------------------
-    def create_bench(self, run: BenchRun) -> None:
+    def create_bench(self, run: BenchRun, *, own_note: str | None = None) -> None:
         cols = [f.name for f in fields(BenchRun)]
         with self.conn:
             self.conn.execute(
                 f"INSERT INTO bench_runs ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
                 [getattr(run, c) for c in cols],
             )
+            if own_note is not None:
+                self._adopt_run(run.id, run.version_id, run.model, own_note, run.owner_id)
+                self.conn.execute("DELETE FROM drafts WHERE id = ? AND owner_id = ?", (run.id, run.owner_id))
 
     def update_bench(self, run_id: str, **values: Any) -> None:
         if not values:

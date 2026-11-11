@@ -77,8 +77,9 @@ def parse_ls(text: str, prefix: str) -> list[S3Object]:
         if not m:
             continue
         key = m.group(3)
-        if prefix and key.startswith(prefix):
-            key = key[len(prefix) :]
+        if not key.startswith(prefix):
+            continue
+        key = key[len(prefix) :]
         key = key.lstrip("/")
         if key:
             out.append(S3Object(key, int(m.group(2)), m.group(1)))

@@ -11,7 +11,9 @@ from pathlib import Path
 import shlex
 
 import httpx
+from nicegui import ui
 
+from fleet_console.auth import IDENTITY, Access, AccessDenied, Identity
 from fleet_console.catalog import CatalogEntry, scan
 from fleet_console.connect.gateway import Gateway, free_port, parse_target, probe
 from fleet_console.connect.kube import Kube, KubeStatus, required_checks
@@ -29,6 +31,7 @@ from fleet_console.runner import CommandError, Runner, SubprocessRunner
 from fleet_console.runs import BenchManager
 from fleet_console.settings import OVERLAY_DIR, SECRET_NAMES, Paths, Settings, aws_secret_names, default_home, read_secret, secrets_env
 from fleet_console.store import Store
+from fleet_console.store.db import LOCAL_OWNER
 
 BASTION = "bastion"
 KUBE_POLL_SEC = 30.0
@@ -59,6 +62,25 @@ class AppContext:
 
     def catalog(self, worktree: Path) -> list[CatalogEntry]:
         return scan(worktree)
+
+    @property
+    def access(self) -> Access:
+        if self.settings.auth.mode == "local":
+            return Access(self.store, Identity(LOCAL_OWNER))
+        identity = ui.context.client.request.scope.get(IDENTITY)
+        if identity is None:
+            raise AccessDenied()
+        return Access(self.store, identity)
+
+    def user_datasets(self):
+        return [dataset for dataset in self.local_datasets.all() if self.access.allows(dataset)]
+
+    def user_dataset(self, dataset_id: str):
+        try:
+            dataset = self.local_datasets.get(dataset_id)
+        except (OSError, ValueError):
+            raise AccessDenied() from None
+        return self.access.require(dataset)
 
     @cached_property
     def local_datasets(self) -> LocalDatasets:
@@ -178,6 +200,7 @@ class AppContext:
     async def _benches_loop(self) -> None:
         try:
             await self.benches.resume()
+            await self.benches.restore_measurements()
         except Exception as exc:  # noqa: BLE001 — сбой возобновления одного прогона не должен ронять цикл
             self.store.event("bench_resume", "-", "error", str(exc))
         while True:

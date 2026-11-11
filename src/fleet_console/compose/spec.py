@@ -42,9 +42,9 @@ def prefix_problem(prefix: str) -> str:
     return ""
 
 
-def make_bench_id(name: str, now: datetime) -> str:
+def make_bench_id(name: str, now: datetime, suffix: str = "") -> str:
     """`<имя>-<время>`: годится как лейбл k8s, S3-префикс и имя каталога; fleet суффикс не добавит (run_id передаётся)."""
-    stamp = now.strftime("%Y%m%d-%H%M%S")
+    stamp = now.strftime("%Y%m%d-%H%M%S") + (f"-{suffix}" if suffix else "")
     slug = SLUG_RE.sub("-", name.lower()).strip("-")[: LABEL_MAX - len(stamp) - 1].rstrip("-") or "bench"  # без «--» на стыке
     return f"{slug}-{stamp}"
 

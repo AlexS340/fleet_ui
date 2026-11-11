@@ -19,6 +19,7 @@ import yaml
 from fleet_console.observe.s3 import aws_env
 from fleet_console.runner import Runner
 from fleet_console.settings import Paths, Settings, aws_secret_names, scrub, secrets_env
+from fleet_console.store.db import LOCAL_OWNER
 
 
 @dataclass
@@ -34,7 +35,7 @@ class Validation:
         return bool(self.tasks) and not self.errors
 
 
-def validate_folder(folder: Path) -> Validation:
+def validate_folder(folder: Path, *, allow_task_links: bool = True) -> Validation:
     """Без запуска кода задач: структура, TOML, образ и входные файлы; один уровень задач."""
     report = Validation()
     digest = hashlib.sha256()
@@ -44,6 +45,9 @@ def validate_folder(folder: Path) -> Validation:
             raise ValueError("выберите папку с задачами")
         candidates = [folder] if (folder / "task.toml").is_file() else sorted(p for p in folder.iterdir() if p.is_dir() and not p.name.startswith("."))
         for task in candidates:
+            if (not allow_task_links and task.is_symlink()) or (task / "task.toml").is_symlink():
+                report.errors.append(f"{task.name}: ссылка на папку задачи или task.toml")
+                continue
             if not (task / "task.toml").is_file():
                 report.errors.append(f"{task.name}: нет task.toml; выберите папку, непосредственно содержащую задачи (например en или ru)")
                 continue
@@ -111,6 +115,7 @@ class LocalDataset:
     uploaded_at: str = ""
     error: str = ""
     digest: str = ""
+    owner_id: str = LOCAL_OWNER
 
 
 class LocalDatasets:
@@ -135,6 +140,12 @@ class LocalDatasets:
         temp.write_text(json.dumps(asdict(dataset), ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)
 
+    def migrate_owner(self, owner_id: str) -> None:
+        for dataset in self.all():
+            if dataset.owner_id == LOCAL_OWNER:
+                dataset.owner_id = owner_id
+                self.save(dataset)
+
     def mapping(self, dataset: LocalDataset) -> None:
         root = self.settings.datasets_root_path()
         relative = Path(dataset.path).relative_to(root.resolve())
@@ -143,8 +154,8 @@ class LocalDatasets:
         target.write_text(yaml.safe_dump({"benchmark": dataset.id, "source": {"tasks_root": relative.as_posix()},
                                         "runtime": {"task_s3_base": dataset.s3_uri or relative.as_posix()}}, sort_keys=False), encoding="utf-8")
 
-    def import_folder(self, folder: Path, name: str) -> LocalDataset:
-        report = validate_folder(folder)
+    def import_folder(self, folder: Path, name: str, *, owner_id: str = LOCAL_OWNER, allow_task_links: bool = True) -> LocalDataset:
+        report = validate_folder(folder, allow_task_links=allow_task_links)
         if not report.ok:
             raise ValueError("\n".join(report.errors[:20]))
         root = self.settings.datasets_root_path()
@@ -155,7 +166,7 @@ class LocalDatasets:
         dataset_id = f"local-{slug}-{uuid4().hex[:12]}"
         dest = root.expanduser().resolve() / "local" / dataset_id / "tasks"
         dataset = LocalDataset(dataset_id, label, str(folder.expanduser().resolve()), str(dest), datetime.now(UTC).isoformat(),
-                               [p.name for p in report.tasks], report.size, report.warnings, digest=report.digest)
+                               [p.name for p in report.tasks], report.size, report.warnings, digest=report.digest, owner_id=owner_id)
         try:
             dest.mkdir(parents=True, exist_ok=False)
             for task in report.tasks:

@@ -6,6 +6,7 @@ priority. Конфликт имён или одинаковый tasks_root в д
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -51,7 +52,7 @@ def scan(directory: Path, origin: str) -> list[Mapping]:
     return [m for m in found if m is not None]
 
 
-def build_registry(worktree: Path, overlay: Path, run_dir: Path) -> tuple[list[Mapping], list[str]]:
+def build_registry(worktree: Path, overlay: Path, run_dir: Path, *, include: Callable[[Mapping], bool] | None = None) -> tuple[list[Mapping], list[str]]:
     """Собрать registry/ прогона заново; вернуть маппинги и ошибки (коллизии имён и tasks_root)."""
     target = run_dir / "registry"
     if target.exists():
@@ -65,6 +66,8 @@ def build_registry(worktree: Path, overlay: Path, run_dir: Path) -> tuple[list[M
     roots: dict[str, str] = {}
     for directory, origin in ((fleet_dir, "fleet"), (overlay_dir, "overlay")):
         for m in scan(directory, origin):
+            if include is not None and not include(m):
+                continue
             if m.name in names:
                 errors.append(f"реестр datasets: имя {m.name} есть и в {names[m.name]}, и в {origin} — переименуйте файл overlay")
                 continue

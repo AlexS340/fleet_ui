@@ -33,6 +33,7 @@ def settings_page(ctx: AppContext) -> None:
         ).classes("text-sm opacity-70")
 
         def save() -> None:
+            ctx.access.require_admin()
             s.fleet_remote = remote.value.strip()
             s.allowed_contexts = [c.strip() for c in contexts.value.split(",") if c.strip()]
             s.namespace = namespace.value.strip()
