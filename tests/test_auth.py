@@ -109,6 +109,31 @@ async def test_two_accounts_and_shared_summary(user: User) -> None:
     assert (await client.get(shared)).status_code == 404
 
 
+async def test_user_can_prepare_revision_for_own_launches(user: User) -> None:
+    ctx = fakes.CTX
+    client = user.http_client
+    await ctx.manager.select("bob", "master")
+    assert (await login(client, "alice")).status_code == 303
+    await user.open("/")
+    await user.should_not_see("Актуализировать")
+    branch = next(e for e in user.find(kind=ui.select).elements if e.props.get("label") == "Ветка")
+    branch.set_value("feat/x")
+    await user.should_see("отстаёт от master на 3")
+    assert not ctx.manager.is_ready(fakes.SHA_FEAT)
+
+    user.find("Подготовить ревизию").click()
+    await user.should_see("Готово: " + fakes.SHA_FEAT[:8])
+    assert ctx.manager.selected("alice").info.sha == fakes.SHA_FEAT
+    assert ctx.manager.selected("bob").info.sha == fakes.SHA_MASTER
+
+    await user.open("/runs")
+    user.find("Запустить бенч").click()
+    await user.should_see("ревизия " + fakes.SHA_FEAT[:8])
+    await user.open("/models")
+    user.find("Поднять модель").click()
+    await user.should_see("ревизия " + fakes.SHA_FEAT[:8])
+
+
 async def test_owner_can_reuse_run_but_personal_preset_is_not_listed_for_other_user(user: User) -> None:
     ctx = fakes.CTX
     revision = await ctx.manager.prepare("master")

@@ -112,7 +112,7 @@ class Mirror:
 
     async def commits(self, ref: str, limit: int = 50) -> list[Commit]:
         fmt = SEP.join(["%H", "%cI", "%an", "%s"])
-        result = await self._git("log", f"-n{limit}", f"--format={fmt}", ref, "--")
+        result = await self._git("log", f"-n{limit}", f"--format={fmt}", "--end-of-options", ref, "--")
         commits = []
         for line in result.stdout.splitlines():
             if not line.strip():
@@ -123,7 +123,7 @@ class Mirror:
 
     async def resolve(self, ref: str) -> str:
         """Ветка, тег или SHA → полный SHA коммита."""
-        result = await self._git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        result = await self._git("rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}")
         return result.stdout.strip()
 
     async def commit_info(self, sha: str, main: str = MAIN_BRANCH) -> CommitInfo:

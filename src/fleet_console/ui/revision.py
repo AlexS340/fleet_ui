@@ -31,20 +31,7 @@ def _title(ref: str, sha: str) -> str:
 
 async def revision_page(ctx: AppContext) -> None:
     build_header(ctx)
-    if not ctx.access.admin:
-        with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-3"):
-            ui.label("Ревизия fleet").classes("text-xl")
-            revision = ctx.revision
-            ui.label(_title(revision.ref, revision.info.sha) if revision else "Ревизия ещё не подготовлена")
-            choices = {r.sha: _title(r.ref, r.sha) for r in ctx.store.revisions() if ctx.manager.is_ready(r.sha)}
-            async def select(e):
-                if e.value in choices:
-                    await ctx.manager.select(ctx.access.id, e.value)
-                    ui.notify("Ревизия выбрана для новых черновиков")
-            ui.select(choices, value=revision.info.sha if revision and revision.info.sha in choices else None,
-                      label="Ревизия для моих прогонов", on_change=select).classes("w-full")
-        return
-    state = {"ref": "", "info": ""}
+    state = {"info": "", "preparing": False}
 
     @ui.refreshable
     def info_view() -> None:
@@ -54,6 +41,11 @@ async def revision_page(ctx: AppContext) -> None:
     @ui.refreshable
     def progress_view() -> None:
         p = ctx.manager.progress
+        if not ctx.access.admin:
+            if state["preparing"]:
+                ui.linear_progress(show_value=False).props("indeterminate").classes("w-full")
+                ui.label(PHASES.get(p.phase, "Готовлю ревизию fleet")).classes("text-sm")
+            return
         if p.busy:
             ui.linear_progress(show_value=False).props("indeterminate").classes("w-full")
             what = _title(p.ref, p.sha) if p.sha else p.ref
@@ -67,7 +59,7 @@ async def revision_page(ctx: AppContext) -> None:
     @ui.refreshable
     def result_view() -> None:
         r = ctx.revision
-        if r is None or ctx.manager.progress.busy:  # пока готовится другая ревизия, старый результат не показываем
+        if r is None:
             return
         pr = r.profile
         with ui.column().classes("w-full gap-2"):
@@ -90,47 +82,56 @@ async def revision_page(ctx: AppContext) -> None:
                     ui.label("\n".join(pr.steps)).classes("font-mono text-sm whitespace-pre-wrap")
             _catalog(ctx, r.worktree)
 
+    def chosen_ref() -> str:
+        return ref_input.value.strip() or commit_select.value or ""
+
     async def show_info() -> None:
-        ref = state["ref"]
+        ref = chosen_ref()
         if not ref:
-            state["info"] = ""
+            description = ""
         else:
             try:
                 info = await ctx.manager.commit_info(ref)
-            except Exception as exc:  # noqa: BLE001 — неизвестный SHA/тег: показываем текст
-                state["info"] = f"Не нашёл «{ref}» в зеркале: {exc}"
-                info_view.refresh()
-                return
-            merged = "влит в master" if info.merged_into_main else f"не влит, отстаёт от master на {info.behind_main}"
-            cached = " · профиль в кеше" if ctx.manager.is_ready(info.sha) else ""
-            state["info"] = f"{info.short} · {info.author} · {info.date:%d.%m.%Y %H:%M} · {merged}{cached}\n{info.subject}"
-        info_view.refresh()
+            except Exception as exc:  # noqa: BLE001 — неизвестный SHA/тег
+                description = f"Ревизия «{ref}» не найдена в зеркале fleet"
+                if ctx.access.admin:
+                    description += f": {exc}"
+            else:
+                merged = "влит в master" if info.merged_into_main else f"не влит, отстаёт от master на {info.behind_main}"
+                cached = " · профиль в кеше" if ctx.manager.is_ready(info.sha) else ""
+                description = f"{info.short} · {info.author} · {info.date:%d.%m.%Y %H:%M} · {merged}{cached}\n{info.subject}"
+        if ref == chosen_ref():
+            state["info"] = description
+            info_view.refresh()
 
     async def on_branch(branch: str | None) -> None:
-        if not branch:
+        commit_select.set_options({})
+        if branch not in branch_select.options:
             return
         commits = await ctx.manager.commits(branch)
-        options = {c.sha: f"{c.short} · {c.date:%d.%m %H:%M} · {c.subject[:70]}" for c in commits}
-        commit_select.set_options(options, value=commits[0].sha if commits else None)
-
-    async def on_commit(ref: str | None) -> None:
-        state["ref"] = ref or ""
-        await show_info()
+        if branch == branch_select.value:
+            options = {c.sha: f"{c.short} · {c.date:%d.%m %H:%M} · {c.subject[:70]}" for c in commits}
+            commit_select.set_options(options, value=commits[0].sha if commits else None)
 
     async def prepare() -> None:
-        ctx.access.require_admin()
-        if not state["ref"]:
+        access = ctx.access
+        ref = chosen_ref()
+        if not ref:
             ui.notify("Выберите ветку и коммит или введите SHA")
             return
-        if ctx.manager.progress.busy:
+        if state["preparing"] or ctx.manager.progress.busy:
             ui.notify("Подождите: операция уже идёт")
             return
+        state["preparing"] = True
         prepare_button.disable()
+        progress_view.refresh()
         try:
-            await ctx.manager.select(ctx.access.id, state["ref"])
+            await ctx.manager.select(access.id, ref)
         except PrepareError:
-            pass  # текст в progress.error
+            if not ctx.access.admin:
+                ui.notify("Не удалось подготовить ревизию. Подробности доступны администратору.", type="negative")
         finally:
+            state["preparing"] = False
             prepare_button.enable()
         progress_view.refresh()
         result_view.refresh()
@@ -143,9 +144,9 @@ async def revision_page(ctx: AppContext) -> None:
         with ui.row().classes("w-full items-end gap-3 flex-wrap"):
             branch_select = ui.select({}, label="Ветка", with_input=True, on_change=lambda e: on_branch(e.value))
             branch_select.classes("flex-1 min-w-[16rem]")
-            commit_select = ui.select({}, label="Коммит", with_input=True, on_change=lambda e: on_commit(e.value))
+            commit_select = ui.select({}, label="Коммит", with_input=True, on_change=lambda: show_info())
             commit_select.classes("flex-1 min-w-[16rem]")
-            ref_input = ui.input("или SHA / тег", on_change=lambda e: on_commit(e.value.strip() or commit_select.value))
+            ref_input = ui.input("или SHA / тег", on_change=lambda: show_info())
             ref_input.classes("min-w-[12rem]")
             prepare_button = ui.button("Подготовить ревизию", on_click=prepare).props("unelevated no-caps")
         mirror_note = ui.label("Зеркало fleet ещё не склонировано — ветки появятся сами, когда клонирование закончится.")
