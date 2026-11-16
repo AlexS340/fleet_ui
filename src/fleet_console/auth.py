@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlencode
 
 from nicegui import Client, core
 from starlette.requests import HTTPConnection, Request
-from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from fleet_console.store.db import LOCAL_OWNER, BenchRun, OwnRun, Store
 
@@ -105,7 +105,6 @@ class TestIdentityAdapter:
 
     def __init__(self, accounts: dict[str, str]) -> None:
         self._seed = dict(accounts)
-        self.tokens: dict[str, str] = {}
         self.sessions: dict[str, tuple[str, int]] = {}
 
     def bind(self, store: Store) -> None:
@@ -145,14 +144,9 @@ class TestIdentityAdapter:
                 actual = await asyncio.to_thread(_password_hash, password, bytes.fromhex(expected.split(":", 1)[0]))
                 current = self.store.user(user)
                 if current and current.enabled and current.session_version == account.session_version and compare_digest(actual, expected):
-                    previous = self.tokens.get(user)
-                    if previous and self.sessions[previous] == (user, current.session_version):
-                        token = previous
-                    else:
-                        if previous:
-                            self.sessions.pop(previous)
-                        token = self.tokens[user] = token_urlsafe(32)
-                        self.sessions[token] = (user, current.session_version)
+                    self.sessions.pop(request.cookies.get(self.cookie, ""), None)
+                    token = token_urlsafe(32)
+                    self.sessions[token] = (user, current.session_version)
                     response = RedirectResponse(next_path, status_code=303, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
                     response.set_cookie(self.cookie, token, httponly=True, samesite="lax", secure=request.url.scheme == "https")
                     return response
@@ -168,14 +162,24 @@ class TestIdentityAdapter:
             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
         )
 
+    async def logout(self, request: Request) -> Response:
+        # Обычная форма с другого сайта не может добавить этот заголовок.
+        if request.headers.get("X-Fleet-Logout") != "1":
+            return PlainTextResponse("Недопустимый запрос на выход", status_code=403)
+        self.sessions.pop(request.cookies.get(self.cookie, ""), None)
+        response = Response(status_code=204, headers={"Cache-Control": "no-store"})
+        response.delete_cookie(self.cookie, httponly=True, samesite="lax", secure=request.url.scheme == "https")
+        return response
+
 
 class IdentityMiddleware:
     def __init__(self, app, *, adapter: IdentityAdapter | None, store: Store) -> None:
         self.app, self.adapter, self.store = app, adapter, store
 
     async def __call__(self, scope, receive, send) -> None:
+        test_adapter = self.adapter if isinstance(self.adapter, TestIdentityAdapter) else None
         if scope["type"] not in {"http", "websocket"} or (
-            isinstance(self.adapter, TestIdentityAdapter) and scope["path"] == "/test-login"
+            test_adapter is not None and scope["path"] in {"/test-login", "/test-logout"}
         ):
             await self.app(scope, receive, send)
             return
@@ -206,7 +210,7 @@ class IdentityMiddleware:
                     login_url += "?" + urlencode({"next": scope["path"]})
                 response = (
                     RedirectResponse(login_url, status_code=303, headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
-                    if isinstance(self.adapter, TestIdentityAdapter) and not socket and scope["method"] == "GET"
+                    if test_adapter is not None and not socket and scope["method"] == "GET"
                     else PlainTextResponse("Требуется вход", status_code=401)
                 )
                 await response(scope, receive, send)
@@ -216,6 +220,8 @@ class IdentityMiddleware:
         version = account.session_version
 
         def session_valid() -> bool:
+            if test_adapter is not None:
+                return test_adapter(conn) == identity
             current = self.store.user(identity.id)
             return current is not None and current.enabled and current.session_version == version
 

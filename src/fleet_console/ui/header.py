@@ -54,14 +54,11 @@ def build_header(ctx: AppContext) -> None:
     with ui.header().classes("items-center gap-2 flex-wrap px-4 py-2"):
         ui.link("Fleet Console", "/").classes("text-lg text-white no-underline mr-2")
         status_row()
-        ui.space()
-        if ctx.access.admin:
-            ui.link("Настройки", "/settings").classes("text-white")
-            ui.link("Админка", "/admin").classes("text-white")
-        if ctx.settings.auth.mode != "local":
-            access = ctx.access
-            account = ctx.store.user(access.id)
-            ui.label((account.display_name if account else "") or access.identity.name or access.id).classes("text-sm text-white")
+        with ui.row().classes("items-center gap-2 ml-auto text-white"):
+            if ctx.access.admin:
+                ui.link("Настройки", "/settings").classes("text-white")
+                ui.link("Админка", "/admin").classes("text-white")
+            profile_control(ctx)
 
     def refresh() -> None:
         try:
@@ -73,6 +70,31 @@ def build_header(ctx: AppContext) -> None:
         status_row.refresh()
 
     timer = ui.timer(2.0, refresh)
+
+
+def profile_control(ctx: AppContext) -> None:
+    if ctx.settings.auth.mode == "local":
+        return
+    access = ctx.access
+    account = ctx.store.user(access.id)
+    name = (account.display_name if account else "") or access.identity.name or access.id
+    if ctx.settings.auth.mode != "test":
+        ui.label(name).classes("text-sm")
+        return
+    with ui.button(name, color=None).props("flat dense no-caps icon-right=arrow_drop_down aria-haspopup=menu"):
+        with ui.menu().props("auto-close"):
+            ui.button("Выйти", color=None).props("flat no-caps").classes("w-full").on("click", js_handler="""async () => {
+                try {
+                    const response = await fetch('/test-logout', {
+                        method: 'POST', headers: {'X-Fleet-Logout': '1'},
+                    });
+                    if (response.ok) {
+                        window.location.replace('/test-login');
+                        return;
+                    }
+                } catch {}
+                window.alert('Не удалось выйти. Попробуйте снова.');
+            }""")
 
 
 def _chip(text: str, color: str, on_click) -> None:

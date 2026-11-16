@@ -13,6 +13,7 @@ from fleet_console.settings import read_secret
 from fleet_console.ui.admin import admin_page
 from fleet_console.ui.benches import benches_page
 from fleet_console.ui.cluster import cluster_page
+from fleet_console.ui.header import profile_control
 from fleet_console.ui.models import models_page
 from fleet_console.ui.measurements import measurements_page, shared_measurement, summary
 from fleet_console.ui.revision import revision_page
@@ -31,6 +32,7 @@ def create_app(ctx: AppContext, identity_adapter: IdentityAdapter | None = None)
             )
             adapter.bind(ctx.store)
             app.add_api_route("/test-login", adapter.login, methods=["GET", "POST"], include_in_schema=False)
+            app.add_api_route("/test-logout", adapter.logout, methods=["POST"], include_in_schema=False)
             identity_adapter = adapter
         elif isinstance(identity_adapter, TestIdentityAdapter):
             raise ValueError("Тестовый адаптер доступен в режиме test")
@@ -89,7 +91,9 @@ def create_app(ctx: AppContext, identity_adapter: IdentityAdapter | None = None)
         except AccessDenied:
             return PlainTextResponse("Ссылка недоступна", status_code=404)
         with ui.column().classes("w-full max-w-4xl mx-auto p-4 gap-3"):
-            ui.label("Сводка замера").classes("text-xl")
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label("Сводка замера").classes("text-xl")
+                profile_control(ctx)
             summary(result)
 
     @ui.page("/settings")

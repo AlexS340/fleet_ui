@@ -8,10 +8,11 @@ from unittest.mock import patch
 import fakes
 import httpx
 import pytest
-from nicegui import ui
+from nicegui import core, ui
 from nicegui.testing import User
 
 from fleet_console.auth import Access, AccessDenied, Identity, IdentityMiddleware, socket_allowed
+from fleet_console.auth import TestIdentityAdapter as LoginAdapter
 from fleet_console.compose import BenchSpec
 from fleet_console.presets import load_presets, personal_dir
 from fleet_console.runner import Result
@@ -23,6 +24,34 @@ pytestmark = pytest.mark.nicegui_main_file("tests/auth_ui_main.py")
 
 async def login(client: httpx.AsyncClient, user: str, password: str | None = None) -> httpx.Response:
     return await client.post("/test-login", data={"user": user, "password": password or f"{user}-test"})
+
+
+async def test_logout_revokes_only_current_browser_session(user: User, monkeypatch) -> None:
+    client = user.http_client
+    assert (await login(client, "alice")).status_code == 303
+    old_cookie = client.cookies[LoginAdapter.cookie]
+    page = await user.open("/measurements")
+    monkeypatch.setattr(core.sio, "get_environ", lambda _: {"asgi.scope": page.request.scope})
+    assert socket_allowed("alice", page.id, joined=False)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(core.app), base_url="http://test") as other:
+        assert (await login(other, "alice")).status_code == 303
+        assert (await client.get("/test-logout")).status_code == 405
+        assert (await client.post("/test-logout")).status_code == 403
+        assert (await client.get("/measurements")).status_code == 200
+        assert (await client.post("/test-logout", headers={"X-Fleet-Logout": "1"})).status_code == 204
+        assert LoginAdapter.cookie not in client.cookies
+        assert not socket_allowed("alice", page.id, joined=False)
+        response = await client.get("/measurements")
+        assert response.status_code == 303 and response.headers["location"] == "/test-login"
+
+        client.cookies.set(LoginAdapter.cookie, old_cookie, domain="test.local", path="/")
+        assert (await client.get("/measurements")).status_code == 303
+        assert (await other.get("/measurements")).status_code == 200
+        assert (await login(client, "bob")).status_code == 303
+        await user.open("/measurements")
+        await user.should_see("bob-cowork")
+        await user.should_not_see("alice-cowork")
 
 
 async def test_two_accounts_and_shared_summary(user: User) -> None:
@@ -163,7 +192,6 @@ async def test_missing_infrastructure_adapter_fails_closed(user: User) -> None:
 
 
 async def test_socket_guard_requires_matching_identity_and_room(user: User, monkeypatch) -> None:
-    from nicegui import core
     from fleet_console.auth import IDENTITY
 
     await login(user.http_client, "alice")
