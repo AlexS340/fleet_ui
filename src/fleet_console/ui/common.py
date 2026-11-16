@@ -22,6 +22,19 @@ def job_queue_select() -> ui.select:
     return ui.select({"": "Из рецепта", **{queue: queue for queue in JOB_QUEUES}}, value="", label="Очередь MLSC").classes("w-36")
 
 
+def split_job_options(overrides: list[str]) -> tuple[str, str, list[str]]:
+    """Последние явные приоритет и очередь возвращаем в поля формы, остальные overrides — в текст."""
+    remaining = list(overrides)
+    selected = []
+    for key, allowed in ((JOB_PRIORITY_OVERRIDE.lstrip("+"), JOB_PRIORITIES), (JOB_QUEUE_KEY, JOB_QUEUES)):
+        matches = [entry for entry in remaining if entry.partition("=")[0].lstrip("+") == key]
+        value = matches[-1].partition("=")[2] if matches else ""
+        selected.append(value if value in allowed else "")
+        if value in allowed:
+            remaining = [entry for entry in remaining if entry not in matches]
+    return selected[0], selected[1], remaining
+
+
 def hint(text: str) -> ui.icon:
     """Вопросик рядом с термином: объяснение по наведению, экран не перегружается."""
     icon = ui.icon("help_outline").classes("text-base opacity-50 cursor-help")

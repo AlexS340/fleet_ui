@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 from fnmatch import fnmatch
+from hashlib import sha256
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -54,6 +56,8 @@ class Preset(BaseModel):
     inference: Literal["litellm", "nginx"] = "litellm"
     harbor_job: dict[str, Any] = Field(default_factory=dict)  # поверх harbor_job: таймауты и т. п.
     overrides: list[str] = Field(default_factory=list)  # сырые overrides fleet, как в «Дополнительно»
+    config_files: dict[str, str] = Field(default_factory=dict)  # ручные YAML из каталога исходного прогона
+    base_preset: str = ""  # исходный пресет из каталога, если был выбран
     path: str = ""  # откуда загружен
 
     @property
@@ -77,6 +81,19 @@ def load_presets(directory: Path = PRESETS_DIR) -> tuple[list[Preset], list[str]
         except (OSError, yaml.YAMLError, ValueError, ValidationError) as exc:
             errors.append(f"{path.name}: {str(exc).splitlines()[0]}")
     return presets, errors
+
+
+def personal_dir(home: Path, owner: str) -> Path:
+    return home / "presets" / sha256(owner.encode()).hexdigest()
+
+
+def save_personal(directory: Path, preset: Preset) -> None:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,100}", preset.name):
+        raise ValueError("Имя пресета: до 101 символа, строчные латинские буквы, цифры, «-», «_» и «.»")
+    body = yaml.safe_dump(preset.model_dump(exclude={"path"}, exclude_defaults=True), allow_unicode=True, sort_keys=False)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / f"{preset.name}.yaml").open("x", encoding="utf-8") as stream:
+        stream.write(body)
 
 
 def compatibility(preset: Preset, groups: dict[str, list[str]], steps: list[str], required_steps: list[str]) -> list[str]:

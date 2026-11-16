@@ -12,7 +12,10 @@ from nicegui import ui
 from nicegui.testing import User
 
 from fleet_console.auth import Access, AccessDenied, Identity, IdentityMiddleware, socket_allowed
+from fleet_console.compose import BenchSpec
+from fleet_console.presets import load_presets, personal_dir
 from fleet_console.runner import Result
+from fleet_console.settings import OVERLAY_DIR
 from fleet_console.ui.measurements import issue_link, revoke_link
 
 pytestmark = pytest.mark.nicegui_main_file("tests/auth_ui_main.py")
@@ -75,6 +78,34 @@ async def test_two_accounts_and_shared_summary(user: User) -> None:
         revoke_link(bob, "alice-cowork", digest)
     revoke_link(alice, "alice-cowork", digest)
     assert (await client.get(shared)).status_code == 404
+
+
+async def test_owner_can_reuse_run_but_personal_preset_is_not_listed_for_other_user(user: User) -> None:
+    ctx = fakes.CTX
+    revision = await ctx.manager.prepare("master")
+    BenchSpec(
+        run_id="alice-cowork", worktree=revision.worktree, run_dir=ctx.paths.runs / "alice-cowork", overlay=OVERLAY_DIR,
+        recipe="glm", agent="terminus2", dataset="cowork", sha=revision.info.sha,
+    ).write()
+    client = user.http_client
+    assert (await login(client, "alice")).status_code == 303
+    await user.open("/runs/alice-cowork")
+    user.find("Сохранить как пресет").click()
+    user.find(marker="save-personal-preset").click()
+    await user.should_see("Пресет «alice-cowork» сохранён")
+    presets, errors = load_presets(personal_dir(ctx.paths.home, "alice"))
+    assert not errors and [p.name for p in presets] == ["alice-cowork"]
+
+    user.find("Запустить с теми же параметрами").click()
+    await user.should_see("Новый прогон из истории")
+    assert len(ctx.store.benches()) == 2
+
+    assert (await login(client, "bob")).status_code == 303
+    assert (await client.get("/runs/alice-cowork")).status_code == 404
+    await user.open("/runs")
+    user.find("Запустить бенч").click()
+    preset = next(e for e in user.find(kind=ui.select).elements if e.props.get("label") == "Пресет")
+    assert not any("alice-cowork" in key for key in preset.options)
 
 
 async def test_foreign_resources_denied_before_external_calls(user: User) -> None:

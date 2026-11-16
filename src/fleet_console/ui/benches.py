@@ -45,17 +45,18 @@ from fleet_console.compose.local_datasets import LocalDataset
 from fleet_console.compose.policy import private_root, supports_private_measure
 from fleet_console.compose.provenance import Candidate, build_index, layers, lookup, tree_nodes, value_at
 from fleet_console.compose.registry import Mapping, bench_slug, group_tasks_roots, list_mappings, registry_choices
+from fleet_console.compose.reuse import config_path, preset_from_run
 from fleet_console.context import AppContext
-from fleet_console.fleetref.manager import ReadyRevision
+from fleet_console.fleetref.manager import PrepareError, ReadyRevision
 from fleet_console.fleetref.profile import CONFIGS_REL, list_groups
 from fleet_console.models.compose import recipe_summary
 from fleet_console.observe.argo import TaskWorkflow, argo_ui_url, workflow_url
 from fleet_console.observe.s3 import S3Object, TaskResult, scan_results
-from fleet_console.presets import DatasetRef, compatibility, load_presets
+from fleet_console.presets import DatasetRef, Preset, compatibility, load_presets, personal_dir, save_personal
 from fleet_console.runs import STAGE_TITLES, BenchError, dataset_of
 from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
 from fleet_console.store import BenchRun
-from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, text_dialog
+from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, split_job_options, text_dialog
 from fleet_console.ui.header import build_header
 from fleet_console.ui.local_datasets import local_panel
 
@@ -113,9 +114,10 @@ def _remaining_resources(ctx: AppContext, run: BenchRun) -> list[str]:
 
 
 def _revision_title(revision: ReadyRevision) -> str:
-    ref = revision.ref if revision.ref != revision.info.sha else revision.info.sha[:8]
+    sha = revision.info.sha[:8]
+    ref = f"{revision.ref}@{sha}" if revision.ref != revision.info.sha else sha
     merged = "влита в master" if revision.info.merged_into_main else f"не влита, отстаёт на {revision.info.behind_main}"
-    return f"{ref}@{revision.info.sha[:8]} · {merged}"
+    return f"{ref} · {merged}"
 
 
 def merged_groups(revision: ReadyRevision) -> dict[str, list[str]]:
@@ -221,13 +223,18 @@ def _facts_table(rows: list[dict[str, str]]) -> ui.table:
 # --- форма запуска -------------------------------------------------------------
 
 
-def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None) -> None:  # noqa: C901 — форма целиком, чтобы состояние жило в замыкании
+def _new_bench_dialog(
+    ctx: AppContext, after, local: LocalDataset | None = None, *,
+    revision: ReadyRevision | None = None, initial: Preset | None = None, source: BenchRun | None = None,
+) -> None:  # noqa: C901 — форма целиком, чтобы состояние жило в замыкании
     if local is not None:
         local = ctx.user_dataset(local.id)
     admin = ctx.access.admin
-    revision = ctx.revision
+    revision = revision or ctx.revision
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
-        ui.label("Запустить бенч").classes("text-lg")
+        ui.label("Новый прогон из истории" if source else "Запустить бенч").classes("text-lg")
+        if source:
+            ui.label(f"Из прогона {source.id}. Будет создан новый прогон.").classes("text-xs opacity-70 break-all")
         if revision is None or not revision.profile.compatible:
             ui.label("Сначала подготовьте совместимую ревизию fleet на главной странице: прогон идёт её шагами.").classes("text-sm")
             ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
@@ -237,8 +244,13 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
         groups = merged_groups(revision)
         overlay = overlay_members()
         presets, preset_errors = load_presets(PRESETS_DIR)
+        personal, personal_errors = load_presets(personal_dir(ctx.paths.home, ctx.access.id))
+        personal_by_key = {"personal:" + p.name: p for p in personal}
+        by_key = {p.name: p for p in presets} | personal_by_key
         draft = Draft()
         model_config_changed = False
+        applied_files: dict[str, str] = {}
+        setup: Preset | None = None
 
         def label_of(group: str, member: str) -> str:
             return f"{member} (overlay)" if member in overlay.get(group, set()) else member
@@ -260,11 +272,14 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             return options | ({CUSTOM_DATASET: CUSTOM_LABEL} if admin else {})
 
         # --- поля формы
-        preset_options = {"": "— без пресета —"} | {p.name: f"{p.name} · {p.description}" if p.description else p.name for p in presets}
+        preset_options = {"": "— без пресета —"} | {
+            key: f"{p.name} · личный" if key in personal_by_key else f"{p.name} · {p.description}" if p.description else p.name
+            for key, p in by_key.items()
+        }
         preset_select = ui.select(preset_options, value="", label="Пресет").classes("w-full")
         preset_note = ui.label().classes("text-xs whitespace-pre-wrap")
-        if preset_errors:
-            ui.label("битые пресеты: " + "; ".join(preset_errors)).classes("text-xs text-negative")
+        if preset_errors or personal_errors:
+            ui.label("битые пресеты: " + "; ".join(preset_errors + personal_errors)).classes("text-xs text-negative")
 
         model_options: dict[str, str] = {}
         for recipe in groups.get("mlsc/model", []):
@@ -272,7 +287,7 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             gpu = summary_.get("gpu_per_instance")
             model_options[OWN_MODEL_PREFIX + recipe] = f"поднять: {label_of('mlsc/model', recipe)}" + (f" · {gpu} GPU/инстанс" if gpu else "")
         for s in ctx.sessions.sessions(active_only=True):
-            if s.status == "ready" and ctx.access.allows(s):
+            if s.status == "ready" and s.owner_id == ctx.access.id:
                 model_options[SESSION_PREFIX + s.id] = f"сессия: {s.model} · {s.replicas} реплик · версия {s.version_id}"
         with ui.row().classes("w-full gap-3 flex-wrap items-end"):
             model_select = ui.select(model_options, value=next(iter(model_options), None), label="Модель", with_input=True).classes("flex-1 min-w-[18rem]")
@@ -309,6 +324,10 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             )
             config_button.disable()
         advanced.set_visibility(admin)
+        carry_files = ui.checkbox("Сохранить ручные правки YAML").set_visibility(False)
+        manual_note = ui.label(
+            "Сохранённый exp.yaml задаёт поля формы. Его можно изменить в полном конфиге или пересобрать из полей, сняв галочку."
+        ).classes("text-xs opacity-70").set_visibility(False)
         preview_box = ui.column().classes("w-full gap-1")
         checks_box = ui.column().classes("w-full gap-1")
         accept = ui.checkbox("Принимаю предупреждения").mark("accept-warnings")
@@ -370,40 +389,81 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             gpu = recipe_summary(revision.worktree, recipe).get("gpu_per_instance") if recipe else None
             gpu_label.set_text(f"GPU: {n} × {gpu} = {n * gpu} · лимит агентов {n} × {int(apr.value or 1)} = {n * int(apr.value or 1)}" if gpu else f"лимит агентов {n * int(apr.value or 1)}")
 
-        def apply_preset(name: str | None) -> None:
-            preset = next((p for p in presets if p.name == name), None)
-            if preset is None:
-                preset_note.set_text("")
-                return
+        def fill_setup(preset: Preset, *, session_id: str | None = None, exact: bool = False) -> None:
+            nonlocal setup
+            setup = preset
+            key = SESSION_PREFIX + session_id if session_id else OWN_MODEL_PREFIX + preset.model
             problems = compatibility(preset, groups, revision.profile.steps, [])
-            preset_note.set_text(("несовместим с ревизией: " + "; ".join(problems)) if problems else f"пресет под {preset.fleet.ref}; поля ниже заполнены из него")
+            if session_id and key not in model_options:
+                problems.append("исходная сессия модели не готова или недоступна; выберите модель")
+            preset_note.set_text("несовместим с ревизией: " + "; ".join(problems) if problems else f"Параметры из «{preset.name}» · fleet {preset.fleet.ref[:12]}")
             preset_note.classes(replace="text-xs whitespace-pre-wrap " + ("text-negative" if problems else "opacity-70"))
-            key = OWN_MODEL_PREFIX + preset.model
-            if key in model_options:
-                model_select.set_value(key)
+            if key in model_options or exact:
+                model_select.set_value(key if key in model_options else None)
             model_name.set_value(preset.model_name)
-            if preset.agent in agent_select.options:
-                agent_select.set_value(preset.agent)
+            if preset.agent in agent_select.options or exact:
+                agent_select.set_value(preset.agent if preset.agent in agent_select.options else None)
             if isinstance(preset.dataset, str):
-                if preset.dataset in dataset_select.options:
-                    dataset_select.set_value(preset.dataset)
+                if preset.dataset in dataset_select.options or exact:
+                    dataset_select.set_value(preset.dataset if preset.dataset in dataset_select.options else None)
             else:
                 ref = preset.dataset
                 key = next((k for k, m in registry.items() if m.name == ref.mapping or m.tasks_root.strip("/") == ref.path.strip("/")), CUSTOM_DATASET)
-                if key in dataset_select.options:
-                    dataset_select.set_value(key)
-                custom_path.set_value(preset.dataset.path)
-                custom_benchmark.set_value(preset.dataset.benchmark)
-                custom_mapping.set_value(preset.dataset.mapping or "")
+                if key in dataset_select.options or exact:
+                    dataset_select.set_value(key if key in dataset_select.options else None)
+                fill_from_registry(dataset_select.value)
+                custom_path.set_value(ref.path)
+                custom_benchmark.set_value(ref.benchmark)
+                custom_mapping.set_value(ref.mapping if ref.mapping in custom_mapping.options else "")
             jobs.set_value(preset.resources.jobs)
             apr.set_value(preset.resources.agents_per_replica)
             task_limit.set_value(preset.execution.task_limit)
-            if preset.execution.profile in profile.options:
-                profile.set_value(preset.execution.profile)
+            if preset.execution.profile in profile.options or exact:
+                profile.set_value(preset.execution.profile if preset.execution.profile in profile.options else None)
             inference.set_value(preset.inference)
-            extra.set_value("\n".join(preset.overrides))
+            saved_priority, saved_queue, overrides = split_job_options(preset.overrides)
+            priority.set_value(saved_priority)
+            queue.set_value(saved_queue)
+            extra.set_value("\n".join(overrides))
             harbor_job_text.set_value(yaml.safe_dump(preset.harbor_job, allow_unicode=True, sort_keys=False) if preset.harbor_job else "")
+            carry_files.set_visibility(admin and bool(preset.config_files))
+            carry_files.set_value(admin and bool(preset.config_files) and not (session_id and model_select.value is None))
+            sync_manual_fields()
+
+        async def apply_preset(name: str | None) -> None:
+            nonlocal setup
+            mark_model_config_changed()
+            preset = by_key.get(name or "")
+            if preset is None:
+                setup = None
+                carry_files.set_value(False)
+                carry_files.set_visibility(False)
+                preset_note.set_text("")
+                sync_manual_fields()
+                mark_model_config_changed()
+                return
+            try:
+                if name in personal_by_key:
+                    _check_saved_setup(ctx, preset, presets)
+                    if preset.fleet.ref != revision.info.sha:
+                        new_revision = await ctx.manager.prepare(preset.fleet.ref)
+                        if preset_select.value == name:
+                            _new_bench_dialog(ctx, after, revision=new_revision, initial=preset)
+                            dialog.close()
+                        return
+                fill_setup(preset, exact=name in personal_by_key)
+            except (AccessDenied, BenchError, PrepareError) as exc:
+                ui.notify(str(exc), type="negative", multi_line=True)
+
+        def sync_manual_fields() -> None:
+            frozen = bool(carry_files.value and setup and "exp.yaml" in setup.config_files)
+            for element in (model_select, agent_select, dataset_select, custom_path, custom_benchmark, custom_mapping,
+                            apr, task_limit, profile, inference, harbor_job_text):
+                element.set_enabled(not frozen)
+            manual_note.set_visibility(frozen)
             refresh_gpu()
+            if frozen:
+                jobs.disable()
 
         def dataset_value() -> str | DatasetRef:
             if is_path_dataset():
@@ -416,6 +476,9 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             return str(dataset_select.value)
 
         def build_spec() -> BenchSpec:
+            selected_personal = personal_by_key.get(preset_select.value)
+            if selected_personal is not None and setup != selected_personal:
+                raise BenchError("Личный пресет ещё не применён; проверьте сообщение о подготовке ревизии")
             if model_select.value not in model_options or agent_select.value not in agent_select.options or dataset_select.value not in dataset_select.options:
                 raise BenchError("выберите модель, агента и датасет из списка")
             if not admin and (profile.value not in profile.options or inference.value not in {"litellm", "nginx"}
@@ -424,16 +487,15 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
             dataset = dataset_value()
             if isinstance(dataset, DatasetRef) and not (dataset.path and dataset.benchmark):
                 raise BenchError("для своего датасета нужны путь и benchmark")
-            if not model_select.value or not agent_select.value:
-                raise BenchError("выберите модель и агента")
-            preset = next((p for p in presets if p.name == preset_select.value), None)
+            if not model_select.value or not agent_select.value or profile.value not in profile.options:
+                raise BenchError("выберите модель, агента и профиль")
             if admin:
                 try:
                     harbor_job = yaml.safe_load(harbor_job_text.value or "") or {}
                 except yaml.YAMLError as exc:
                     raise BenchError(f"harbor_job: не YAML — {exc}") from exc
             else:
-                harbor_job = preset.harbor_job if preset else {}
+                harbor_job = setup.harbor_job if setup else {}
             if not isinstance(harbor_job, dict):
                 raise BenchError("harbor_job должен быть словарём")
             session = None
@@ -444,12 +506,14 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
                 session = ctx.benches.session_link(session_id)
                 recipe = session.recipe
             overrides = ([line.strip() for line in (extra.value or "").splitlines() if line.strip()] if admin
-                         else list(preset.overrides) if preset else [])
+                         else split_job_options(setup.overrides)[2] if setup else [])
             if not session and priority.value in JOB_PRIORITIES:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={priority.value}")
             if not session and queue.value in JOB_QUEUES:
                 overrides.append(f"++{JOB_QUEUE_KEY}={queue.value}")
-            preset_name = str(preset_select.value or "")
+            preset_name = setup.name if setup and not source else ""
+            base_preset = (preset_select.value if preset_select.value and preset_select.value not in personal_by_key
+                           else setup.base_preset) if setup else ""
             if not draft.run_id:
                 base = preset_name or f"{session.model if session else recipe}-{dataset if isinstance(dataset, str) else dataset.benchmark}"
                 run_id = make_bench_id(base, datetime.now(timezone.utc), uuid4().hex[:10])
@@ -465,7 +529,7 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
                 model_name=(model_name.value or "").strip() if not session else "", harbor_job=harbor_job,
                 private_s3_root=private_root(ctx.settings),
                 extra=tuple(overrides), pod=draft.spec.pod if draft.spec else "",
-                session=session, preset=preset_name, sha=revision.info.sha,
+                session=session, preset=base_preset, sha=revision.info.sha,
                 dataset_source={"id": item.id, "source": item.source, "imported_at": item.imported_at, "s3_uri": item.s3_uri,
                                 "uploaded_at": item.uploaded_at} if item else {},
             )
@@ -483,7 +547,20 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
                 if not spec.pod:
                     spec = BenchSpec(**{**spec.__dict__, "pod": await ctx.benches._pod()})
                 ctx.access.draft(spec.run_id)
-                spec.write(force=not draft.manual)
+                files = setup.config_files if admin and setup and carry_files.value else {}
+                for rel, old in applied_files.items():
+                    path = spec.run_dir / config_path(rel)
+                    if rel not in files and path.is_file() and path.read_text(encoding="utf-8") == old:
+                        path.unlink()
+                for rel, content in files.items():
+                    if applied_files.get(rel) == content:
+                        continue
+                    path = spec.run_dir / config_path(rel)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
+                applied_files.clear()
+                applied_files.update(files)
+                spec.write(force=not draft.manual and "exp.yaml" not in files)
                 draft.spec = spec
                 mappings, registry_errors = build_registry(spec.worktree, spec.overlay, spec.run_dir, include=visible_mapping)
                 draft.resolved, draft.resolve_error = await ctx.benches.print_config(spec)
@@ -606,15 +683,94 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
         dataset_select.on_value_change(lambda e: fill_from_registry(e.value))
         for element in (model_select, dataset_select, jobs, apr):
             element.on_value_change(lambda _: refresh_gpu())
-        for element in (model_select, model_name, priority, queue, extra):
+        for element in (model_select, model_name, priority, queue, extra, agent_select, dataset_select,
+                        custom_path, custom_benchmark, custom_mapping, jobs, apr, task_limit, profile, inference, harbor_job_text):
             element.on_value_change(lambda _: mark_model_config_changed())
+        carry_files.on_value_change(lambda _: (sync_manual_fields(), mark_model_config_changed()))
         accept.on_value_change(lambda _: refresh_start())
         dialog.on("hide", lambda _: discard_draft())
         fill_from_registry(dataset_select.value)
         if local:
             dataset_select.set_value(REGISTRY_DATASET + local.id)
             fill_from_registry(dataset_select.value)
+        if initial is not None:
+            if not source:
+                preset_select.value = next((key for key, p in personal_by_key.items() if p.name == initial.name), "")
+            fill_setup(initial, session_id=source.session_id if source else None, exact=True)
+            if source and model_select.value and agent_select.value and dataset_select.value and profile.value:
+                ui.timer(0, rebuild, once=True)
         refresh_gpu()
+    dialog.open()
+
+
+def _check_saved_setup(ctx: AppContext, setup: Preset, shipped: list[Preset]) -> None:
+    if ctx.access.admin:
+        return
+    base = next((p for p in shipped if p.name == setup.base_preset), None)
+    if (setup.config_files or setup.harbor_job != (base.harbor_job if base else {})
+            or split_job_options(setup.overrides)[2] != (split_job_options(base.overrides)[2] if base else [])):
+        raise BenchError("Этот запуск содержит расширенные настройки вне штатного пресета; для повтора нужны права администратора.")
+
+
+def _saved_run_setup(ctx: AppContext, run_id: str) -> tuple[BenchRun, Preset]:
+    run = ctx.access.run(run_id)
+    directory = Path(run.dir)
+    spec = BenchSpec.from_json((directory / "spec.json").read_text(encoding="utf-8"))
+    if spec.dataset_source:
+        ctx.user_dataset(spec.dataset_source["id"])
+    setup = preset_from_run(spec, directory, name=run.id, sha=run.sha)
+    _check_saved_setup(ctx, setup, load_presets(PRESETS_DIR)[0])
+    return run, setup
+
+
+async def _repeat_run(ctx: AppContext, run_id: str, after, close) -> None:
+    try:
+        run, setup = _saved_run_setup(ctx, run_id)
+        revision = await ctx.manager.prepare(run.sha)
+    except (AccessDenied, BenchError, PrepareError, OSError, ValueError, KeyError, yaml.YAMLError) as exc:
+        ui.notify(f"Не удалось повторить прогон: {exc}", type="negative", multi_line=True)
+        return
+    _new_bench_dialog(ctx, after, revision=revision, initial=setup, source=run)
+    close()
+
+
+def _save_run_preset_dialog(ctx: AppContext, run_id: str) -> None:
+    try:
+        run, setup = _saved_run_setup(ctx, run_id)
+    except (AccessDenied, BenchError, OSError, ValueError, KeyError, yaml.YAMLError) as exc:
+        ui.notify(f"Не удалось прочитать настройки прогона: {exc}", type="negative", multi_line=True)
+        return
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-md"):
+        ui.label("Личный пресет из прогона").classes("text-lg")
+        ui.label(f"Ревизия fleet закреплена: {run.sha[:12]}").classes("text-sm")
+        if run.session_id:
+            ui.label("Пресет выберет рецепт модели из прогона. Готовую сессию можно выбрать в форме.").classes("text-sm")
+        name = ui.input("Имя пресета", value=run.id).classes("w-full")
+        error = ui.label().classes("text-negative text-sm")
+
+        def save() -> None:
+            try:
+                ctx.access.run(run_id)
+                _check_saved_setup(ctx, setup, load_presets(PRESETS_DIR)[0])
+                preset = setup.model_copy(update={"name": name.value.strip()})
+                raw = preset.model_dump_json()
+                if (scrub(raw, ctx.benches.secrets().values()) != raw
+                        or any(scrub(content, ctx.benches.secrets().values()) != content
+                               for content in (*setup.config_files.values(), *setup.overrides))):
+                    raise BenchError("В настройках найден секрет. Вынесите его в окружение перед сохранением пресета.")
+                save_personal(personal_dir(ctx.paths.home, ctx.access.id), preset)
+            except FileExistsError:
+                error.set_text("Личный пресет с таким именем уже существует.")
+                return
+            except (AccessDenied, BenchError, OSError, ValueError) as exc:
+                error.set_text(str(exc))
+                return
+            dialog.close()
+            ui.notify(f"Пресет «{preset.name}» сохранён. Его можно выбрать при запуске бенча.")
+
+        with ui.row().classes("gap-2"):
+            ui.button("Сохранить пресет", on_click=save).props("unelevated no-caps").mark("save-personal-preset")
+            ui.button("Отмена", on_click=dialog.close).props("flat no-caps")
     dialog.open()
 
 
@@ -968,6 +1124,9 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         for line in ctx.benches.measure_summary(run.id):
             ui.label("замер: " + line).classes("text-sm")
         with ui.row().classes("items-end gap-2 flex-wrap"):
+            if spec_path.is_file() and run.sha:
+                ui.button("Запустить с теми же параметрами", on_click=lambda: _repeat_run(ctx, run.id, after, dialog.close)).props("unelevated no-caps")
+                ui.button("Сохранить как пресет", on_click=lambda: _save_run_preset_dialog(ctx, run.id)).props("flat no-caps")
             if run.status == "queued":
                 ui.label("Ожидает свободной квоты. Ресурсы ещё не выделены.").classes("text-sm")
                 ui.button("Отменить заявку", on_click=lambda: do(ctx.benches.stop(run.id, access=ctx.access))).props("flat no-caps")

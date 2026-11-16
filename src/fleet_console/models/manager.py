@@ -189,6 +189,8 @@ class SessionManager:
         agent, dataset = self.stubs(groups)
         config_text = None
         if source_id is not None:
+            if access:
+                access.require_admin()
             source = access.session(source_id) if access else self.get(source_id)
             if source.sha != revision.info.sha:
                 raise SessionError("повтор сессии должен использовать исходный SHA fleet")

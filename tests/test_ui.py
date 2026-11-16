@@ -7,10 +7,12 @@ from nicegui.testing import User
 import pytest
 
 from fleet_console.fleetref.profile import CONFIGS_REL
+from fleet_console.compose import BenchSpec
+from fleet_console.presets import load_presets, personal_dir
 from fleet_console.runner import Result
 from fleet_console.observe.mlsc import Version
-from fleet_console.settings import Settings
-from fleet_console.store import Session
+from fleet_console.settings import OVERLAY_DIR, Settings
+from fleet_console.store import BenchRun, Session
 import fakes
 
 pytestmark = pytest.mark.nicegui_main_file("tests/ui_main.py")
@@ -272,7 +274,7 @@ async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy:
     await ctx.manager.prepare("feat/x")  # в шапке выбрана другая ревизия
     await user.open("/models")
     user.find(kind=ui.table).trigger("rowClick", [None, {"id": source.id}])
-    user.find("Повторить с правками").click()
+    user.find("Запустить с теми же параметрами").click()
     await user.should_see("Будет создана новая сессия")
     assert ctx.manager.prepared[-1] == source.sha
     assert _select(user, "Рецепт mlsc/model").value == "glm"
@@ -308,7 +310,7 @@ async def test_repeat_model_session_shows_revision_prepare_error(user: User) -> 
     ctx.manager.prepare_error = "Не удалось подготовить исходную ревизию"
     await user.open("/models")
     user.find(kind=ui.table).trigger("rowClick", [None, {"id": source.id}])
-    user.find("Повторить с правками").click()
+    user.find("Запустить с теми же параметрами").click()
     await user.should_see("Не удалось подготовить исходную ревизию")
     assert len(ctx.sessions.sessions()) == 1
 
@@ -412,6 +414,61 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.should_see("runner log line 2")
     user.find("Лог упавшего воркера модели").click()
     await user.should_see("MLSC: последний упавший воркер")
+
+
+async def test_bench_can_save_preset_and_repeat_on_original_sha(user: User) -> None:
+    ctx = fakes.CTX
+    revision = await ctx.manager.prepare("master")
+    source = BenchSpec(
+        run_id="source-run", worktree=revision.worktree, run_dir=ctx.paths.runs / "source-run", overlay=OVERLAY_DIR,
+        recipe="glm", agent="terminus2", dataset="cowork", sha=revision.info.sha, task_limit=3, agents_per_replica=2,
+        model_name="custom-model", inference="nginx", harbor_job={"agent_timeout_multiplier": 2},
+        extra=("++mlsc.create_job.job.job_priority_class=low", "++mlsc.create_job.job.queue_name=shared", "execution.shuffle=false"),
+    )
+    source.write()
+    (source.run_dir / "harbor" / "agent").mkdir(parents=True)
+    edit = source.run_dir / "harbor" / "agent" / "terminus2.yaml"
+    edit.write_text("harbor_job: {agent_timeout_multiplier: 3}\n")
+    source.resolved.write_text("should-not-be-copied: true\n")
+    ctx.store.create_bench(BenchRun(source.run_id, "done", fakes.NOW.isoformat(), sha=source.sha, dir=str(source.run_dir)))
+    await ctx.manager.select(ctx.access.id, "feat/x")
+
+    await user.open("/runs/source-run")
+    user.find("Сохранить как пресет").click()
+    name = next(e for e in user.find(kind=ui.input).elements if e.props.get("label") == "Имя пресета")
+    name.set_value("smoke-copy")
+    user.find(marker="save-personal-preset").click()
+    await user.should_see("Пресет «smoke-copy» сохранён")
+    (saved,), errors = load_presets(personal_dir(ctx.paths.home, ctx.access.id))
+    assert not errors
+    assert saved.fleet.ref == source.sha and saved.model_name == "custom-model"
+    assert saved.config_files == {"harbor/agent/terminus2.yaml": edit.read_text()}
+    assert load_presets(personal_dir(ctx.paths.home, "another-user")) == ([], [])
+
+    user.find("Запустить с теми же параметрами").click()
+    await user.should_see("Новый прогон из истории")
+    await user.should_see("Что и где будет запущено")
+    assert len(ctx.store.benches()) == 1
+    assert ctx.manager.prepared[-1] == source.sha
+    assert ctx.manager.selected(ctx.access.id).info.sha == fakes.SHA_FEAT
+    assert _select(user, "Приоритет джобы").value == "low"
+    assert _select(user, "Очередь MLSC").value == "shared"
+    assert _select(user, "Маршрут").value == "nginx"
+    draft_dir, = [p for p in ctx.paths.runs.iterdir() if p != source.run_dir]
+    clone = BenchSpec.from_json((draft_dir / "spec.json").read_text())
+    assert clone.run_id != source.run_id and clone.effective_model != source.effective_model
+    assert clone.extra == (source.extra[-1], *source.extra[:2])
+    assert clone.harbor_job == source.harbor_job and clone.task_limit == source.task_limit
+    assert (draft_dir / edit.relative_to(source.run_dir)).read_text() == edit.read_text()
+    assert "should-not-be-copied" not in (draft_dir / "resolved.yaml").read_text()
+
+    await user.open("/runs")
+    user.find("Запустить бенч").click()
+    _select(user, "Пресет").set_value("personal:smoke-copy")
+    await user.should_see("Параметры из «smoke-copy»")
+    assert ctx.manager.prepared[-1] == source.sha
+    priority_fields = [e for e in user.find(kind=ui.select).elements if e.props.get("label") == "Приоритет джобы"]
+    assert max(priority_fields, key=lambda e: e.id).value == "low"
 
 
 async def test_bench_on_existing_session_ignores_selected_priority(user: User) -> None:

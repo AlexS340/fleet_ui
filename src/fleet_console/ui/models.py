@@ -19,7 +19,7 @@ from fleet_console.models.compose import recipe_summary
 from fleet_console.observe.mlsc import Version
 from fleet_console.settings import scrub
 from fleet_console.store import Session
-from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, text_dialog
+from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, split_job_options, text_dialog
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
 
 GATEWAY_OPTIONS = {"litellm": "litellm — маршрут fleet по умолчанию", "nginx": "nginx — vllm-proxy"}
@@ -116,29 +116,30 @@ def _sessions_card(ctx: AppContext, session_id: str | None) -> None:
         _session_dialog(ctx, session_id, render)
 
 
-async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = None) -> None:
+async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = None) -> bool:
     request_key = uuid4().hex
     revision = ctx.revision
     options = {"recipe": None, "model_name": "", "replicas": 1, "inference": "litellm",
                "ttl_minutes": ctx.settings.session_ttl_minutes, "extra": ()}
     if source_id is not None:
         try:
-            ctx.access.require_admin()
             source = ctx.access.session(source_id)
             options = ctx.sessions.launch_options(source)
+            if not ctx.access.admin and split_job_options(list(options["extra"]))[2]:
+                raise SessionError("В исходном запуске есть расширенные overrides; для повтора нужны права администратора.")
             revision = await ctx.manager.prepare(source.sha)
         except (AccessDenied, SessionError, PrepareError) as exc:
             ui.notify(str(exc), type="negative", multi_line=True)
-            return
+            return False
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
-        ui.label("Повторить с правками" if source_id else "Поднять модель").classes("text-lg")
+        ui.label("Новый запуск из истории" if source_id else "Поднять модель").classes("text-lg")
         if source_id:
             ui.label(f"Из сессии {source_id}. Будет создана новая сессия.").classes("text-xs opacity-70 break-all")
         if revision is None or not revision.profile.compatible:
             ui.label("Сначала подготовьте совместимую ревизию fleet на главной странице: сессия идёт её шагами mlsc.*").classes("text-sm")
             ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
             dialog.open()
-            return
+            return True
         ref = revision.ref if revision.ref != revision.info.sha else revision.info.sha[:8]
         ui.label(f"ревизия {ref}@{revision.info.sha[:8]}" if ref != revision.info.sha[:8] else f"ревизия {ref}").classes("text-sm opacity-70")
         recipes = revision.profile.groups.get("mlsc/model", [])
@@ -151,16 +152,9 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
             inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value=options["inference"], label="Маршрут").classes("w-32")
             priority = job_priority_select()
             queue = job_queue_select()
-        saved_extra = list(options["extra"])
-        priority_values = {f"{JOB_PRIORITY_OVERRIDE}={value}": value for value in JOB_PRIORITIES}
-        priority_overrides = [value for value in saved_extra if value.split("=", 1)[0].lstrip("+") == JOB_PRIORITY_OVERRIDE.lstrip("+")]
-        if priority_overrides and priority_overrides[-1] in priority_values:
-            priority.set_value(priority_values[priority_overrides[-1]])
-            saved_extra = [value for value in saved_extra if value not in priority_overrides]
-        queue_overrides = [value for value in saved_extra if value.partition("=")[0].lstrip("+") == JOB_QUEUE_KEY]
-        if queue_overrides and (saved_queue := queue_overrides[-1].partition("=")[2]) in JOB_QUEUES:
-            queue.set_value(saved_queue)
-            saved_extra = [value for value in saved_extra if value not in queue_overrides]
+        saved_priority, saved_queue, saved_extra = split_job_options(list(options["extra"]))
+        priority.set_value(saved_priority)
+        queue.set_value(saved_queue)
         with ui.expansion("Дополнительно").classes("w-full").set_visibility(ctx.access.admin):
             extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение", value="\n".join(saved_extra)).classes("w-full").props("autogrow")
         gpu_label = ui.label().classes("text-sm")
@@ -218,7 +212,7 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
                     inference=selected_inference,
                     ttl_minutes=selected_ttl,
                     extra=tuple(overrides),
-                    source_id=source_id,
+                    source_id=source_id if ctx.access.admin else None,
                     request_key=request_key,
                     access=ctx.access,
                 )
@@ -231,6 +225,7 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
             ui.button("Запустить подъём", on_click=ask).props("unelevated no-caps").mark("start-session")
             ui.button("Отмена", on_click=dialog.close).props("flat no-caps")
     dialog.open()
+    return True
 
 
 def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
@@ -244,8 +239,8 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
     v = ctx.observer.active_model(s.id, version_id, since=s.stopped_at if not s.active else None)
 
     async def repeat() -> None:
-        await _new_session_dialog(ctx, after, source_id=s.id)
-        dialog.close()
+        if await _new_session_dialog(ctx, after, source_id=s.id):
+            dialog.close()
 
     def refresh() -> None:
         dialog.close()
@@ -283,8 +278,8 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
         if s.error:
             ui.label(scrub(s.error, secrets)).classes("text-negative text-sm whitespace-pre-wrap")
         ui.label(f"каталог: {s.dir}").classes("text-xs opacity-60 break-all")
-        if ctx.access.admin:
-            ui.button("Повторить с правками", on_click=repeat).props("unelevated no-caps")
+        if s.sha and s.dir:
+            ui.button("Запустить с теми же параметрами", on_click=repeat).props("unelevated no-caps")
         if version_id is not None:
             ui.button(
                 "Лог упавшего воркера модели",
