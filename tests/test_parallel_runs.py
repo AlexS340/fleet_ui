@@ -10,6 +10,7 @@ from fleet_console.auth import Access, AccessDenied, Identity
 from fleet_console.compose import Preview, make_bench_id
 from fleet_console.compose.policy import private_root
 from fleet_console.observe.mlsc import created_version
+from fleet_console.runs import BenchError
 from fleet_console.settings import Quotas, Settings
 
 
@@ -151,7 +152,11 @@ def test_private_storage_and_exact_reconciliation():
     with pytest.raises(ValueError, match="закрытый S3"):
         private_root(settings)
     settings.results.private_s3_root = "s3://private/results"
+    settings.results.allow_shared_bucket = True
     assert private_root(settings) == "s3://private/results"
+    settings.results.private_s3_root = "s3://private"
+    with pytest.raises(ValueError, match="закрытый S3"):
+        private_root(settings)
     configuration = {"application_versions": {"7": {"application_name": "user | fleet-console run-a"},
                                                "8": {"application_name": "user | fleet-console run-ab"}}}
     assert created_version(configuration, "run-a") == 7
@@ -160,6 +165,24 @@ def test_private_storage_and_exact_reconciliation():
     configuration["application_versions"]["9"] = {"application_name": "other | fleet-console run-a"}
     with pytest.raises(RuntimeError):
         created_version(configuration, "run-a")
+
+
+async def test_signed_in_run_can_use_fleet_storage_when_enabled(h):
+    h.settings.results.private_s3_root = ""
+    spec, access = draft(h, "alice")
+    with pytest.raises(BenchError, match="results.allow_shared_bucket"):
+        await submit(h, spec, access)
+    assert not h.stages
+
+    h.settings.results.allow_shared_bucket = True
+    h.submitter = "done"
+    run = await submit(h, spec, access)
+    await h.mgr.tasks[run.id]
+    assert h.mgr.get(run.id).status == "done"
+    assert run.preview["s3"] == f"s3://b/ns/{run.model}/{run.id}"
+    assert "system.measure_run.read_only=true" in spec.overrides_file.read_text()
+    assert [row["run_id"] for row in h.store.measurements("alice")] == [run.id]
+    assert h.store.measurements("bob") == []
 
 
 async def test_two_accounts_keep_separate_completed_measurements(h):

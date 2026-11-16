@@ -9,6 +9,7 @@ import pytest
 from fleet_console.fleetref.profile import CONFIGS_REL
 from fleet_console.runner import Result
 from fleet_console.observe.mlsc import Version
+from fleet_console.settings import Settings
 from fleet_console.store import Session
 import fakes
 
@@ -95,10 +96,13 @@ async def test_fetch_button_and_dialogs(user: User) -> None:
 
 async def test_settings_page_saves(user: User) -> None:
     await user.open("/settings")
-    await user.should_see("Настройки")
+    user.find("Квоты и хранение результатов").click()
+    shared = user.find(kind=ui.checkbox).elements.pop()
+    assert shared.value is False
+    shared.set_value(True)
     user.find("Сохранить").click()
     await user.should_see("Сохранено")
-    assert fakes.CTX.paths.settings_file.exists()
+    assert Settings.load(fakes.CTX.paths).results.allow_shared_bucket is True
 
 
 async def test_cluster_page_shows_all_sources(user: User) -> None:
@@ -178,7 +182,7 @@ async def test_header_shows_sleep_guard(user: User) -> None:
         fakes.CTX.guard.last_sleep = None
 
 
-@pytest.mark.parametrize("job_priority", ["", "high"])
+@pytest.mark.parametrize("job_priority", ["", "low", "high"])
 async def test_models_page_sessions(user: User, job_priority: str) -> None:
     await user.open("/models")
     await user.should_see("Сессии моделей")
@@ -199,8 +203,8 @@ async def test_models_page_sessions(user: User, job_priority: str) -> None:
     user.find("Запустить подъём").click()
     await user.should_see("Занять GPU под модель?")
     await user.should_see("стадии: preflight → mlsc.create_job")
-    if job_priority == "high":
-        await user.should_see("приоритет джобы high")
+    if job_priority:
+        await user.should_see(f"приоритет джобы {job_priority}")
         await user.should_see("очередь MLSC shared")
     user.find("Да, поднять").click()
     await user.should_see("подъём начат")
@@ -214,7 +218,7 @@ async def test_models_page_sessions(user: User, job_priority: str) -> None:
             assert "job_priority_class=" not in stage.command
             assert "queue_name=" not in stage.command
         else:
-            assert "++mlsc.create_job.job.job_priority_class=high" in stage.command
+            assert f"++mlsc.create_job.job.job_priority_class={job_priority}" in stage.command
             assert "++mlsc.create_job.job.queue_name=shared" in stage.command
     assert "session:" + session.id in fakes.CTX.sleep_reasons()
     await fakes.CTX.sessions.stop(session.id)
@@ -251,7 +255,7 @@ async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy:
     ctx = fakes.CTX
     revision = await ctx.manager.prepare("master")
     ctx.settings.quotas.user_gpus = ctx.settings.quotas.total_gpus = 32
-    extra = ("++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", "++mlsc.create_job.job.job_priority_class=high",
+    extra = ("++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", "++mlsc.create_job.job.job_priority_class=low",
              "++mlsc.create_job.job.queue_name=shared")
     source = await ctx.sessions.start(revision, recipe="glm", model_name="GLM-personal", replicas=3,
                                       inference="nginx", ttl_minutes=85, extra=extra)
@@ -273,7 +277,7 @@ async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy:
     assert ctx.manager.prepared[-1] == source.sha
     assert _select(user, "Рецепт mlsc/model").value == "glm"
     assert _select(user, "Маршрут").value == "nginx"
-    assert _select(user, "Приоритет джобы").value == "high"
+    assert _select(user, "Приоритет джобы").value == "low"
     assert _select(user, "Очередь MLSC").value == "shared"
     numbers = {e.props["label"]: e for e in user.find(kind=ui.number).elements}
     assert numbers["Реплики"].value == 3 and numbers["Время жизни, мин"].value == 85
@@ -352,16 +356,16 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     queue.set_value("shared")
     assert not start.enabled
     await user.should_see("Обновите превью и preflight")
-    priority.set_value("high")
+    priority.set_value("low")
     user.find("Превью и preflight").click()
     await user.should_not_see("Обновите превью и preflight")
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
-    assert preview["Приоритет джобы"] == "high"
+    assert preview["Приоритет джобы"] == "low"
     assert "очередь shared" in preview["Модель"]
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     user.find(marker="start-bench").click()
     await user.should_see("Запустить прогон?")
-    await user.should_see("приоритет джобы high")
+    await user.should_see("приоритет джобы low")
     await user.should_see("очередь MLSC shared")
     await user.should_see("стадии: preflight → материализация → create_job → start_llm → check → upload → launch → исполнение → stop_llm → замер")
     user.find("Да, запустить").click()
@@ -371,7 +375,7 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     assert run.status == "done" and run.version_id == 777 and run.task_limit == 3 and run.agents_per_replica == 2 and run.id.startswith("glm-cowork-")
     stages = fakes.CTX.benches.stages(run.id)
     assert [s.stage for s in stages] == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "stop_llm", "measure"]
-    assert "++mlsc.create_job.job.job_priority_class=high" in stages[2].command
+    assert "++mlsc.create_job.job.job_priority_class=low" in stages[2].command
     assert "++mlsc.create_job.job.queue_name=shared" in stages[2].command
     assert fakes.CTX.store.get_run(run.id) is not None and run.preview["gpu_per_instance"] == 8 and run.preview["tasks_total"] is None
     exp = (fakes.CTX.paths.runs / run.id / "exp.yaml").read_text()

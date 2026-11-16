@@ -28,14 +28,15 @@ def settings_page(ctx: AppContext) -> None:
             requeue = ui.number("Раундов requeue упавших", value=s.bench.requeue_rounds, min=0, max=3, precision=0).classes("w-48 max-w-full")
             attention = ui.number("Автогашение без ответа, мин (0 — нет)", value=s.bench.attention_minutes, min=0, precision=0).classes("w-72 max-w-full")
             poll = ui.number("Опрос прогона, с", value=s.bench.poll_seconds, min=5, precision=0)
-        with ui.expansion("Квоты и приватные результаты").classes("w-full"):
+        with ui.expansion("Квоты и хранение результатов").classes("w-full"):
             with ui.row().classes("gap-4 flex-wrap"):
                 user_runs = ui.number("Заявок на пользователя", value=s.quotas.user_runs, min=1, precision=0)
                 total_runs = ui.number("Заявок всего", value=s.quotas.total_runs, min=1, precision=0)
                 user_gpus = ui.number("GPU на пользователя", value=s.quotas.user_gpus, min=1, precision=0)
                 total_gpus = ui.number("GPU всего", value=s.quotas.total_gpus, min=1, precision=0)
             private_s3 = ui.input("Закрытый S3-корень результатов", value=s.results.private_s3_root).classes("w-full")
-            ui.label("Для общего режима нужен отдельный бакет без доступа из общего Benchboard. Права хранилища настраивает оператор.").classes("text-sm opacity-70")
+            shared_bucket = ui.checkbox("Разрешить общий бакет Fleet, если закрытый путь пуст", value=s.results.allow_shared_bucket)
+            ui.label("Артефакты в общем бакете доступны тем, у кого уже есть права на чтение в S3.").classes("text-sm opacity-70")
         ui.label(
             f"Настройки: {ctx.paths.settings_file} · Данные сервиса: {ctx.paths.home}"
         ).classes("text-sm opacity-70 break-all")
@@ -58,6 +59,7 @@ def settings_page(ctx: AppContext) -> None:
             for name, element in (("user_runs", user_runs), ("total_runs", total_runs), ("user_gpus", user_gpus), ("total_gpus", total_gpus)):
                 setattr(s.quotas, name, max(1, int(element.value or 1)))
             s.results.private_s3_root = private_s3.value.strip().rstrip("/")
+            s.results.allow_shared_bucket = shared_bucket.value
             s.save(ctx.paths)
             ui.notify("Сохранено. Пробросы и зеркало применят новые значения после перезапуска сервиса.")
 

@@ -10,8 +10,11 @@ from fleet_console.settings import Settings
 
 def private_root(settings: Settings) -> str:
     root = settings.results.private_s3_root.strip().rstrip("/")
-    if not root and settings.auth.mode == "local":
-        return ""
+    if not root:
+        if settings.auth.mode == "local" or settings.results.allow_shared_bucket:
+            return ""
+        raise ValueError("Настройте закрытый S3-корень результатов (results.private_s3_root) "
+                         "или разрешите общий бакет Fleet (results.allow_shared_bucket)")
     parsed = urlparse(root)
     if (parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/")
             or parsed.query or parsed.fragment or not re.fullmatch(r"s3://[a-z0-9.-]+/[A-Za-z0-9/_-]+", root)

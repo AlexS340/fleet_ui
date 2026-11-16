@@ -9,12 +9,13 @@ from nicegui import ui
 from fleet_console.settings import scrub
 
 JOB_PRIORITY_OVERRIDE = "++mlsc.create_job.job.job_priority_class"
+JOB_PRIORITIES = ("low", "medium", "high")
 JOB_QUEUE_KEY = "mlsc.create_job.job.queue_name"
 JOB_QUEUES = ("gigacode", "shared")
 
 
 def job_priority_select() -> ui.select:
-    return ui.select({"": "Из рецепта", "medium": "medium", "high": "high"}, value="", label="Приоритет джобы").classes("w-40")
+    return ui.select({"": "Из рецепта", **{priority: priority for priority in JOB_PRIORITIES}}, value="", label="Приоритет джобы").classes("w-40")
 
 
 def job_queue_select() -> ui.select:

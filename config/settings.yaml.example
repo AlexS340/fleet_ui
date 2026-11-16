@@ -8,3 +8,6 @@ s3_read_profile: gcvmfleet_ro
 s3_write_profile: gcvmfleet
 auth:
   mode: local
+results:
+  private_s3_root: ""
+  allow_shared_bucket: false  # При включённом входе разрешить путь Fleet, если закрытый путь пуст.

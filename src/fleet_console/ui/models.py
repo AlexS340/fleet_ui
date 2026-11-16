@@ -19,7 +19,7 @@ from fleet_console.models.compose import recipe_summary
 from fleet_console.observe.mlsc import Version
 from fleet_console.settings import scrub
 from fleet_console.store import Session
-from fleet_console.ui.common import JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, text_dialog
+from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, text_dialog
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
 
 GATEWAY_OPTIONS = {"litellm": "litellm — маршрут fleet по умолчанию", "nginx": "nginx — vllm-proxy"}
@@ -152,7 +152,7 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
             priority = job_priority_select()
             queue = job_queue_select()
         saved_extra = list(options["extra"])
-        priority_values = {f"{JOB_PRIORITY_OVERRIDE}={value}": value for value in ("medium", "high")}
+        priority_values = {f"{JOB_PRIORITY_OVERRIDE}={value}": value for value in JOB_PRIORITIES}
         priority_overrides = [value for value in saved_extra if value.split("=", 1)[0].lstrip("+") == JOB_PRIORITY_OVERRIDE.lstrip("+")]
         if priority_overrides and priority_overrides[-1] in priority_values:
             priority.set_value(priority_values[priority_overrides[-1]])
@@ -197,7 +197,7 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
                 f"время жизни {int(ttl.value or 0)} мин, затем уведомление и гашение через {ctx.settings.session_grace_minutes} мин",
                 "стадии: preflight → mlsc.create_job → mlsc.start_llm → mlsc.check_llm_works; команды видны в карточке",
             ]
-            if job_priority in {"medium", "high"}:
+            if job_priority in JOB_PRIORITIES:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={job_priority}")
                 lines.insert(2, f"приоритет джобы {job_priority}")
             if queue.value in JOB_QUEUES:

@@ -163,6 +163,7 @@ class Results(BaseModel):
     # Отдельный закрытый bucket/prefix, недоступный учётным записям общего Benchboard.
     # Права bucket настраивает оператор; Console не меняет IAM/ACL.
     private_s3_root: str = ""
+    allow_shared_bucket: bool = False
 
 
 class Settings(BaseModel):

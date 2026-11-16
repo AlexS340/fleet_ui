@@ -55,7 +55,7 @@ from fleet_console.presets import DatasetRef, compatibility, load_presets
 from fleet_console.runs import STAGE_TITLES, BenchError, dataset_of
 from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
 from fleet_console.store import BenchRun
-from fleet_console.ui.common import JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, text_dialog
+from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, text_dialog
 from fleet_console.ui.header import build_header
 from fleet_console.ui.local_datasets import local_panel
 
@@ -445,7 +445,7 @@ def _new_bench_dialog(ctx: AppContext, after, local: LocalDataset | None = None)
                 recipe = session.recipe
             overrides = ([line.strip() for line in (extra.value or "").splitlines() if line.strip()] if admin
                          else list(preset.overrides) if preset else [])
-            if not session and priority.value in {"medium", "high"}:
+            if not session and priority.value in JOB_PRIORITIES:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={priority.value}")
             if not session and queue.value in JOB_QUEUES:
                 overrides.append(f"++{JOB_QUEUE_KEY}={queue.value}")
