@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin'))
 );
+CREATE TABLE IF NOT EXISTS run_coauthors (
+    run_id TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    PRIMARY KEY(run_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS drafts (
     id TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -161,6 +166,19 @@ class Event:
     object: str
     result: str
     details: str
+    actor_id: str = ""
+
+
+@dataclass(frozen=True)
+class UserAccount:
+    id: str
+    role: str
+    display_name: str
+    enabled: bool
+    run_limit: int | None
+    gpu_limit: int | None
+    session_version: int
+    has_password: bool
 
 
 @dataclass(frozen=True)
@@ -320,6 +338,18 @@ class Store:
             for table in ("runs", "sessions", "bench_runs"):
                 if not any(row["name"] == "owner_id" for row in self.conn.execute(f"PRAGMA table_info({table})")):
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT NOT NULL DEFAULT '{LOCAL_OWNER}'")
+            self._add_columns("users", {
+                "display_name": "TEXT NOT NULL DEFAULT ''", "enabled": "INTEGER NOT NULL DEFAULT 1",
+                "run_limit": "INTEGER", "gpu_limit": "INTEGER", "password_hash": "TEXT",
+                "session_version": "INTEGER NOT NULL DEFAULT 0", "role_managed": "INTEGER NOT NULL DEFAULT 0",
+            })
+            self._add_columns("events", {"actor_id": "TEXT NOT NULL DEFAULT ''"})
+
+    def _add_columns(self, table: str, definitions: dict[str, str]) -> None:
+        present = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in definitions.items():
+            if name not in present:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def register_user(self, user_id: str, admin: bool = False) -> None:
         if not admin and self.conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
@@ -327,11 +357,68 @@ class Store:
         with self.conn:
             self.conn.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
             if admin:
-                self.conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", (user_id,))
+                self.conn.execute("UPDATE users SET role = 'admin' WHERE id = ? AND role_managed = 0", (user_id,))
 
     def is_admin(self, user_id: str) -> bool:
-        row = self.conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
-        return row is not None and row["role"] == "admin"
+        row = self.conn.execute("SELECT 1 FROM users WHERE id=? AND role='admin' AND enabled", (user_id,)).fetchone()
+        return row is not None
+
+    def user(self, user_id: str) -> UserAccount | None:
+        return next(iter(self._users("WHERE id=?", (user_id,))), None)
+
+    def users(self) -> list[UserAccount]:
+        return self._users("ORDER BY id", ())
+
+    def _users(self, clause: str, args: tuple) -> list[UserAccount]:
+        return [UserAccount(**dict(row)) for row in self.conn.execute(
+            "SELECT id, role, display_name, enabled, run_limit, gpu_limit, session_version,"
+            " password_hash IS NOT NULL AS has_password FROM users " + clause, args,
+        )]
+
+    def user_limits(self, user_id: str, quotas) -> tuple[int, int]:
+        user = self.user(user_id)
+        return (user.run_limit if user and user.run_limit is not None else quotas.user_runs,
+                user.gpu_limit if user and user.gpu_limit is not None else quotas.user_gpus)
+
+    def update_user(self, actor: str, user_id: str, *, role: str, enabled: bool, display_name: str,
+                    run_limit: int | None, gpu_limit: int | None) -> None:
+        if role not in {"user", "admin"} or len(display_name) > 100 or any(
+            value is not None and (type(value) is not int or not 1 <= value <= 1_000_000)
+            for value in (run_limit, gpu_limit)
+        ):
+            raise ValueError("Проверьте роль, имя (до 100 символов) и квоты (целые числа от 1 до 1 000 000)")
+        if actor == user_id and (not enabled or role != "admin"):
+            raise ValueError("Нельзя отключить свой аккаунт или снять с себя права администратора")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            old = self.user(user_id)
+            if old is None:
+                raise ValueError("Пользователь не найден")
+            self.conn.execute(
+                "UPDATE users SET role=?, enabled=?, display_name=?, run_limit=?, gpu_limit=?, role_managed=1,"
+                " session_version=session_version+? WHERE id=?",
+                (role, enabled, display_name, run_limit, gpu_limit, int(old.enabled != enabled or old.role != role), user_id),
+            )
+            self._record_event("admin_user", user_id, "ok", json.dumps({
+                "role": role, "enabled": enabled, "display_name": display_name, "run_limit": run_limit, "gpu_limit": gpu_limit,
+            }, ensure_ascii=False), actor)
+
+    def password_hash(self, user_id: str) -> str | None:
+        row = self.conn.execute("SELECT password_hash FROM users WHERE id=?", (user_id,)).fetchone()
+        return row["password_hash"] if row else None
+
+    def seed_password(self, user_id: str, password_hash: str) -> None:
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
+            self.conn.execute("UPDATE users SET password_hash=? WHERE id=? AND password_hash IS NULL", (password_hash, user_id))
+
+    def reset_password(self, actor: str, user_id: str, password_hash: str) -> None:
+        with self.conn:
+            changed = self.conn.execute("UPDATE users SET password_hash=?, session_version=session_version+1 WHERE id=?",
+                                        (password_hash, user_id)).rowcount
+            if not changed:
+                raise ValueError("Пользователь не найден")
+            self._record_event("admin_password", user_id, "ok", "", actor)
 
     def migrate_owner(self, owner_id: str) -> None:
         with self.conn:
@@ -384,6 +471,10 @@ class Store:
             request = self.request(request_id)
             if request is None or request["state"] != "queued":
                 return False
+            user = self.user(request["owner_id"])
+            if user and not user.enabled:
+                return False
+            run_limit, gpu_limit = self.user_limits(request["owner_id"], quotas)
             active = list(self.conn.execute("SELECT owner_id, gpu, slots FROM requests WHERE state='reserved'"))
             # Старые активные объекты без резерва: неизвестный расход блокирует новые GPU,
             # пока оператор не завершит их. Терминальные записи историю квот не занимают.
@@ -400,9 +491,9 @@ class Store:
                     return False
             own = [r for r in active if r["owner_id"] == request["owner_id"]]
             if (sum(r["slots"] for r in active) + request["slots"] > quotas.total_runs
-                    or sum(r["slots"] for r in own) + request["slots"] > quotas.user_runs
+                    or sum(r["slots"] for r in own) + request["slots"] > run_limit
                     or sum(r["gpu"] for r in active) + request["gpu"] > quotas.total_gpus
-                    or sum(r["gpu"] for r in own) + request["gpu"] > quotas.user_gpus):
+                    or sum(r["gpu"] for r in own) + request["gpu"] > gpu_limit):
                 return False
             self.conn.execute("UPDATE requests SET state='reserved' WHERE id=?", (request_id,))
             table, status = ("bench_runs", "running") if request["kind"] == "bench" else ("sessions", "starting")
@@ -448,8 +539,9 @@ class Store:
             if gpu <= request["gpu"]:
                 return  # уменьшение освобождается только после подтверждённого гашения
             rows = list(self.conn.execute("SELECT owner_id, gpu FROM requests WHERE state='reserved' AND id<>?", (request_id,)))
+            _, gpu_limit = self.user_limits(request["owner_id"], quotas)
             if (gpu + sum(r["gpu"] for r in rows) > quotas.total_gpus
-                    or gpu + sum(r["gpu"] for r in rows if r["owner_id"] == request["owner_id"]) > quotas.user_gpus):
+                    or gpu + sum(r["gpu"] for r in rows if r["owner_id"] == request["owner_id"]) > gpu_limit):
                 raise ValueError("Для увеличения числа реплик не хватает квоты GPU")
             self.conn.execute("UPDATE requests SET gpu=? WHERE id=?", (gpu, request_id))
 
@@ -476,7 +568,8 @@ class Store:
     def measurements(self, owner_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT m.* FROM measurements m JOIN bench_runs b ON b.id=m.run_id"
-            " WHERE b.owner_id=? ORDER BY m.measured_at DESC", (owner_id,),
+            " WHERE b.owner_id=? OR EXISTS (SELECT 1 FROM run_coauthors c WHERE c.run_id=b.id AND c.user_id=?)"
+            " ORDER BY m.measured_at DESC", (owner_id, owner_id),
         ).fetchall()
 
     def measurement(self, run_id: str) -> sqlite3.Row | None:
@@ -510,10 +603,17 @@ class Store:
     # --- события ---------------------------------------------------------
     def event(self, action: str, obj: str, result: str, details: str = "") -> None:
         with self.conn:
-            self.conn.execute(
-                "INSERT INTO events (ts, action, object, result, details) VALUES (?, ?, ?, ?, ?)",
-                (_now(), action, obj, result, details),
-            )
+            self._record_event(action, obj, result, details, "")
+
+    def _record_event(self, action: str, obj: str, result: str, details: str, actor_id: str) -> None:
+        self.conn.execute(
+            "INSERT INTO events (ts, action, object, result, details, actor_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (_now(), action, obj, result, details, actor_id),
+        )
+
+    def admin_events(self, limit: int = 50) -> list[Event]:
+        rows = self.conn.execute("SELECT * FROM events WHERE actor_id<>'' ORDER BY id DESC LIMIT ?", (limit,))
+        return [Event(**dict(r)) for r in rows]
 
     def events(self, limit: int = 100) -> list[Event]:
         rows = self.conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -571,6 +671,47 @@ class Store:
     def forget_run(self, run_id: str) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+            if self.get_bench(run_id) is None:
+                self.conn.execute("DELETE FROM run_coauthors WHERE run_id=?", (run_id,))
+
+    def run_ownership(self, run_id: str) -> tuple[str, list[str]] | None:
+        row = self.conn.execute(
+            "SELECT owner_id FROM bench_runs WHERE id=? UNION ALL SELECT owner_id FROM runs WHERE run_id=? LIMIT 1",
+            (run_id, run_id),
+        ).fetchone()
+        if row is None:
+            return None
+        authors = self.conn.execute("SELECT user_id FROM run_coauthors WHERE run_id=? ORDER BY user_id", (run_id,))
+        return row["owner_id"], [r["user_id"] for r in authors]
+
+    def has_run_access(self, run_id: str, user_id: str) -> bool:
+        ownership = self.run_ownership(run_id)
+        return ownership is not None and (ownership[0] == user_id or user_id in ownership[1])
+
+    def set_run_ownership(self, actor: str, run_id: str, owner_id: str, coauthors: list[str]) -> None:
+        authors = sorted(set(coauthors) - {owner_id})
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            old = self.run_ownership(run_id)
+            if old is None:
+                raise ValueError("Прогон не найден")
+            if ((owner_id != old[0] and self.user(owner_id) is None)
+                    or any(self.user(user_id) is None for user_id in authors)):
+                raise ValueError("Выберите существующих пользователей")
+            if old == (owner_id, authors):
+                return
+            self.conn.execute("UPDATE bench_runs SET owner_id=? WHERE id=?", (owner_id, run_id))
+            self.conn.execute("UPDATE runs SET owner_id=? WHERE run_id=?", (owner_id, run_id))
+            self.conn.execute("DELETE FROM run_coauthors WHERE run_id=?", (run_id,))
+            self.conn.executemany("INSERT INTO run_coauthors VALUES (?, ?)", [(run_id, user_id) for user_id in authors])
+            removed = {old[0], *old[1]} - {owner_id, *authors}
+            if removed:
+                self.conn.execute("UPDATE measurement_links SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL", (_now(), run_id))
+            # Заявка остаётся за тем, кто её отправил: её ключ повтора, квота и сессия модели не меняются.
+            self._record_event("admin_run", run_id, "ok", json.dumps({
+                "previous_owner": old[0], "previous_coauthors": old[1], "owner": owner_id,
+                "coauthors": authors, "links_revoked": bool(removed),
+            }, ensure_ascii=False), actor)
 
     # --- сессии моделей --------------------------------------------------
     def create_session(self, s: Session) -> None:

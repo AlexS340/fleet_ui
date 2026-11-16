@@ -13,7 +13,7 @@ import shlex
 import httpx
 from nicegui import ui
 
-from fleet_console.auth import IDENTITY, Access, AccessDenied, Identity
+from fleet_console.auth import Access, AccessDenied, Identity, scope_identity
 from fleet_console.catalog import CatalogEntry, scan
 from fleet_console.connect.gateway import Gateway, free_port, parse_target, probe
 from fleet_console.connect.kube import Kube, KubeStatus, required_checks
@@ -67,7 +67,7 @@ class AppContext:
     def access(self) -> Access:
         if self.settings.auth.mode == "local":
             return Access(self.store, Identity(LOCAL_OWNER))
-        identity = ui.context.client.request.scope.get(IDENTITY)
+        identity = scope_identity(ui.context.client.request.scope)
         if identity is None:
             raise AccessDenied()
         return Access(self.store, identity)

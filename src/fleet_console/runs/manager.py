@@ -351,7 +351,8 @@ class BenchManager:
                                run_dir=spec.run_dir, session=spec.session.id if spec.session else "")
         self._validate_resolved(spec, resolved, actual)
         try:
-            gpu = check_gpu(0 if spec.session else actual.gpu_total, self.settings)
+            _, user_limit = self.store.user_limits(access.id if access else LOCAL_OWNER, self.settings.quotas)
+            gpu = check_gpu(0 if spec.session else actual.gpu_total, self.settings, user_limit=user_limit)
         except ValueError as exc:
             raise BenchError(str(exc)) from exc
         preview = actual
@@ -575,7 +576,7 @@ class BenchManager:
                         version_id = mlsc.created_version(configuration, run_id)
                         (Path(run.dir) / "version_id").write_text(str(version_id))
                         self.store.update_bench(run_id, version_id=version_id)
-                        self.store.adopt_run(run_id, version_id, model=run.model, note="запущен сервисом", owner_id=run.owner_id)
+                        self.store.adopt_run(run_id, version_id, model=run.model, note="запущен сервисом", owner_id=self.get(run_id).owner_id)
                     if not mlsc.is_stopped(configuration, version_id):
                         remaining.append(f"версия MLSC {version_id} ещё активна")
                 if remaining:

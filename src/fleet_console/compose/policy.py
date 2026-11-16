@@ -34,9 +34,9 @@ def supports_private_measure(worktree: Path) -> bool:
                        and field.target.id == "read_only" for field in n.body) for n in tree.body)
 
 
-def check_gpu(gpu: int | None, settings: Settings) -> int:
+def check_gpu(gpu: int | None, settings: Settings, *, user_limit: int | None = None) -> int:
     if type(gpu) is not int or gpu < 0:
         raise ValueError("Не удалось определить число GPU из итогового конфига; заявка не принята")
-    if gpu > min(settings.quotas.user_gpus, settings.quotas.total_gpus):
+    if gpu > min(user_limit if user_limit is not None else settings.quotas.user_gpus, settings.quotas.total_gpus):
         raise ValueError(f"Заявка требует {gpu} GPU и превышает квоту; уменьшите число реплик")
     return gpu

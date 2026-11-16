@@ -226,7 +226,8 @@ class SessionManager:
         spec.resolved.write_text(scrub(result.stdout, [self.token() or ""]))
         try:
             preview = from_resolved(yaml.safe_load(spec.resolved.read_text()))
-            gpu = check_gpu(preview.gpu_total, self.settings)
+            _, user_limit = self.store.user_limits(access.id if access else LOCAL_OWNER, self.settings.quotas)
+            gpu = check_gpu(preview.gpu_total, self.settings, user_limit=user_limit)
             if preview.model != model or preview.replicas != replicas:
                 raise ValueError("Итоговый конфиг меняет маршрут модели или число реплик")
         except (ValueError, TypeError, yaml.YAMLError) as exc:
@@ -331,7 +332,9 @@ class SessionManager:
         if self.store.request(session_id):
             preview = from_resolved(yaml.safe_load((Path(session.dir) / "resolved.yaml").read_text()))
             try:
-                self.store.grow_reservation(session_id, check_gpu(count * preview.gpu_per_instance, self.settings), self.settings.quotas)
+                _, user_limit = self.store.user_limits(session.owner_id, self.settings.quotas)
+                gpu = check_gpu(count * preview.gpu_per_instance, self.settings, user_limit=user_limit)
+                self.store.grow_reservation(session_id, gpu, self.settings.quotas)
             except (ValueError, TypeError) as exc:
                 raise SessionError(str(exc)) from exc
         ok = await self._stage(session_id, await self.spec(session), "start_llm", jobs=count)

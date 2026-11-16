@@ -10,6 +10,7 @@ from fleet_console.store import BenchRun, Session
 
 fakes.CTX = ctx = fakes.make_context()
 ctx.settings.auth.mode = "test"
+ctx.settings.auth.admins = ["operator"]
 ctx.settings.auth.legacy_owner = "alice"
 now = fakes.NOW.isoformat()
 for owner, score in (("alice", 75), ("bob", 50)):
@@ -29,5 +30,5 @@ for owner, score in (("alice", 75), ("bob", 50)):
         "infra_errors": 1, "timeouts": 0, "unattempted": 0,
     }])
 ctx.store.reserve_draft("alice-draft", "@local")
-create_app(ctx, TestIdentityAdapter({"alice": "alice-test", "bob": "bob-test"}))
-ui.run(reload=False, show=False)
+create_app(ctx, TestIdentityAdapter({"alice": "alice-test", "bob": "bob-test", "operator": "operator-test"}))
+ui.run(host="127.0.0.1", reload=False, show=False)

@@ -7,17 +7,19 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import pbkdf2_hmac
 from hmac import compare_digest
-from secrets import token_urlsafe
+from secrets import token_bytes, token_urlsafe
 from urllib.parse import parse_qs, urlencode
 
 from nicegui import Client, core
 from starlette.requests import HTTPConnection, Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
-from fleet_console.store.db import LOCAL_OWNER, Store
+from fleet_console.store.db import LOCAL_OWNER, BenchRun, OwnRun, Store
 
 IDENTITY = "fleet_console.identity"
+SESSION_VALID = "fleet_console.session_valid"
 SHARE_PATH = re.compile(r"/measurements/shared/[A-Za-z0-9_-]{43}")
 
 
@@ -49,7 +51,18 @@ class Access:
         return self.id == LOCAL_OWNER or self.store.is_admin(self.id)
 
     def allows(self, item) -> bool:
-        return item is not None and (self.admin or item.owner_id == self.id)
+        if item is None:
+            return False
+        if self.id == LOCAL_OWNER:
+            return True
+        user = self.store.user(self.id)
+        if user and not user.enabled:
+            return False
+        if user and user.role == "admin":
+            return True
+        if isinstance(item, (BenchRun, OwnRun)):
+            return self.store.has_run_access(item.id if isinstance(item, BenchRun) else item.run_id, self.id)
+        return item.owner_id == self.id
 
     def require(self, item):
         if not self.allows(item):
@@ -68,32 +81,56 @@ class Access:
 
     def draft(self, draft_id: str) -> None:
         # Открытый черновик привязан к создавшему его клиенту даже для администраторов.
-        if self.store.draft_owner(draft_id) != self.id:
+        user = self.store.user(self.id)
+        if (user and not user.enabled) or self.store.draft_owner(draft_id) != self.id:
             raise AccessDenied()
 
 
+def _password_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt if salt is not None else token_bytes(16)
+    digest = pbkdf2_hmac("sha256", password.encode(), salt, 600_000)
+    return f"{salt.hex()}:{digest.hex()}"
+
+
+async def hash_new_password(password: str) -> str:
+    if not 12 <= len(password) <= 256 or not password.strip():
+        raise ValueError("Введите новый пароль длиной от 12 до 256 символов")
+    return await asyncio.to_thread(_password_hash, password)
+
+
 class TestIdentityAdapter:
-    """Вход для изолированного стенда. Учётные данные задаёт оператор процесса."""
+    """Вход для стенда: исходные пароли задаёт оператор, сброс сохраняется в SQLite."""
 
     cookie = "fleet_test_session"
 
     def __init__(self, accounts: dict[str, str]) -> None:
-        self.accounts = accounts
-        self.tokens = {name: token_urlsafe(32) for name in accounts}
-        self.identities = {token: Identity(name) for name, token in self.tokens.items()}
+        self._seed = dict(accounts)
+        self.tokens: dict[str, str] = {}
+        self.sessions: dict[str, tuple[str, int]] = {}
+
+    def bind(self, store: Store) -> None:
+        self.store = store
+        for user, password in self._seed.items():
+            if store.password_hash(user) is None:
+                store.seed_password(user, _password_hash(password))
+        self._seed.clear()
 
     @classmethod
     def from_env(cls, value: str) -> TestIdentityAdapter:
         accounts = json.loads(value)
         if not isinstance(accounts, dict) or any(
-            not isinstance(password, str) or not password or not name or name == LOCAL_OWNER
+            not isinstance(password, str) or not password or not name.strip() or name == LOCAL_OWNER
             for name, password in accounts.items()
         ):
             raise ValueError("FLEET_CONSOLE_TEST_USERS должен содержать JSON-словарь логинов и непустых паролей")
         return cls(accounts)
 
     def __call__(self, conn: HTTPConnection) -> Identity | None:
-        return self.identities.get(conn.cookies.get(self.cookie, ""))
+        session = self.sessions.get(conn.cookies.get(self.cookie, ""))
+        if session is None:
+            return None
+        user = self.store.user(session[0])
+        return Identity(user.id) if user and user.enabled and user.session_version == session[1] else None
 
     async def login(self, request: Request):
         next_path = request.query_params.get("next", "")
@@ -102,11 +139,23 @@ class TestIdentityAdapter:
             form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
             user = form.get("user", [""])[0]
             password = form.get("password", [""])[0]
-            expected = self.accounts.get(user)
-            if expected is not None and compare_digest(password.encode(), expected.encode()):
-                response = RedirectResponse(next_path, status_code=303, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
-                response.set_cookie(self.cookie, self.tokens[user], httponly=True, samesite="lax", secure=request.url.scheme == "https")
-                return response
+            account = self.store.user(user)
+            expected = self.store.password_hash(user)
+            if account and account.enabled and expected:
+                actual = await asyncio.to_thread(_password_hash, password, bytes.fromhex(expected.split(":", 1)[0]))
+                current = self.store.user(user)
+                if current and current.enabled and current.session_version == account.session_version and compare_digest(actual, expected):
+                    previous = self.tokens.get(user)
+                    if previous and self.sessions[previous] == (user, current.session_version):
+                        token = previous
+                    else:
+                        if previous:
+                            self.sessions.pop(previous)
+                        token = self.tokens[user] = token_urlsafe(32)
+                        self.sessions[token] = (user, current.session_version)
+                    response = RedirectResponse(next_path, status_code=303, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+                    response.set_cookie(self.cookie, token, httponly=True, samesite="lax", secure=request.url.scheme == "https")
+                    return response
         invalid = "<p>Проверьте логин и пароль.</p>" if request.method == "POST" else ""
         return HTMLResponse(
             '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
@@ -142,7 +191,13 @@ class IdentityMiddleware:
             previous = _identity_id((core.sio.environ.get(sid) or {}).get("asgi.scope", {}))
             if identity is None or previous != identity.id:
                 identity = None
-        if identity is None or not identity.id.strip() or identity.id == LOCAL_OWNER:
+        account = None
+        if identity is not None and identity.id.strip() and identity.id != LOCAL_OWNER:
+            self.store.register_user(identity.id)
+            account = self.store.user(identity.id)
+        if account is None or not account.enabled:
+            identity = None
+        if identity is None:
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             else:
@@ -157,8 +212,14 @@ class IdentityMiddleware:
                 await response(scope, receive, send)
             return
 
-        self.store.register_user(identity.id)
         scope[IDENTITY] = identity
+        version = account.session_version
+
+        def session_valid() -> bool:
+            current = self.store.user(identity.id)
+            return current is not None and current.enabled and current.session_version == version
+
+        scope[SESSION_VALID] = session_valid
 
         async def private_send(message):
             if message["type"] == "http.response.start":
@@ -171,8 +232,13 @@ class IdentityMiddleware:
         await self.app(scope, receive, private_send)
 
 
+def scope_identity(scope: dict) -> Identity | None:
+    valid = scope.get(SESSION_VALID)
+    return scope.get(IDENTITY) if valid is None or valid() else None
+
+
 def _identity_id(scope: dict) -> str | None:
-    identity = scope.get(IDENTITY)
+    identity = scope_identity(scope)
     return identity.id if identity is not None else None
 
 
@@ -181,8 +247,11 @@ def socket_allowed(sid: str, client_id: str, *, joined: bool) -> bool:
     client = Client.instances.get(client_id)
     if client is None:
         return False
-    actual = _identity_id((core.sio.get_environ(sid) or {}).get("asgi.scope", {}))
+    scope = (core.sio.get_environ(sid) or {}).get("asgi.scope", {})
+    actual = _identity_id(scope)
     expected = _identity_id(client.request.scope)
+    if actual is None and (IDENTITY in scope or IDENTITY in client.request.scope):
+        return False
     return actual == expected and (not joined or client_id in core.sio.rooms(sid))
 
 

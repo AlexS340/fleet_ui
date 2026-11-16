@@ -1077,6 +1077,17 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
 
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
         ui.label(run.id).classes("text-lg break-all")
+        if ctx.settings.auth.mode != "local":
+            owner, coauthors = ctx.store.run_ownership(run.id)
+
+            def name(user_id: str) -> str:
+                account = ctx.store.user(user_id)
+                return (account.display_name if account else "") or user_id
+
+            byline = f"Владелец: {name(owner)}"
+            if coauthors:
+                byline += " · Соавторы: " + ", ".join(map(name, coauthors))
+            ui.label(byline).classes("text-sm break-all")
         remaining = _remaining_resources(ctx, run)
         facts = [
             _status_text(run),

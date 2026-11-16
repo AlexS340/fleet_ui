@@ -10,6 +10,7 @@ from starlette.responses import PlainTextResponse
 from fleet_console.auth import AccessDenied, IdentityAdapter, IdentityMiddleware, TestIdentityAdapter, install_socket_guard
 from fleet_console.context import AppContext, build_context
 from fleet_console.settings import read_secret
+from fleet_console.ui.admin import admin_page
 from fleet_console.ui.benches import benches_page
 from fleet_console.ui.cluster import cluster_page
 from fleet_console.ui.models import models_page
@@ -28,6 +29,7 @@ def create_app(ctx: AppContext, identity_adapter: IdentityAdapter | None = None)
             adapter = identity_adapter if isinstance(identity_adapter, TestIdentityAdapter) else TestIdentityAdapter.from_env(
                 read_secret(ctx.paths, "FLEET_CONSOLE_TEST_USERS") or "{}"
             )
+            adapter.bind(ctx.store)
             app.add_api_route("/test-login", adapter.login, methods=["GET", "POST"], include_in_schema=False)
             identity_adapter = adapter
         elif isinstance(identity_adapter, TestIdentityAdapter):
@@ -95,6 +97,12 @@ def create_app(ctx: AppContext, identity_adapter: IdentityAdapter | None = None)
         if not ctx.access.admin:
             return PlainTextResponse("Требуются права администратора", status_code=403)
         settings_page(ctx)
+
+    @ui.page("/admin")
+    def admin():
+        if not ctx.access.admin:
+            return PlainTextResponse("Требуются права администратора", status_code=403)
+        admin_page(ctx)
 
     app.on_startup(ctx.startup)
     app.on_shutdown(ctx.shutdown)

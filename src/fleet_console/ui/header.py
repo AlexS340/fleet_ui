@@ -7,6 +7,7 @@ import shlex
 
 from nicegui import ui
 
+from fleet_console.auth import AccessDenied
 from fleet_console.context import AppContext
 from fleet_console.fleetref.manager import PrepareError
 
@@ -56,9 +57,22 @@ def build_header(ctx: AppContext) -> None:
         ui.space()
         if ctx.access.admin:
             ui.link("Настройки", "/settings").classes("text-white")
+            ui.link("Админка", "/admin").classes("text-white")
         if ctx.settings.auth.mode != "local":
-            ui.label(ctx.access.identity.name or ctx.access.id).classes("text-sm text-white")
-    ui.timer(2.0, status_row.refresh)
+            access = ctx.access
+            account = ctx.store.user(access.id)
+            ui.label((account.display_name if account else "") or access.identity.name or access.id).classes("text-sm text-white")
+
+    def refresh() -> None:
+        try:
+            _ = ctx.access
+        except AccessDenied:
+            timer.deactivate()
+            ui.navigate.to("/test-login" if ctx.settings.auth.mode == "test" else "/")
+            return
+        status_row.refresh()
+
+    timer = ui.timer(2.0, refresh)
 
 
 def _chip(text: str, color: str, on_click) -> None:
