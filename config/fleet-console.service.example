@@ -1,0 +1,13 @@
+[Unit]
+Description=Fleet Console
+
+[Service]
+WorkingDirectory=%h/src/fleet_ui
+Environment=PATH=/cache/miniconda/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/cache/miniconda/bin/uv run fleet-console
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

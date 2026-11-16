@@ -7,3 +7,11 @@ __pycache__/
 *.sqlite-journal
 .DS_Store
 screenshots/
+/.fleet-console/
+/config/*
+!/config/settings.yaml.example
+!/config/kubeconfig.example
+!/config/ssh_config.example
+!/config/aws-credentials.example
+!/config/secrets.env.example
+!/config/fleet-console.service.example

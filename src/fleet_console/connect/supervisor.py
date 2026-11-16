@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
@@ -32,16 +32,18 @@ class ProcessLike(Protocol):
 Spawner = Callable[[Sequence[str], Path | None], Awaitable[ProcessLike]]
 
 
-async def subprocess_spawner(argv: Sequence[str], log_path: Path | None) -> ProcessLike:
+async def subprocess_spawner(
+    argv: Sequence[str], log_path: Path | None, *, env: Mapping[str, str] | None = None
+) -> ProcessLike:
     """Запуск процесса, stdout+stderr — в лог (append)."""
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("ab") as log:
             return await asyncio.create_subprocess_exec(
-                *argv, stdout=log, stderr=asyncio.subprocess.STDOUT, start_new_session=True
+                *argv, stdout=log, stderr=asyncio.subprocess.STDOUT, start_new_session=True, env=env
             )
     return await asyncio.create_subprocess_exec(
-        *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True
+        *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True, env=env
     )
 
 

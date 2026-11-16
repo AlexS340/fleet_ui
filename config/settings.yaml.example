@@ -1,0 +1,10 @@
+ui_port: 18082
+allowed_contexts: [internal]
+bastion:
+  ssh_host: gigacode-bastion
+  socks_proxy: socks5h://127.0.0.1:11080
+datasets_root: ../.fleet-console/datasets
+s3_read_profile: gcvmfleet_ro
+s3_write_profile: gcvmfleet
+auth:
+  mode: local

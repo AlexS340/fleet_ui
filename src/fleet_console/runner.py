@@ -214,6 +214,12 @@ def _merged_env(extra: Mapping[str, str] | None) -> dict[str, str]:
 class SubprocessRunner:
     """Настоящий запуск через asyncio.create_subprocess_exec."""
 
+    def __init__(self, base_env: Mapping[str, str] | None = None) -> None:
+        self._base_env = dict(base_env or {})
+
+    def environment(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
+        return _merged_env({**self._base_env, **(extra or {})})
+
     async def run(
         self,
         argv: Argv,
@@ -227,7 +233,7 @@ class SubprocessRunner:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
-            env=_merged_env(env),
+            env=self.environment(env),
             stdin=asyncio.subprocess.PIPE if stdin is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -260,7 +266,7 @@ class SubprocessRunner:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
-            env=_merged_env(env),
+            env=self.environment(env),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -311,7 +317,7 @@ class SubprocessRunner:
         proc = await asyncio.create_subprocess_exec(
             *detached_argv(argv, files, marker),
             cwd=cwd,
-            env=_merged_env(env),
+            env=self.environment(env),
             start_new_session=True,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,

@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, partial
 from pathlib import Path
 import shlex
 
@@ -29,7 +29,7 @@ from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
 from fleet_console.runner import CommandError, Runner, SubprocessRunner
 from fleet_console.runs import BenchManager
-from fleet_console.settings import OVERLAY_DIR, SECRET_NAMES, Paths, Settings, aws_secret_names, default_home, read_secret, secrets_env
+from fleet_console.settings import OVERLAY_DIR, SECRET_NAMES, Paths, Settings, aws_secret_names, read_secret, secrets_env
 from fleet_console.store import Store
 from fleet_console.store.db import LOCAL_OWNER
 
@@ -314,9 +314,9 @@ class AppContext:
 
 
 def build_context(home: Path | None = None) -> AppContext:
-    paths = Paths(home or default_home()).ensure()
+    paths = (Paths(home) if home is not None else Paths.for_project()).ensure()
     settings = Settings.load(paths)
-    runner = SubprocessRunner()
+    runner = SubprocessRunner(paths.subprocess_env())
     store = Store(paths.db)
     kube = Kube(runner, settings.allowed_contexts)
     mirror = Mirror(runner, paths, settings.fleet_remote)
@@ -324,17 +324,18 @@ def build_context(home: Path | None = None) -> AppContext:
     forwards: list[Forward] = []
     host = settings.bastion.ssh_host
     if host:
+        ssh = paths.ssh_command()
         forwards.append(
             Forward(
                 BASTION,
                 "бастион",
-                ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", host],
+                [*ssh, "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", host],
                 health=kube.readyz,
-                hint=f"Порты берутся из ~/.ssh/config (Host {host}). Руками: ssh -N {host}",
+                hint=f"Руками: {shlex.join([*ssh, '-N', host])}",
             )
         )
     # Проброс до Argo Server пока не делаем (решение 2026-10-21): наблюдение идёт через CRD по Kubernetes API.
-    supervisor = Supervisor(forwards, subprocess_spawner, log_dir=paths.logs)
+    supervisor = Supervisor(forwards, partial(subprocess_spawner, env=runner.environment()), log_dir=paths.logs)
 
     def sync_gate() -> str | None:
         if host and supervisor.state(BASTION).status != "green":

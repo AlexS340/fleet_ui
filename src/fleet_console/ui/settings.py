@@ -37,7 +37,7 @@ def settings_page(ctx: AppContext) -> None:
             private_s3 = ui.input("Закрытый S3-корень результатов", value=s.results.private_s3_root).classes("w-full")
             ui.label("Для общего режима нужен отдельный бакет без доступа из общего Benchboard. Права хранилища настраивает оператор.").classes("text-sm opacity-70")
         ui.label(
-            f"Данные сервиса: {ctx.paths.home} · MLSC_TOKEN — окружение или {ctx.paths.secrets_env.name}; ключи S3 — профиль gcvmfleet в ~/.aws/credentials"
+            f"Настройки: {ctx.paths.settings_file} · Данные сервиса: {ctx.paths.home}"
         ).classes("text-sm opacity-70 break-all")
 
         def save() -> None:

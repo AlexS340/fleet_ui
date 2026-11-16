@@ -1,0 +1,18 @@
+# Замените /absolute/path/to/fleet_ui на абсолютный путь к checkout.
+Host gigacode-bastion
+  HostName REPLACE_WITH_BASTION_HOST
+  User REPLACE_WITH_BASTION_USER
+  LocalForward 127.0.0.1:18443 192.168.100.17:5443
+  DynamicForward 127.0.0.1:11080
+  IdentityFile "/absolute/path/to/fleet_ui/config/bastion-key"
+
+Host gitverse.ru
+  Port 2222
+  User git
+  IdentityFile "/absolute/path/to/fleet_ui/config/gitverse-key"
+
+Host *
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile "/absolute/path/to/fleet_ui/config/known_hosts"

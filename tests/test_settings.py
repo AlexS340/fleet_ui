@@ -1,5 +1,7 @@
 from pathlib import Path
+import shlex
 
+from fleet_console import settings as config
 from fleet_console.settings import Paths, Settings, default_home
 
 
@@ -60,3 +62,51 @@ def test_aws_keys_come_from_credentials_profile(tmp_path, monkeypatch) -> None:
     assert read_secret(paths, "AWS_ACCESS_KEY_ID_gcvmfleet", creds) == "from-env"  # окружение важнее всего
     assert read_secret(paths, "AWS_SECRET_ACCESS_KEY_gcvmfleet", tmp_path / "missing") is None
     assert set(secrets_env(paths, ("AWS_ACCESS_KEY_ID_gcvmfleet", "MLSC_TOKEN"))) == {"AWS_ACCESS_KEY_ID_gcvmfleet"}
+
+
+def test_project_files_take_precedence_and_missing_files_fall_back(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "project with spaces"
+    folder = repo / "config"
+    folder.mkdir(parents=True)
+    home = tmp_path / "home"
+    legacy = (home / ".fleet-console")
+    legacy.mkdir(parents=True)
+    monkeypatch.setattr(config, "REPO_ROOT", repo)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.delenv("FLEET_CONSOLE_HOME", raising=False)
+    for name in (*config.SECRET_NAMES, "AWS_SHARED_CREDENTIALS_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    (legacy / "settings.yaml").write_text("ui_port: 9091\n")
+    (legacy / "secrets.env").write_text("MLSC_TOKEN=legacy\n")
+    shared_s3 = home / ".aws" / "credentials"
+    shared_s3.parent.mkdir()
+    shared_s3.write_text("[gcvmfleet]\naws_access_key_id = legacy\n")
+
+    paths = Paths.for_project()
+    assert paths.home == legacy and Settings.load(paths).ui_port == 9091
+    assert paths.ssh_command() == ["ssh"] and paths.subprocess_env() == {}
+    assert config.read_secret(paths, "MLSC_TOKEN") == "legacy"
+    assert config.read_secret(paths, "AWS_ACCESS_KEY_ID_gcvmfleet") == "legacy"
+
+    (folder / "settings.yaml").write_text("ui_port: 18082\ndatasets_root: ../data\n")
+    (folder / "secrets.env").write_text("MLSC_TOKEN=project\n")
+    (folder / "aws-credentials").write_text("[gcvmfleet]\naws_access_key_id = project\n")
+    (folder / "kubeconfig").touch()
+    (folder / "ssh_config").touch()
+    paths = Paths.for_project()
+    settings = Settings.load(paths)
+    assert paths.home == repo / ".fleet-console"
+    assert settings.ui_port == 18082 and settings.datasets_root_path() == repo / "data"
+    settings.save(paths)
+    assert (legacy / "settings.yaml").read_text() == "ui_port: 9091\n"
+    assert config.read_secret(paths, "MLSC_TOKEN") == "project"
+    assert config.read_secret(paths, "AWS_ACCESS_KEY_ID_gcvmfleet") == "project"
+    assert paths.subprocess_env() == {
+        "KUBECONFIG": str(folder / "kubeconfig"),
+        "AWS_SHARED_CREDENTIALS_FILE": str(folder / "aws-credentials"),
+        "GIT_SSH_COMMAND": shlex.join(["ssh", "-F", str(folder / "ssh_config")]),
+    }
+    (folder / "aws-credentials").unlink()
+    (folder / "secrets.env").unlink()
+    assert config.read_secret(paths, "MLSC_TOKEN") == "legacy"
+    assert config.read_secret(paths, "AWS_ACCESS_KEY_ID_gcvmfleet") == "legacy"

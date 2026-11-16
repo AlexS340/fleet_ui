@@ -110,7 +110,7 @@ def run_checks(
     checks.append(
         Check(
             "secrets", "MLSC_TOKEN и S3-креды", "fail" if missing else "ok",
-            "нет: " + ", ".join(missing) + " (окружение сервиса, secrets.env или профиль gcvmfleet в ~/.aws/credentials)" if missing else "есть",
+            "нет: " + ", ".join(missing) + " (secrets.env, профиль gcvmfleet в файле ключей S3 или окружение)" if missing else "есть",
         )
     )
     if not kube.allowed:

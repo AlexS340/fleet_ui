@@ -1,4 +1,4 @@
-"""Настройки сервиса и пути к данным в ~/.fleet-console."""
+"""Настройки и пути к данным Fleet Console."""
 
 from __future__ import annotations
 
@@ -8,9 +8,10 @@ import configparser
 import os
 from pathlib import Path
 import re
+import shlex
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +22,6 @@ KNOWN_ISSUES = REPO_ROOT / "known_issues.yaml"
 # Секреты, которые уходят только в окружение подпроцессов fleet; в exp.yaml, resolved.yaml и логи не попадают.
 SECRET_NAMES = ("MLSC_TOKEN", "AWS_ACCESS_KEY_ID_gcvmfleet", "AWS_SECRET_ACCESS_KEY_gcvmfleet")
 # Ключи S3 fleet читает как AWS_ACCESS_KEY_ID_<профиль>; сервис берёт их из профиля ~/.aws/credentials.
-AWS_CREDENTIALS = Path("~/.aws/credentials").expanduser()
 AWS_SECRET_RE = re.compile(r"^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)_(.+)$")
 AWS_FIELDS = {"ACCESS_KEY_ID": "aws_access_key_id", "SECRET_ACCESS_KEY": "aws_secret_access_key"}
 
@@ -33,8 +33,12 @@ SETTINGS_HEADER = (
 
 
 def default_home() -> Path:
-    """Каталог данных: $FLEET_CONSOLE_HOME или ~/.fleet-console."""
-    return Path(os.environ.get("FLEET_CONSOLE_HOME", "~/.fleet-console")).expanduser()
+    """Каталог данных выбранного экземпляра."""
+    if home := os.environ.get("FLEET_CONSOLE_HOME"):
+        return Path(home).expanduser().resolve()
+    if (REPO_ROOT / "config" / "settings.yaml").is_file():
+        return REPO_ROOT / ".fleet-console"
+    return Path.home() / ".fleet-console"
 
 
 @dataclass(frozen=True)
@@ -42,10 +46,39 @@ class Paths:
     """Расположение данных сервиса внутри каталога home."""
 
     home: Path
+    config_dir: Path | None = None
+    fallback_home: Path | None = None
+
+    @classmethod
+    def for_project(cls) -> "Paths":
+        home = default_home()
+        fallback = home if os.environ.get("FLEET_CONSOLE_HOME") else Path.home() / ".fleet-console"
+        return cls(home, REPO_ROOT / "config", fallback)
+
+    def project_file(self, name: str) -> Path | None:
+        if self.config_dir is not None:
+            path = self.config_dir / name
+            if path.is_file():
+                return path
+        return None
+
+    def ssh_command(self) -> list[str]:
+        config = self.project_file("ssh_config")
+        return ["ssh", "-F", str(config)] if config else ["ssh"]
+
+    def subprocess_env(self) -> dict[str, str]:
+        env = {}
+        if kubeconfig := self.project_file("kubeconfig"):
+            env["KUBECONFIG"] = str(kubeconfig)
+        if self.project_file("ssh_config"):
+            env["GIT_SSH_COMMAND"] = shlex.join(self.ssh_command())
+        if credentials := self.project_file("aws-credentials"):
+            env["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials)
+        return env
 
     @property
     def settings_file(self) -> Path:
-        return self.home / "settings.yaml"
+        return self.project_file("settings.yaml") or (self.fallback_home or self.home) / "settings.yaml"
 
     @property
     def mirror(self) -> Path:
@@ -66,7 +99,7 @@ class Paths:
     @property
     def secrets_env(self) -> Path:
         """KEY=value построчно; запасной источник токенов, когда их нет в окружении сервиса."""
-        return self.home / "secrets.env"
+        return self.project_file("secrets.env") or (self.fallback_home or self.home) / "secrets.env"
 
     @property
     def runs(self) -> Path:
@@ -75,7 +108,7 @@ class Paths:
 
     def ensure(self) -> "Paths":
         for d in (self.home, self.worktrees, self.logs, self.runs):
-            d.mkdir(parents=True, exist_ok=True)
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
         return self
 
 
@@ -163,10 +196,16 @@ class Settings(BaseModel):
     auth: Auth = Field(default_factory=Auth)
     quotas: Quotas = Field(default_factory=Quotas)
     results: Results = Field(default_factory=Results)
+    _config_dir: Path | None = PrivateAttr(default=None)
 
     def datasets_root_path(self) -> Path | None:
         raw = self.datasets_root.strip() or os.environ.get("FLEET_DATASETS_ROOT", "").strip()
-        return Path(raw).expanduser() if raw else None
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if self._config_dir and self.datasets_root.strip():
+            return (self._config_dir / path).resolve()
+        return path
 
     @classmethod
     def load(cls, paths: Paths) -> "Settings":
@@ -176,7 +215,10 @@ class Settings(BaseModel):
             cluster = data.get("cluster") or {}
             if str(cluster.get("mlsc_base_url", "")).rstrip("/") == "https://text-coordinator-proxy.mlrnd.ru/mlc":
                 cluster["mlsc_base_url"] = Cluster().mlsc_base_url
-            return cls.model_validate(data)
+            settings = cls.model_validate(data)
+            if paths.project_file("settings.yaml"):
+                settings._config_dir = paths.config_dir
+            return settings
         settings = cls()
         settings.save(paths)
         return settings
@@ -187,23 +229,31 @@ class Settings(BaseModel):
         paths.settings_file.write_text(SETTINGS_HEADER + body, encoding="utf-8")
 
 
-def read_secret(paths: Paths, name: str, aws_credentials: Path = AWS_CREDENTIALS) -> str | None:
-    """Секрет из окружения сервиса, иначе из secrets.env (NAME=value, можно с export), для ключей S3 — из ~/.aws/credentials."""
+def read_secret(paths: Paths, name: str, aws_credentials: Path | None = None) -> str | None:
+    """Явно заданное окружение, затем файлы проекта или прежние пользовательские файлы."""
     value = os.environ.get(name, "").strip()
     if value:
         return value
-    if paths.secrets_env.is_file():
-        for raw in paths.secrets_env.read_text(encoding="utf-8").splitlines():
+    if (credentials := paths.project_file("aws-credentials")) and AWS_SECRET_RE.fullmatch(name):
+        return read_aws_credential(name, credentials)
+    secrets_file = paths.secrets_env
+    if secrets_file.is_file():
+        for raw in secrets_file.read_text(encoding="utf-8").splitlines():
             line = raw.strip().removeprefix("export ")
             if line.startswith(f"{name}="):
                 return line.split("=", 1)[1].strip().strip("\"'") or None
     return read_aws_credential(name, aws_credentials)
 
 
-def read_aws_credential(name: str, path: Path = AWS_CREDENTIALS) -> str | None:
-    """AWS_ACCESS_KEY_ID_gcvmfleet → поле aws_access_key_id профиля [gcvmfleet] в ~/.aws/credentials."""
+def read_aws_credential(name: str, path: Path | None = None) -> str | None:
+    """AWS_ACCESS_KEY_ID_gcvmfleet → поле aws_access_key_id профиля [gcvmfleet]."""
     match = AWS_SECRET_RE.match(name)
-    if match is None or not path.is_file():
+    if match is None:
+        return None
+    if path is None:
+        fallback = os.environ.get("AWS_SHARED_CREDENTIALS_FILE")
+        path = Path(fallback).expanduser() if fallback else Path.home() / ".aws" / "credentials"
+    if not path.is_file():
         return None
     field, profile = AWS_FIELDS[match.group(1)], match.group(2)
     parser = configparser.RawConfigParser()

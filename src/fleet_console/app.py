@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import os
 
 from nicegui import app, ui
 from starlette.responses import PlainTextResponse
 
 from fleet_console.auth import AccessDenied, IdentityAdapter, IdentityMiddleware, TestIdentityAdapter, install_socket_guard
 from fleet_console.context import AppContext, build_context
+from fleet_console.settings import read_secret
 from fleet_console.ui.benches import benches_page
 from fleet_console.ui.cluster import cluster_page
 from fleet_console.ui.models import models_page
@@ -26,7 +26,7 @@ def create_app(ctx: AppContext, identity_adapter: IdentityAdapter | None = None)
     if auth.mode != "local":
         if auth.mode == "test":
             adapter = identity_adapter if isinstance(identity_adapter, TestIdentityAdapter) else TestIdentityAdapter.from_env(
-                os.environ.get("FLEET_CONSOLE_TEST_USERS", "{}")
+                read_secret(ctx.paths, "FLEET_CONSOLE_TEST_USERS") or "{}"
             )
             app.add_api_route("/test-login", adapter.login, methods=["GET", "POST"], include_in_schema=False)
             identity_adapter = adapter
