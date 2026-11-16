@@ -430,7 +430,7 @@ Fleet это позволяет: подъём и гашение модели —
 
 **Auth Argo.** Argo Server запущен с `--auth-mode=client`: и UI, и API требуют Bearer-токен Kubernetes; без него `/api/v1/version` отвечает 401, корень UI отдаёт 200. Fleet читает токен из `ARGO_TOKEN` (с префиксом `Bearer `), получить его можно командой `kubectl -n argo create token argo-server --duration 24h` (в `argo` есть и SA `argo-workflows-api-client-fleet` — какой из них нужен, вопрос Ф1). Namespace `swe-bench-v2-20260308` в README и шаблонах fleet для этого проброса указан ошибочно: там живёт только `workflow-controller`, сервер Argo — в namespace `argo`. Argo UI также доступен по ingress `https://fleet-argo.sberai-rnd.ru`, но только через SOCKS бастиона.
 
-**Режим сервера.** На сервере сервис работает как systemd user unit или в tmux и слушает `127.0.0.1:8080`. С Mac к UI ходим через ssh-туннель, и вот здесь autossh как раз нужен: туннель переживёт смену Wi-Fi и сон ноутбука.
+**Режим сервера.** На сервере сервис работает как systemd user unit или в tmux и слушает loopback на настроенном порту (по умолчанию 8080). Для ecs3 есть [отдельный план развёртывания](DEPLOY_ECS3.md). С Mac к UI ходим через ssh-туннель, и вот здесь autossh как раз нужен: туннель переживёт смену Wi-Fi и сон ноутбука.
 
 ```bash
 autossh -M 0 -N -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -L 8080:127.0.0.1:8080 user@server
