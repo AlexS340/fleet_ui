@@ -68,7 +68,10 @@ def _chip(text: str, color: str, on_click) -> None:
 def _benches_text(ctx: AppContext) -> str:
     active = [r for r in ctx.benches.runs(active_only=True) if ctx.access.allows(r)] if ctx.benches is not None else []
     attention = sum(1 for r in active if r.status == "attention")
-    text = "Прогоны" + (f" · идёт {len(active)}" if active else "")
+    queued = sum(r.status == "queued" for r in active)
+    text = "Прогоны" + (f" · идёт {len(active) - queued}" if len(active) > queued else "")
+    if queued:
+        text += f" · очередь {queued}"
     return text + (f" · ⚠ {attention}" if attention else "")
 
 

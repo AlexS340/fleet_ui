@@ -59,8 +59,8 @@ def summary(row, *, show_run_id: bool = True) -> None:
             **result, "score": f"{result['score']:.2f}%",
             "succeeded": f"{completed}/{result['planned']}" if completed is not None else "—",
         })
-    ui.table(columns=COLUMNS, rows=rows, row_key="leaf").classes("w-full hidden sm:block").props("dense flat wrap-cells")
-    with ui.column().classes("w-full sm:hidden gap-2"):
+    ui.table(columns=COLUMNS, rows=rows, row_key="leaf").classes("w-full gt-xs").props("dense flat wrap-cells")
+    with ui.column().classes("w-full lt-sm gap-2"):
         for result in rows:
             with ui.card().classes("w-full gap-2"):
                 ui.label(result["leaf"]).classes("font-medium break-all")

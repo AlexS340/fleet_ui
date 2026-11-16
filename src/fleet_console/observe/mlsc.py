@@ -56,8 +56,10 @@ def model_name(version: dict) -> str:
 
 def active_versions(configuration: dict) -> list[Version]:
     """Версии с planned > 0 или current > 0, по возрастанию id."""
-    states = configuration.get("application_version_states") or {}
-    versions = configuration.get("application_versions") or {}
+    states = configuration.get("application_version_states")
+    versions = configuration.get("application_versions")
+    if not isinstance(states, dict) or not isinstance(versions, dict):
+        raise RuntimeError("MLSC не вернула списки версий и их состояний")
     rows = []
     for version_id, state in states.items():
         planned, current = int(state.get("planned") or 0), int(state.get("current") or 0)
@@ -77,6 +79,35 @@ def active_versions(configuration: dict) -> list[Version]:
             )
         )
     return sorted(rows, key=lambda r: r.version_id)
+
+
+def console_run_id(application: str) -> str:
+    name = application.rsplit(" | ", 1)[-1]
+    return name.removeprefix("fleet-console ") if name.startswith("fleet-console ") else ""
+
+
+def created_version(configuration: dict, run_id: str, known_id: int | None = None) -> int:
+    """Только полное совпадение имени заявки, включая версии с нулевым планом."""
+    versions = configuration.get("application_versions")
+    if not isinstance(versions, dict):
+        raise RuntimeError("MLSC не вернул список версий; исход create_job неизвестен")
+    matches = [int(key) for key, version in versions.items()
+               if console_run_id(str(version.get("application_name") or "")) == run_id]
+    if len(matches) != 1 or (known_id is not None and matches[0] != known_id):
+        raise RuntimeError("Исход create_job неоднозначен: нужна одна подтверждённая версия MLSC; повтор отключён")
+    return matches[0]
+
+
+def replica_counts(configuration: dict, version_id: int) -> tuple[int, int]:
+    versions, states = configuration.get("application_versions"), configuration.get("application_version_states")
+    if not isinstance(versions, dict) or not isinstance(states, dict) or str(version_id) not in versions:
+        raise RuntimeError(f"MLSC не подтвердила состояние версии {version_id}")
+    state = states.get(str(version_id), {})
+    return int(state.get("planned") or 0), int(state.get("current") or 0)
+
+
+def is_stopped(configuration: dict, version_id: int) -> bool:
+    return replica_counts(configuration, version_id) == (0, 0)
 
 
 async def find_pod(runner: Runner, namespace: str, deployment: str) -> str:

@@ -34,8 +34,15 @@ async def revision_page(ctx: AppContext) -> None:
     if not ctx.access.admin:
         with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-3"):
             ui.label("Ревизия fleet").classes("text-xl")
-            revision = ctx.manager.current
+            revision = ctx.revision
             ui.label(_title(revision.ref, revision.info.sha) if revision else "Ревизия ещё не подготовлена")
+            choices = {r.sha: _title(r.ref, r.sha) for r in ctx.store.revisions() if ctx.manager.is_ready(r.sha)}
+            async def select(e):
+                if e.value in choices:
+                    await ctx.manager.select(ctx.access.id, e.value)
+                    ui.notify("Ревизия выбрана для новых черновиков")
+            ui.select(choices, value=revision.info.sha if revision and revision.info.sha in choices else None,
+                      label="Ревизия для моих прогонов", on_change=select).classes("w-full")
         return
     state = {"ref": "", "info": ""}
 
@@ -59,7 +66,7 @@ async def revision_page(ctx: AppContext) -> None:
 
     @ui.refreshable
     def result_view() -> None:
-        r = ctx.manager.current
+        r = ctx.revision
         if r is None or ctx.manager.progress.busy:  # пока готовится другая ревизия, старый результат не показываем
             return
         pr = r.profile
@@ -120,7 +127,7 @@ async def revision_page(ctx: AppContext) -> None:
             return
         prepare_button.disable()
         try:
-            await ctx.manager.prepare(state["ref"])
+            await ctx.manager.select(ctx.access.id, state["ref"])
         except PrepareError:
             pass  # текст в progress.error
         finally:

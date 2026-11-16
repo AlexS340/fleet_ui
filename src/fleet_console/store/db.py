@@ -607,7 +607,7 @@ class Store:
             )
             return int(cur.lastrowid)
 
-    def finish_stage(self, stage_id: int, returncode: int) -> None:
+    def finish_stage(self, stage_id: int, returncode: int | None) -> None:
         with self.conn:
             self.conn.execute("UPDATE session_stages SET finished_at = ?, returncode = ? WHERE id = ?", (_now(), returncode, stage_id))
 

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 import cluster_samples
 from fleet_console.compose import BenchSpec, Preview, SessionLink
@@ -28,7 +29,7 @@ RESOLVED_YAML = (
 
 
 def _override(argv: tuple[str, ...], key: str) -> str | None:
-    for a, b in zip(argv, argv[1:]):
+    for a, b in reversed(list(zip(argv, argv[1:]))):
         if a == "-o" and b.startswith(key + "="):
             return b.split("=", 1)[1]
     return None
@@ -44,6 +45,8 @@ class Harness:
 
     def __init__(self, tmp_path: Path) -> None:
         self.now = T0
+        self.configuration = json.loads(cluster_samples.CONFIGURATION)
+        self.still_running = False
         self.paths = Paths(tmp_path / "home").ensure()
         self.store = Store(self.paths.db)
         self.runner = FakeRunner()
@@ -64,6 +67,8 @@ class Harness:
         }.items():
             (cfg / rel).parent.mkdir(parents=True, exist_ok=True)
             (cfg / rel).write_text(text, encoding="utf-8")
+        (self.worktree / "fleet").mkdir()
+        (self.worktree / "fleet" / "measure_run.py").write_text("class MeasureRunRunner:\n    read_only: bool = False\n")
         self.overlay = tmp_path / "overlay"
         (self.overlay / "datasets").mkdir(parents=True)
 
@@ -71,7 +76,13 @@ class Harness:
             if "--print-config" in argv:
                 self.stages.append("preflight")
                 failed = "preflight" in self.fail
-                return Result(argv, 1 if failed else 0, "" if failed else RESOLVED_YAML, "Hydra: boom" if failed else "")
+                data = yaml.safe_load(RESOLVED_YAML)
+                data["experiment"]["run_id"] = _override(argv, "experiment.run_id")
+                data["experiment"]["model_name"] = _override(argv, "mlsc.served_model_name")
+                data["experiment"]["jobs"] = int(_override(argv, "experiment.jobs") or 1)
+                data["system"]["measure_run"] = {"read_only": True}
+                data["system"]["s3_base_directory"] = _override(argv, "system.s3_base_directory") or f"s3://b/ns/{data['experiment']['model_name']}/{data['experiment']['run_id']}"
+                return Result(argv, 1 if failed else 0, "" if failed else yaml.safe_dump(data, sort_keys=False), "Hydra: boom" if failed else "")
             steps = _steps(argv)
             stage = {
                 "system.materialize": "materialize", "mlsc.create_job": "create_job", "mlsc.start_llm": "start_llm",
@@ -82,17 +93,29 @@ class Harness:
             if stage in self.fail:
                 return Result(argv, 1, f"{stage} упал")
             if stage == "create_job":
-                Path(_override(argv, "mlsc.version_id_file")).write_text("1234\n", encoding="utf-8")
+                version_id = str(1234 + sum(int(k) >= 1234 for k in self.configuration["application_versions"]))
+                Path(_override(argv, "mlsc.version_id_file")).write_text(version_id + "\n", encoding="utf-8")
+                self.configuration["application_versions"][version_id] = {"application_name": f"fleet-console {_override(argv, 'experiment.run_id')}"}
+            if stage == "stop_llm":
+                version_id = Path(_override(argv, "mlsc.version_id_file")).read_text().strip()
+                self.configuration["application_versions"].setdefault(version_id, {"application_name": "fleet-console test"})
+                self.configuration["application_version_states"][version_id] = {"planned": 0, "current": 1 if self.still_running else 0}
             if stage == "materialize":
                 out = Path(_override(argv, "output_dir")) / ".fleet"
                 out.mkdir(parents=True, exist_ok=True)
                 (out / "tasks.json").write_text("[{}, {}, {}]", encoding="utf-8")
             if stage == "requeue":
                 return Result(argv, 0, "Перенесено submitted → pending: 2/2\n" if self.requeue_moves else "Submitted пуст — переносить нечего.\n")
+            if stage == "measure" and _override(argv, "++system.measure_run.output_file"):
+                Path(_override(argv, "++system.measure_run.output_file")).write_text(json.dumps({
+                    "run_id": _override(argv, "experiment.run_id"), "sha": _override(argv, "++system.measure_run.sha"),
+                    "results": [{"leaf": "birdsql/terminus-2", "score": 50, "planned": 3, "infra_errors": 1,
+                                 "succeeded": 1, "timeouts": 0, "unattempted": 0, "reward_sum": 1.5}]}))
             return Result(argv, 0, f"{stage} ok\n")
 
         self.runner.on("uv", "run", result=fleet)
         self.runner.on("osascript")
+        self.runner.on("kubectl", "exec", "-i", "-n", "vllm-proxy", result=lambda argv: Result(argv, 0, json.dumps(self.configuration)))
         cluster_samples.install(self.runner, NS)
         self.runner.handlers = [h for h in self.runner.handlers if h[0][:4] != ("kubectl", "exec", "-n", NS)]  # сабмиттер — по сценарию
 
@@ -109,6 +132,8 @@ class Harness:
 
         def argo(argv: tuple[str, ...]) -> Result:
             rows = "".join(f"wf-x-{i}\tRunning\trun-x\tGLM\t2026-10-21T05:00:00Z\t\n" for i in range(self.argo_active))
+            if "-l" in argv:
+                return Result(argv, 0, rows if "fleet/run-name=run-x" in argv else "")
             return Result(argv, 0, rows + cluster_samples.ARGO_TEXT)
 
         self.runner.handlers = [h for h in self.runner.handlers if h[0][:5] != ("kubectl", "-n", NS, "get", "workflows")]
@@ -125,6 +150,8 @@ class Harness:
             return None
 
         self.settings = Settings()
+        self.settings.quotas.user_runs = self.settings.quotas.total_runs = 20
+        self.settings.quotas.user_gpus = self.settings.quotas.total_gpus = 160
         self.settings.bench.poll_seconds = 0
         self.settings.bench.startup_grace_seconds = 0
         self.settings.datasets_root = str(tmp_path / "data")
@@ -177,7 +204,7 @@ async def test_bench_runs_all_stages_on_own_model(h: Harness) -> None:
     h.submitter = "done"
     run = await h.start()
     assert run.status == "done" and run.version_id == 1234 and run.stage == "" and run.finished_at
-    assert h.stages == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "requeue", "stop_llm", "measure"]
+    assert h.stages == ["preflight", "preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "requeue", "stop_llm", "measure"]
     stage_names = [s.stage for s in h.mgr.stages(run.id)]
     assert stage_names == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "requeue", "stop_llm", "measure"]
     assert all(s.returncode == 0 for s in h.mgr.stages(run.id))
@@ -191,7 +218,7 @@ async def test_bench_runs_all_stages_on_own_model(h: Harness) -> None:
     own = h.store.get_run(run.id)
     assert own and own.version_id == 1234 and "запущен сервисом" in own.note
     envs = [meta["env"] for argv, meta in h.runner.calls if argv[:2] == ("uv", "run")]
-    assert envs[0]["MLSC_TOKEN"] == "fleet-console-dummy" and envs[1]["MLSC_TOKEN"] == "tok" and envs[1]["FLEET_DATASETS_ROOT"].endswith("data")
+    assert envs[0]["MLSC_TOKEN"] == "fleet-console-dummy" and envs[2]["MLSC_TOKEN"] == "tok" and envs[2]["FLEET_DATASETS_ROOT"].endswith("data")
     assert run.counters["submitter_alive"] is False and run.counters["completed"] == 7 and run.agent_limit is None  # версии 1234 в MLSC-фейке нет: лимит не трогали
     actions = [e.action for e in h.store.events()]
     assert actions[0] == "bench_done" and "bench_start" in actions and h.runner.calls[-1][0][0] == "osascript"
@@ -227,7 +254,7 @@ async def test_bench_on_session_skips_model_stages_and_writes_limit_from_live_re
     link = SessionLink("console-glm-1", "GLM-s", "glm", 3, 41)
     run = await h.start(session=link, model_name="")
     assert run.status == "done" and run.session_id == "console-glm-1" and run.model == "GLM-s" and run.jobs == 3 and run.version_id == 41
-    assert h.stages == ["preflight", "materialize", "upload", "launch", "measure"]  # без create_job/start_llm/check/stop_llm
+    assert h.stages == ["preflight", "preflight", "materialize", "upload", "launch", "measure"]  # без create_job/start_llm/check/stop_llm
     assert "mlsc.served_model_name=GLM-s" in h.mgr.stages(run.id)[1].command and "experiment.jobs=3" in h.mgr.stages(run.id)[1].command
     assert h.limits == [6] and run.agent_limit == 6  # версия 41: current 3 × 2 агента
     assert h.mgr.busy_sessions() == set() and not run.holds_gpu
@@ -247,8 +274,9 @@ async def test_failures_before_and_after_gpu(h: Harness) -> None:
     await asyncio.sleep(0)  # уведомление уходит отдельной задачей
     assert "check не удалась" in run.error and h.runner.calls[-1][0][0] == "osascript" and "GPU тратятся" in h.runner.calls[-1][0][-1]
     h.fail = {"preflight"}
-    run = await h.start(run_id="run-z")
-    assert run.status == "failed" and "Hydra: boom" in run.error and (Path(run.dir) / "logs" / "preflight.log").exists()
+    with pytest.raises(BenchError, match="Hydra: boom"):
+        await h.start(run_id="run-z")
+    assert h.store.get_bench("run-z") is None
 
 
 async def test_retry_stage_and_stop(h: Harness) -> None:
@@ -291,7 +319,7 @@ async def test_execute_detects_dead_submitter_with_queue(h: Harness) -> None:
     assert run.status == "attention" and "в очереди 3 манифестов" in run.error and run.stage == "execute"
     h.submitter = "missing"
     run = await h.start(run_id="run-y")
-    assert run.status == "attention" and "каталога прогона на submitter-поде нет" in run.error
+    assert run.status == "attention" and "каталог прогона отсутствует" in run.error
 
 
 async def test_requeue_round_relaunches_only_when_something_moved(h: Harness) -> None:
@@ -300,7 +328,7 @@ async def test_requeue_round_relaunches_only_when_something_moved(h: Harness) ->
     h.requeue_moves = True
     run = await h.start()
     assert run.status == "done" and run.requeues == 1
-    assert h.stages == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "requeue", "launch", "stop_llm", "measure"]
+    assert h.stages == ["preflight", "preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "requeue", "launch", "stop_llm", "measure"]
     assert [s.stage for s in h.mgr.stages(run.id)].count("execute") == 2
 
 
@@ -316,6 +344,7 @@ async def test_resume_after_restart(h: Harness) -> None:
     no_version = await h.start(run_id="run-nv")
     h.store.update_bench(no_version.id, status="running", stage="create_job", version_id=None)
     h.store.start_bench_stage(no_version.id, "create_job", "cmd", "", pid=999999999)
+    h.configuration["application_versions"].pop(str(no_version.version_id))
     (Path(no_version.dir) / "version_id").unlink()
     StageFiles.for_stage(Path(no_version.dir) / "logs", "create_job").clear()
     # 3) create_job убит, но version_id записан → продолжить со start_llm
@@ -327,18 +356,20 @@ async def test_resume_after_restart(h: Harness) -> None:
     in_execute = await h.start(run_id="run-ex")
     h.store.update_bench(in_execute.id, status="running", stage="execute")
     h.store.start_bench_stage(in_execute.id, "execute", "цикл", "")
-    # 5) остановка прервана перезапуском → attention
+    # 5) остановка прервана перезапуском → сверяем кластер
     stopping = await h.start(run_id="run-st")
     h.store.update_bench(stopping.id, status="stopping")
+    for active in (done, in_execute):
+        h.configuration["application_version_states"][str(active.version_id)] = {"planned": 1, "current": 1}
     h.stages.clear()
     await h.mgr.resume()
     await asyncio.gather(*h.mgr.tasks.values())
     assert h.mgr.get(done.id).status == "done" and h.store.bench_stages(done.id)[-1].stage == "measure"
     assert next(s for s in h.store.bench_stages(done.id) if s.id == sid).returncode == 0
-    assert h.mgr.get(no_version.id).status == "attention" and "version_id не записан" in h.mgr.get(no_version.id).error
+    assert h.mgr.get(no_version.id).status == "attention" and "неоднозначен" in h.mgr.get(no_version.id).error
     assert h.mgr.get(with_version.id).status == "done", h.mgr.get(with_version.id).error
-    assert h.mgr.get(with_version.id).version_id == 1234
-    assert h.mgr.get(in_execute.id).status == "done" and h.mgr.get(stopping.id).status == "attention"
+    assert h.mgr.get(with_version.id).version_id == with_version.version_id
+    assert h.mgr.get(in_execute.id).status == "done" and h.mgr.get(stopping.id).status == "stopped"
     assert "create_job" not in h.stages and h.stages.count("start_llm") == 1
     # launch при живом сабмиттере не повторяется
     relaunch = await h.start(run_id="run-rl")
@@ -346,6 +377,7 @@ async def test_resume_after_restart(h: Harness) -> None:
     h.store.update_bench(relaunch.id, status="running", stage="launch")
     h.store.start_bench_stage(relaunch.id, "launch", "cmd", "", pid=999999999)
     StageFiles.for_stage(Path(relaunch.dir) / "logs", "launch").clear()
+    h.configuration["application_version_states"][str(relaunch.version_id)] = {"planned": 1, "current": 1}
     h.submitter = "alive"
     h.observer.runs.at = None
 
@@ -359,6 +391,59 @@ async def test_resume_after_restart(h: Harness) -> None:
     await asyncio.gather(*h.mgr.tasks.values())
     assert h.mgr.get(relaunch.id).status == "done" and "launch" not in h.stages
     assert any("пропущено: сабмиттер прогона уже жив" in s.command for s in h.store.bench_stages(relaunch.id))
+
+
+async def test_reconcile_interrupted_stop_waits_for_all_remote_resources(h: Harness) -> None:
+    h.fail = {"check"}
+    run = await h.start()
+    h.store.update_bench(run.id, status="stopping")
+    h.argo_active = 1
+    state = {"planned": 0, "current": 1}
+    h.configuration["application_version_states"][str(run.version_id)] = state
+    before = len(h.runner.calls)
+    await h.mgr.resume()
+    assert h.store.request(run.id)["state"] == "reserved"
+    error = h.mgr.get(run.id).error
+    assert "сабмиттер работает" in error and "активные workflows: 1" in error and "ещё активна" in error
+    assert not h.stopped and all(argv[0] == "kubectl" for argv, _ in h.runner.calls[before:])
+    h.submitter = "done"
+    h.argo_active = 0
+    await h.mgr.tick()
+    assert h.mgr.get(run.id).status == "stopping"
+    state["current"] = 0
+    await h.mgr.tick()
+    assert h.mgr.get(run.id).status == "stopped" and h.store.request(run.id)["state"] == "released"
+
+
+async def test_resume_refuses_to_launch_on_stopped_model(h: Harness) -> None:
+    h.submitter = "done"
+    h.fail = {"upload"}
+    run = await h.start()
+    h.store.update_bench(run.id, status="running", stage="launch")
+    await h.mgr.resume()
+    await h.mgr.tasks[run.id]
+    assert "погашена" in h.mgr.get(run.id).error
+    assert "launch" not in h.stages
+
+
+async def test_resume_lost_launch_acknowledgment_uses_argo_instead_of_relaunching(h: Harness) -> None:
+    h.settings.bench.requeue_rounds = 0
+    h.submitter = "done"
+    h.fail = {"upload"}
+    run = await h.start()
+    h.store.update_bench(run.id, status="running", stage="launch")
+    h.store.start_bench_stage(run.id, "launch", "interrupted")
+    h.configuration["application_version_states"][str(run.version_id)] = {"planned": 1, "current": 1}
+    h.argo_active = 1
+
+    async def finish_workflows(_: float) -> None:
+        h.argo_active = 0
+
+    h.mgr.sleep = finish_workflows
+    await h.mgr.resume()
+    await asyncio.wait_for(h.mgr.tasks[run.id], 3)
+    assert h.mgr.get(run.id).status == "done" and "launch" not in h.stages
+    assert any("задачи прогона уже активны в Argo" in s.command for s in h.mgr.stages(run.id))
 
 
 async def test_attention_auto_stop_and_measure_later(h: Harness) -> None:

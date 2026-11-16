@@ -12,6 +12,8 @@ from datetime import datetime
 import json
 from pathlib import Path
 import re
+import hashlib
+from uuid import uuid4
 from typing import Any
 
 import yaml
@@ -42,11 +44,16 @@ def prefix_problem(prefix: str) -> str:
     return ""
 
 
-def make_bench_id(name: str, now: datetime, suffix: str = "") -> str:
+def make_bench_id(name: str, now: datetime, suffix: str | None = None) -> str:
     """`<имя>-<время>`: годится как лейбл k8s, S3-префикс и имя каталога; fleet суффикс не добавит (run_id передаётся)."""
-    stamp = now.strftime("%Y%m%d-%H%M%S") + (f"-{suffix}" if suffix else "")
+    stamp = now.strftime("%Y%m%d-%H%M%S") + "-" + (suffix or uuid4().hex[:12])
     slug = SLUG_RE.sub("-", name.lower()).strip("-")[: LABEL_MAX - len(stamp) - 1].rstrip("-") or "bench"  # без «--» на стыке
     return f"{slug}-{stamp}"
+
+
+def model_route(name: str, run_id: str) -> str:
+    slug = SLUG_RE.sub("-", name.lower()).strip("-")[:42] or "model"
+    return f"{slug}-{hashlib.sha256(run_id.encode()).hexdigest()[:16]}"
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,10 @@ class BenchSpec:
     preset: str = ""
     sha: str = ""
     dataset_source: dict[str, str] = field(default_factory=dict)  # происхождение локально импортированного набора
+    isolate_model: bool = True
+    read_only_measure: bool = True
+    private_s3_root: str = ""
+    mlsc_base_url: str = ""
 
     # --- пути -------------------------------------------------------------
     @property
@@ -142,7 +153,9 @@ class BenchSpec:
 
     @property
     def effective_model(self) -> str:
-        return self.session.model if self.session else self.model_name
+        if self.session:
+            return self.session.model
+        return model_route(self.model_name or self.recipe, self.run_id) if self.isolate_model else self.model_name
 
     # --- exp.yaml -----------------------------------------------------------
     def exp_text(self) -> str:
@@ -213,6 +226,9 @@ class BenchSpec:
         if self.sha:
             (self.run_dir / "fleet.sha").write_text(self.sha + "\n", encoding="utf-8")
         self.spec_file.write_text(self.to_json(), encoding="utf-8")
+        if self.read_only_measure:
+            adapter = Path(__file__).resolve().parents[1] / "runs" / "private_measure.py"
+            (self.run_dir / "fleet_console_measure.py").write_bytes(adapter.read_bytes())
         return self.exp
 
     # --- сохранение -----------------------------------------------------------
@@ -232,6 +248,8 @@ class BenchSpec:
         if isinstance(data["dataset"], dict):
             data["dataset"] = DatasetRef.model_validate(data["dataset"])
         data["extra"] = tuple(data.get("extra") or ())
+        data.setdefault("isolate_model", False)  # прежним прогонам нельзя менять маршрут
+        data.setdefault("read_only_measure", False)
         data["pod"] = pod or data.get("pod", "")
         stored = data.get("session")
         data["session"] = session or (SessionLink(**stored) if stored else None)
@@ -239,7 +257,7 @@ class BenchSpec:
 
     # --- команды ------------------------------------------------------------
     def service_overrides(self) -> list[str]:
-        values = [
+        values = [*self.extra,
             f"hydra.searchpath=[file://{self.worktree / CONFIGS_REL},file://{self.overlay}]",
             f"experiment.run_id={self.run_id}",
             f"output_dir={self.out_dir}",
@@ -251,7 +269,30 @@ class BenchSpec:
         values.append(f"mlsc.create_job.job.application_name='fleet-console {self.run_id}'")
         if self.session:
             values += [f"mlsc.served_model_name={self.session.model}", f"experiment.jobs={self.session.replicas}"]
-        values.extend(self.extra)
+        elif self.effective_model:
+            values.append(f"mlsc.served_model_name={self.effective_model}")
+        if self.isolate_model:
+            values += ["experiment.model_name=${mlsc.served_model_name}",
+                       f"system.pending_dir=/manifests/harbor_run/{self.run_id}/pending"]
+        if self.private_s3_root:
+            values.append(f"system.s3_base_directory={self.private_s3_root.rstrip('/')}/{self.effective_model}/{self.run_id}")
+            # Правка вложенного пути в пресете не должна отправлять артефакты в общий бакет.
+            for key, suffix in (
+                ("materialize.s3_base_directory", ""), ("task_artifacts_upload.s3_directory", ""),
+                ("runtime_upload.s3_directory", "/scripts"), ("workflow_builder.s3_base_directory", ""),
+                ("workflow_builder.polar_topology_s3", "/scripts/topology.yaml"),
+                ("submitter_launch.s3_prefix", ""), ("requeue_failed.s3_prefix", ""),
+            ):
+                values.append(f"++system.{key}=" + "${system.s3_base_directory}" + suffix)
+        if self.read_only_measure:
+            values += ["++system.measure_run.read_only=true",
+                       "system.measure_run._target_=fleet_console_measure.PrivateMeasureRunner",
+                       "system.measure_run.run_uri=${system.s3_base_directory}",
+                       f"++system.measure_run.run_id={self.run_id}", f"++system.measure_run.sha={self.sha}",
+                       f"++system.measure_run.output_file={self.run_dir / 'measurement.json'}"]
+        if self.mlsc_base_url:
+            values += [f"++mlsc.{step}.base_url={self.mlsc_base_url}" for step in
+                       ("create_job", "start_llm", "stop_llm", "wait_first_litellm_job")]
         return values
 
     def overrides(self, steps: list[str]) -> list[str]:

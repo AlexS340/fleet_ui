@@ -18,6 +18,7 @@ import yaml
 
 from fleet_console.fleetref.profile import CONFIGS_REL
 from fleet_console.fleetref.sync import fleet_argv
+from fleet_console.compose.spec import make_bench_id
 
 OVERLAY_TEMPLATE = Path(__file__).resolve().parents[3] / "overlay" / "configs" / "console_model.yaml"
 CONFIG_NAME = "console_model.yaml"
@@ -31,10 +32,14 @@ GPU_RE = re.compile(r"(\d+)gpu|gpu(\d+)")  # a100plus.8gpu.… или ${mlsc.ins
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
+def mlsc_url_overrides(base_url: str) -> list[str]:
+    return [f"++mlsc.{step}.base_url={base_url}" for step in
+            ("create_job", "start_llm", "stop_llm", "wait_first_litellm_job")] if base_url else []
+
+
 def make_run_id(model_name: str, now: datetime) -> str:
     """`console-<модель>-<время>`: годится как значение лейбла k8s и как имя каталога."""
-    slug = SLUG_RE.sub("-", model_name.lower()).strip("-")[:30] or "model"
-    return f"console-{slug}-{now.strftime('%Y%m%d-%H%M%S')}"
+    return make_bench_id(f"console-{model_name}", now)
 
 
 def gpu_in(instance_type: str | None) -> int | None:
@@ -101,6 +106,7 @@ class SessionSpec:
     pod: str
     model_name: str = ""  # пусто — served_model_name из рецепта
     extra: tuple[str, ...] = ()  # overrides из «Дополнительно»
+    mlsc_base_url: str = ""
 
     @property
     def config(self) -> Path:
@@ -131,6 +137,15 @@ class SessionSpec:
         if self.model_name:
             values.append(f"mlsc.served_model_name={self.model_name}")
         values.extend(self.extra)
+        # Поля владения ресурсами нельзя перенаправить пользовательским override.
+        values += [f"experiment.run_id={self.run_id}", f"mlsc.version_id_file={self.version_id_file}",
+                   f"mlsc.create_job.job.application_name='fleet-console {self.run_id}'", f"output_dir={self.run_dir / 'out'}"]
+        if self.model_name:
+            values += [f"mlsc.served_model_name={self.model_name}", "experiment.model_name=${mlsc.served_model_name}"]
+        values.append(f"experiment.jobs={self.replicas if jobs is None else jobs}")
+        values.extend(mlsc_url_overrides(self.mlsc_base_url))
+        if jobs is not None:  # смена реплик должна перекрывать исходный override experiment.jobs
+            values.append(f"experiment.jobs={jobs}")
         values.append(f"main.run=[{STEPS[step]}]")
         return values
 

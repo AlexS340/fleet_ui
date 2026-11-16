@@ -49,6 +49,22 @@ class ClusterObserver:
     def sources(self) -> list[Source]:
         return [self.runs, self.mlsc, self.nginx, self.submitter, self.nodes]
 
+    def current(self, source: Source, *, since: str | None = None) -> Any:
+        if not self.ready() or source.error:
+            return None
+        if since and source.at:
+            cutoff = datetime.fromisoformat(since)
+            if source.at < (cutoff if cutoff.tzinfo else cutoff.replace(tzinfo=timezone.utc)):
+                return None
+        return source.data
+
+    def active_model(self, run_id: str, version_id: int | None, *, since: str | None = None) -> mlsc.Version | None:
+        versions = self.current(self.mlsc, since=since) or []
+        if version_id is not None:
+            return next((version for version in versions if version.version_id == version_id), None)
+        matches = [version for version in versions if mlsc.console_run_id(version.application) == run_id]
+        return matches[0] if len(matches) == 1 else None
+
     async def refresh(self) -> None:
         if self.busy:
             return
@@ -74,6 +90,11 @@ class ClusterObserver:
     async def submitter_log(self, run_id: str) -> str:
         c = self.settings.cluster
         return await submitter.log_tail(self.runner, self.settings.namespace, c.submitter_pod, run_id)
+
+    async def failed_worker_log(self, version_id: int) -> str:
+        token = self.require_token()
+        c = self.settings.cluster
+        return await mlsc.get_last_failed_log(self.runner, c.mlsc_namespace, await self.mlsc_pod(), c.mlsc_base_url, token, version_id)
 
     async def _fill(self, source: Source, coro: Awaitable[Any]) -> None:
         try:

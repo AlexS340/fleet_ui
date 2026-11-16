@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from uuid import uuid4
 import re
 
 from nicegui import ui
@@ -12,11 +13,13 @@ from nicegui import ui
 from fleet_console.auth import AccessDenied
 from fleet_console.connect.gateway import Gateway, list_models, snippets
 from fleet_console.context import AppContext
+from fleet_console.fleetref.manager import PrepareError
 from fleet_console.models import SessionError, sandbox
 from fleet_console.models.compose import recipe_summary
+from fleet_console.observe.mlsc import Version
 from fleet_console.settings import scrub
 from fleet_console.store import Session
-from fleet_console.ui.common import JOB_PRIORITY_OVERRIDE, confirm_dialog, hint, job_priority_select
+from fleet_console.ui.common import JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, text_dialog
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
 
 GATEWAY_OPTIONS = {"litellm": "litellm — маршрут fleet по умолчанию", "nginx": "nginx — vllm-proxy"}
@@ -29,7 +32,7 @@ SESSION_COLUMNS = [
     {"name": "expires", "label": "Истекает", "field": "expires", "align": "left"},
 ]
 STATUS_TEXT = {
-    "starting": "поднимается",
+    "queued": "в очереди", "starting": "поднимается",
     "ready": "готова",
     "stopping": "гасится",
     "stopped": "погашена",
@@ -53,6 +56,10 @@ async def models_page(ctx: AppContext, session_id: str | None = None) -> None:
 def _status_text(s: Session) -> str:
     text = STATUS_TEXT.get(s.status, s.status)
     return f"{text}: {s.stage}" if s.status == "starting" and s.stage else text
+
+
+def _live_conflict(s: Session, version: Version | None) -> bool:
+    return not s.active and version is not None
 
 
 def _expires_text(s: Session) -> str:
@@ -79,20 +86,23 @@ def _sessions_card(ctx: AppContext, session_id: str | None) -> None:
         empty = ui.label("Сессий нет. «Поднять модель» создаёт версию в MLSC шагами fleet и гасит её по таймеру.").classes(
             "text-sm opacity-70"
         )
+        mlsc_status = ui.label("Актуальный статус MLSC недоступен").classes("text-warning text-sm")
         ui.label("клик по строке — стадии, логи и управление сессией").classes("text-xs opacity-60")
 
     def render() -> None:
-        versions = {v.version_id: v for v in ctx.observer.mlsc.data or []}
+        mlsc_status.set_visibility(ctx.observer.current(ctx.observer.mlsc) is None)
+        sessions = [(s, ctx.observer.active_model(s.id, s.version_id, since=s.stopped_at if not s.active else None))
+                    for s in ctx.sessions.sessions() if ctx.access.allows(s)]
+        sessions.sort(key=lambda item: not _live_conflict(*item))
         rows = []
-        for s in [item for item in ctx.sessions.sessions() if ctx.access.allows(item)][:20]:
-            v = versions.get(s.version_id) if s.version_id is not None else None
+        for s, v in sessions[:20]:
             rows.append(
                 {
                     "id": s.id,
                     "model": s.model or s.recipe,
-                    "status": _status_text(s),
-                    "replicas": f"{s.replicas} ({v.planned}/{v.current})" if v else str(s.replicas),
-                    "version": s.version_id if s.version_id is not None else "—",
+                    "status": _status_text(s) + (" · версия MLSC ещё активна" if _live_conflict(s, v) else ""),
+                    "replicas": f"{s.replicas} ({v.planned}/{v.current})" if v else f"{s.replicas} (—)",
+                    "version": v.version_id if v else s.version_id if s.version_id is not None else "—",
                     "expires": _expires_text(s),
                 }
             )
@@ -106,10 +116,24 @@ def _sessions_card(ctx: AppContext, session_id: str | None) -> None:
         _session_dialog(ctx, session_id, render)
 
 
-def _new_session_dialog(ctx: AppContext, after) -> None:
-    revision = ctx.manager.current
+async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = None) -> None:
+    request_key = uuid4().hex
+    revision = ctx.revision
+    options = {"recipe": None, "model_name": "", "replicas": 1, "inference": "litellm",
+               "ttl_minutes": ctx.settings.session_ttl_minutes, "extra": ()}
+    if source_id is not None:
+        try:
+            ctx.access.require_admin()
+            source = ctx.access.session(source_id)
+            options = ctx.sessions.launch_options(source)
+            revision = await ctx.manager.prepare(source.sha)
+        except (AccessDenied, SessionError, PrepareError) as exc:
+            ui.notify(str(exc), type="negative", multi_line=True)
+            return
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
-        ui.label("Поднять модель").classes("text-lg")
+        ui.label("Повторить с правками" if source_id else "Поднять модель").classes("text-lg")
+        if source_id:
+            ui.label(f"Из сессии {source_id}. Будет создана новая сессия.").classes("text-xs opacity-70 break-all")
         if revision is None or not revision.profile.compatible:
             ui.label("Сначала подготовьте совместимую ревизию fleet на главной странице: сессия идёт её шагами mlsc.*").classes("text-sm")
             ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
@@ -118,16 +142,27 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
         ref = revision.ref if revision.ref != revision.info.sha else revision.info.sha[:8]
         ui.label(f"ревизия {ref}@{revision.info.sha[:8]}" if ref != revision.info.sha[:8] else f"ревизия {ref}").classes("text-sm opacity-70")
         recipes = revision.profile.groups.get("mlsc/model", [])
-        recipe = ui.select(recipes, value=recipes[0] if recipes else None, label="Рецепт mlsc/model").classes("w-full")
+        recipe = ui.select(recipes, value=options["recipe"] or (recipes[0] if recipes else None), label="Рецепт mlsc/model").classes("w-full")
         info = ui.label().classes("text-xs opacity-70")
-        model = ui.input("served_model_name (пусто — из рецепта; суффикс спасает от коллизий имён)").classes("w-full")
+        model = ui.input("Имя модели (уникальный суффикс добавится автоматически)", value=options["model_name"]).classes("w-full")
         with ui.row().classes("gap-3 flex-wrap"):
-            replicas = ui.number("Реплики", value=1, min=1, precision=0).classes("w-28")
-            ttl = ui.number("Время жизни, мин", value=ctx.settings.session_ttl_minutes, min=5, precision=0).classes("w-40")
-            inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value="litellm", label="Маршрут").classes("w-32")
+            replicas = ui.number("Реплики", value=options["replicas"], min=1, precision=0).classes("w-28")
+            ttl = ui.number("Время жизни, мин", value=options["ttl_minutes"], min=5, precision=0).classes("w-40")
+            inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value=options["inference"], label="Маршрут").classes("w-32")
             priority = job_priority_select()
+            queue = job_queue_select()
+        saved_extra = list(options["extra"])
+        priority_values = {f"{JOB_PRIORITY_OVERRIDE}={value}": value for value in ("medium", "high")}
+        priority_overrides = [value for value in saved_extra if value.split("=", 1)[0].lstrip("+") == JOB_PRIORITY_OVERRIDE.lstrip("+")]
+        if priority_overrides and priority_overrides[-1] in priority_values:
+            priority.set_value(priority_values[priority_overrides[-1]])
+            saved_extra = [value for value in saved_extra if value not in priority_overrides]
+        queue_overrides = [value for value in saved_extra if value.partition("=")[0].lstrip("+") == JOB_QUEUE_KEY]
+        if queue_overrides and (saved_queue := queue_overrides[-1].partition("=")[2]) in JOB_QUEUES:
+            queue.set_value(saved_queue)
+            saved_extra = [value for value in saved_extra if value not in queue_overrides]
         with ui.expansion("Дополнительно").classes("w-full").set_visibility(ctx.access.admin):
-            extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение").classes("w-full").props("autogrow")
+            extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение", value="\n".join(saved_extra)).classes("w-full").props("autogrow")
         gpu_label = ui.label().classes("text-sm")
         summary: dict = {}
 
@@ -165,6 +200,9 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
             if job_priority in {"medium", "high"}:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={job_priority}")
                 lines.insert(2, f"приоритет джобы {job_priority}")
+            if queue.value in JOB_QUEUES:
+                overrides.append(f"++{JOB_QUEUE_KEY}={queue.value}")
+                lines.insert(2, f"очередь MLSC {queue.value}")
 
             selected_recipe = recipe.value
             selected_name = (model.value or "").strip()
@@ -180,15 +218,17 @@ def _new_session_dialog(ctx: AppContext, after) -> None:
                     inference=selected_inference,
                     ttl_minutes=selected_ttl,
                     extra=tuple(overrides),
+                    source_id=source_id,
+                    request_key=request_key,
                     access=ctx.access,
                 )
                 dialog.close()
-                ui.notify(f"Сессия {session.id}: подъём начат")
+                ui.notify(f"Сессия {session.id}: {'в очереди' if session.status == 'queued' else 'подъём начат'}")
 
             confirm_dialog("Занять GPU под модель?", lines, start, after, button="Да, поднять")
 
         with ui.row().classes("gap-2"):
-            ui.button("Запустить подъём", on_click=ask).props("unelevated no-caps")
+            ui.button("Запустить подъём", on_click=ask).props("unelevated no-caps").mark("start-session")
             ui.button("Отмена", on_click=dialog.close).props("flat no-caps")
     dialog.open()
 
@@ -199,10 +239,13 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
     except AccessDenied as exc:
         ui.notify(str(exc), type="negative")
         return
-    versions = {v.version_id: v for v in ctx.observer.mlsc.data or []}
     secrets = ctx.benches.secrets().values()
     version_id = s.version_id
-    v = versions.get(version_id) if version_id is not None else None
+    v = ctx.observer.active_model(s.id, version_id, since=s.stopped_at if not s.active else None)
+
+    async def repeat() -> None:
+        await _new_session_dialog(ctx, after, source_id=s.id)
+        dialog.close()
 
     def refresh() -> None:
         dialog.close()
@@ -225,16 +268,33 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
             f"модель {s.model or '(из рецепта)'}",
             f"ревизия {s.ref}@{s.sha[:8]}" if s.ref and s.ref != s.sha else f"ревизия {s.sha[:8]}",
             f"маршрут {s.inference}",
-            f"реплик {s.replicas}" + (f" — в MLSC план {v.planned}, факт {v.current}, {v.gpus or 0} GPU" if v else ""),
+            f"реплик {s.replicas}" + (f" — в MLSC план {v.planned}, факт {v.current}" if v else ""),
             f"version_id {s.version_id if s.version_id is not None else '—'}",
             f"создана {_when_iso(s.created_at)}",
             f"истекает {_expires_text(s)}",
         ]
+        if v and v.gpus is not None:
+            facts.append(f"{v.gpus} GPU")
         ui.label(" · ".join(facts)).classes("text-sm")
+        if _live_conflict(s, v):
+            ui.label(f"Локальный статус расходится с MLSC. Версия {v.version_id} ещё активна.").classes("text-negative text-sm")
+        elif ctx.observer.current(ctx.observer.mlsc) is None:
+            ui.label("Актуальный статус MLSC недоступен").classes("text-warning text-sm")
         if s.error:
             ui.label(scrub(s.error, secrets)).classes("text-negative text-sm whitespace-pre-wrap")
         ui.label(f"каталог: {s.dir}").classes("text-xs opacity-60 break-all")
-        if s.active:
+        if ctx.access.admin:
+            ui.button("Повторить с правками", on_click=repeat).props("unelevated no-caps")
+        if version_id is not None:
+            ui.button(
+                "Лог упавшего воркера модели",
+                on_click=lambda: text_dialog(
+                    f"MLSC: последний упавший воркер · версия {version_id}",
+                    _worker_log(ctx, s.id),
+                    ctx.benches.secrets,
+                ),
+            ).props("flat dense no-caps")
+        if s.active or (_live_conflict(s, v) and version_id is not None):
             with ui.row().classes("items-end gap-2 flex-wrap"):
                 if s.status in ("ready", "attention"):
                     ui.button("Продлить +60 мин", on_click=lambda: do(ctx.sessions.extend(s.id, 60, access=ctx.access))).props("flat no-caps")
@@ -250,12 +310,14 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
                         )
 
                     ui.button("Применить", on_click=ask_replicas).props("flat no-caps")
-                label = "Прервать подъём" if s.status == "starting" else "Погасить"
+                label = "Отменить заявку" if s.status == "queued" else "Прервать подъём" if s.status == "starting" else "Погасить"
                 detail = (
                     f"mlsc.stop_llm: версии {s.version_id} будет выставлено 0 инстансов"
                     if s.version_id is not None
                     else "версии MLSC ещё нет — сессия просто отметится погашенной"
                 )
+                if s.status == "queued":
+                    detail = "Заявка ожидает квоту. Ресурсы ещё не выделены."
                 ui.button(
                     label,
                     on_click=lambda: confirm_dialog(f"{label}: {s.id}", [detail], lambda: ctx.sessions.stop(s.id, access=ctx.access), refresh, button=label),
@@ -265,13 +327,18 @@ def _session_dialog(ctx: AppContext, session_id: str, after) -> None:
         if not stages:
             ui.label("ещё не начинались").classes("text-sm opacity-70")
         for st in stages:
-            result = "идёт" if st.returncode is None else f"код {st.returncode}"
+            result = ("прервана" if st.finished_at else "идёт") if st.returncode is None else f"код {st.returncode}"
             with ui.expansion(f"{st.stage} · {result} · {_when_iso(st.started_at)}").classes("w-full"):
                 ui.code(scrub(st.command, secrets), language="bash").classes("w-full")
                 if st.log_path:
                     ui.button("Хвост лога", on_click=lambda p=st.log_path: _log_tail_dialog(ctx, s.id, p)).props("flat dense no-caps")
         ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
     dialog.open()
+
+
+async def _worker_log(ctx: AppContext, session_id: str) -> str:
+    session = ctx.access.session(session_id)
+    return await ctx.observer.failed_worker_log(session.version_id) if session.version_id is not None else ""
 
 
 def _log_tail_dialog(ctx: AppContext, session_id: str, path: str, lines: int = 80) -> None:

@@ -80,11 +80,11 @@ def spec_for(tmp_path: Path, **kw) -> BenchSpec:
 
 
 def test_bench_id_fits_k8s_label() -> None:
-    cut = make_bench_id("checkpoints_qwen_262k-cowork-bench-ua-external-260902", T0)
-    assert cut == "checkpoints-qwen-262k-cowork-bench-ua-external-20261021-120000" and "--" not in cut and len(cut) <= 63
-    assert make_bench_id("qwen36-birdsql-smoke", T0) == "qwen36-birdsql-smoke-20261021-120000"
+    cut = make_bench_id("checkpoints_qwen_262k-cowork-bench-ua-external-260902", T0, "abcdef123456")
+    assert cut == "checkpoints-qwen-262k-cowork-bench-20261021-120000-abcdef123456" and "--" not in cut and len(cut) <= 63
+    assert make_bench_id("qwen36-birdsql-smoke", T0) != make_bench_id("qwen36-birdsql-smoke", T0)
     long = make_bench_id("Очень длинное имя " + "x" * 80, T0)
-    assert len(long) <= 63 and long.endswith("-20261021-120000") and long.startswith("x")
+    assert len(long) <= 63 and "-20261021-120000-" in long and long.startswith("x")
 
 
 def test_exp_yaml_overrides_and_argv(tmp_path: Path) -> None:
@@ -99,11 +99,12 @@ def test_exp_yaml_overrides_and_argv(tmp_path: Path) -> None:
     assert "# Прогон Fleet Console: smoke-20261021-120000 · пресет smoke" in text and "правка действует только в этом прогоне" in text
     assert (spec.run_dir / "fleet.sha").read_text().strip() == spec.sha and (spec.run_dir / "logs").is_dir()
     overrides = spec.overrides(["system.materialize", "system.topology_saver"])
-    assert overrides[0] == f"hydra.searchpath=[file://{spec.worktree / CONFIGS_REL},file://{spec.overlay}]"
+    assert f"hydra.searchpath=[file://{spec.worktree / CONFIGS_REL},file://{spec.overlay}]" in overrides
     assert f"experiment.run_id={spec.run_id}" in overrides and f"output_dir={spec.run_dir / 'out'}" in overrides
     assert f"system.materialize.dataset_registry.directory={spec.run_dir / 'registry'}" in overrides and "mlsc.pod_name=litellm-abc" in overrides
     assert "mlsc.create_job.job.application_name='fleet-console smoke-20261021-120000'" in overrides
-    assert overrides[-2:] == ["execution.retry_limit=0", "main.run=[system.materialize,system.topology_saver]"]
+    assert overrides[0] == "execution.retry_limit=0" and overrides[-1] == "main.run=[system.materialize,system.topology_saver]"
+    assert f"mlsc.served_model_name={spec.effective_model}" in overrides and "++system.measure_run.read_only=true" in overrides
     assert spec.overrides_file.read_text().count("\n") == len(spec.service_overrides()) + 1
     argv = spec.argv(["mlsc.create_job"], print_config=True)
     assert argv[:7] == ["uv", "run", "--project", str(spec.worktree), "--no-sync", "fleet", str(exp)] and argv[7] == "--print-config"

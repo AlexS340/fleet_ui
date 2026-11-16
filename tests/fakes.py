@@ -146,8 +146,18 @@ class FakeManager:
         self.prepare_error: str | None = None
         self.prepared: list[str] = []
         self.fetched = 0
+        self.selections = {}
         self.mirror = SimpleNamespace(exists=lambda: True, last_fetch_at=lambda: NOW, remote="fake")
         self.files_at: dict[tuple[str, str], str] = {}  # (sha, путь группы) → текст на той ревизии
+
+    def selected(self, owner):
+        if owner not in self.selections or self.selections[owner] is None:
+            self.selections[owner] = self.current
+        return self.selections[owner]
+
+    async def select(self, owner, ref):
+        self.selections[owner] = await self.prepare(ref)
+        return self.selections[owner]
 
     async def file_at(self, sha: str, rel: str) -> str | None:
         return self.files_at.get((sha, rel))
@@ -216,6 +226,8 @@ def make_worktree(root: Path) -> Path:
     for rel, text in files.items():
         (cfg / rel).parent.mkdir(parents=True, exist_ok=True)
         (cfg / rel).write_text(text, encoding="utf-8")
+    (root / "fleet").mkdir(exist_ok=True)
+    (root / "fleet" / "measure_run.py").write_text("class MeasureRunRunner:\n    read_only: bool = False\n")
     return root
 
 
@@ -224,7 +236,17 @@ def fake_fleet(argv: tuple[str, ...]) -> Result:
     overrides = {b.split("=", 1)[0]: b.split("=", 1)[1] for a, b in zip(argv, argv[1:]) if a == "-o" and "=" in b}
     if "--print-config" in argv:
         priority = overrides.get("++mlsc.create_job.job.job_priority_class", "medium")
-        return Result(argv, 0, RESOLVED.replace("job_priority_class: medium", f"job_priority_class: {priority}"))
+        import yaml
+        data = yaml.safe_load(RESOLVED)
+        data["experiment"]["run_id"] = overrides.get("experiment.run_id", "bench")
+        data["experiment"]["model_name"] = overrides.get("mlsc.served_model_name", "GLM")
+        data["mlsc"]["served_model_name"] = data["experiment"]["model_name"]
+        data["experiment"]["jobs"] = int(overrides.get("experiment.jobs", 1))
+        data["mlsc"]["create_job"]["job"]["job_priority_class"] = priority
+        data["mlsc"]["create_job"]["job"]["queue_name"] = overrides.get("++mlsc.create_job.job.queue_name", "gigacode")
+        data["system"]["measure_run"] = {"read_only": True}
+        data["system"]["s3_base_directory"] = overrides.get("system.s3_base_directory", f"s3://fake/runs/{data['experiment']['run_id']}")
+        return Result(argv, 0, yaml.safe_dump(data, sort_keys=False))
     steps = overrides.get("main.run", "[]").strip("[]").split(",")
     if steps[0] == "mlsc.create_job":
         Path(overrides["mlsc.version_id_file"]).write_text("777\n", encoding="utf-8")
@@ -233,6 +255,12 @@ def fake_fleet(argv: tuple[str, ...]) -> Result:
         out.mkdir(parents=True, exist_ok=True)
         (out / "tasks.json").write_text("[{}, {}, {}]", encoding="utf-8")
         return Result(argv, 0, "Материализовано Harbor-пар агент×задача: 3\n")
+    if steps[0] == "system.measure_run" and "++system.measure_run.output_file" in overrides:
+        import json
+        Path(overrides["++system.measure_run.output_file"]).write_text(json.dumps({
+            "run_id": overrides["experiment.run_id"], "sha": overrides["++system.measure_run.sha"],
+            "results": [{"leaf": "cowork/terminus-2", "score": 75, "planned": 4, "infra_errors": 1,
+                         "succeeded": 3, "timeouts": 0, "unattempted": 0, "reward_sum": 3}]}))
     return Result(argv, 0, "ok\n")
 
 
@@ -257,6 +285,12 @@ def make_context() -> AppContext:
     store = Store(paths.db)
     kubectl = FakeRunner()
     kubectl.on("kubectl", "exec", "-n", settings.namespace, "fleet-submitter-python", "--", "sh", result=fake_submitter(store))
+    def configuration(argv):
+        import json
+        data = json.loads(cluster_samples.CONFIGURATION)
+        data["application_versions"]["777"] = {"application_name": "fleet-console fake"}
+        return Result(argv, 0, json.dumps(data))
+    kubectl.on("kubectl", "exec", "-i", "-n", "vllm-proxy", result=configuration)
     cluster_samples.install(kubectl, settings.namespace)
     kubectl.on("uv", "run", result=fake_fleet)
     kubectl.on("osascript")

@@ -10,7 +10,10 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import subprocess
+import sys
 from typing import Protocol
+from uuid import uuid4
 
 Argv = Sequence[str]
 LineHook = Callable[[str], None]
@@ -96,12 +99,35 @@ class StageFiles:
 
     def clear(self) -> None:
         """Перед новым запуском: старые pid и код выхода не должны выдать себя за свежие. Лог остаётся (дописывается)."""
-        for path in (self.pid, self.exit):
+        for path in (self.pid, self.exit, self.process):
             path.unlink(missing_ok=True)
+
+    @property
+    def process(self) -> Path:
+        return self.pid.with_suffix(".process")
 
     def alive(self) -> bool:
         pid = self.read_pid()
-        return pid is not None and self.read_exit() is None and pid_alive(pid)
+        return pid is not None and self.read_exit() is None and self.owns_process(pid)
+
+    def owns_process(self, pid: int) -> bool:
+        """PID на томе переживает pod; идентификатор запуска находится в argv самой обёртки."""
+        if pid <= 0:
+            return False
+        try:
+            marker = self.process.read_text(encoding="ascii").strip()
+            if not marker:
+                return False
+            if sys.platform == "linux":
+                argv = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+                return argv[-1] == marker.encode("ascii")
+            ps = subprocess.run(
+                ["ps", "-ww", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=2,
+            )
+            return ps.returncode == 0 and ps.stdout.rstrip().endswith(f" {marker}")
+        except (OSError, UnicodeError, subprocess.TimeoutExpired):
+            return False
 
 
 def _read_int(path: Path) -> int | None:
@@ -111,23 +137,13 @@ def _read_int(path: Path) -> int | None:
         return None
 
 
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def detached_argv(argv: Argv, files: StageFiles) -> list[str]:
+def detached_argv(argv: Argv, files: StageFiles, marker: str) -> list[str]:
     """Обёртка sh: вывод в лог пишет сам процесс, код выхода — в файл; так стадия переживает перезапуск сервиса."""
     script = (
         f"{shlex.join(argv)} >> {shlex.quote(str(files.log))} 2>&1; code=$?; "
         f"echo $code > {shlex.quote(str(files.exit))}; exit $code"
     )
-    return ["sh", "-c", script]
+    return ["sh", "-c", script, marker]
 
 
 class Detached(Protocol):
@@ -156,8 +172,7 @@ async def attach(files: StageFiles, poll: float = 1.0) -> int | None:
         code = files.read_exit()
         if code is not None:
             return code
-        pid = files.read_pid()
-        if pid is None or not pid_alive(pid):
+        if not files.alive():
             return files.read_exit()
         await asyncio.sleep(poll)
 
@@ -165,13 +180,22 @@ async def attach(files: StageFiles, poll: float = 1.0) -> int | None:
 def kill_stage(files: StageFiles) -> bool:
     """SIGTERM всей группе процессов стадии (setsid): uv, fleet и их дети."""
     pid = files.read_pid()
-    if pid is None or not pid_alive(pid):
+    if pid is None or files.read_exit() is not None or not files.owns_process(pid):
         return False
     try:
         os.killpg(pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         return False
     return True
+
+
+async def interrupt_stage(files: StageFiles) -> None:
+    if files.alive():
+        kill_stage(files)
+        try:
+            await asyncio.wait_for(attach(files, poll=0.1), timeout=5)
+        except TimeoutError as exc:
+            raise RuntimeError("Процесс стадии ещё работает; повторите остановку") from exc
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -282,8 +306,10 @@ class SubprocessRunner:
         files.clear()
         with files.log.open("a", encoding="utf-8") as log:
             log.write(f"$ {shlex.join(argv)}\n")
+        marker = f"fleet-console-stage-{uuid4().hex}"
+        files.process.write_text(marker, encoding="ascii")
         proc = await asyncio.create_subprocess_exec(
-            *detached_argv(argv, files),
+            *detached_argv(argv, files, marker),
             cwd=cwd,
             env=_merged_env(env),
             start_new_session=True,

@@ -122,7 +122,7 @@ def import_dialog(ctx: AppContext, after) -> None:
 
 
 def default_s3_root(ctx: AppContext) -> str:
-    revision = ctx.manager.current
+    revision = ctx.revision
     if revision is None:
         return ""
     try:

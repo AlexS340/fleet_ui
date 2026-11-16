@@ -1,11 +1,15 @@
 import asyncio
 from pathlib import Path
+from shlex import quote
 
 from nicegui import ui
 from nicegui.testing import User
 import pytest
 
 from fleet_console.fleetref.profile import CONFIGS_REL
+from fleet_console.runner import Result
+from fleet_console.observe.mlsc import Version
+from fleet_console.store import Session
 import fakes
 
 pytestmark = pytest.mark.nicegui_main_file("tests/ui_main.py")
@@ -13,6 +17,21 @@ pytestmark = pytest.mark.nicegui_main_file("tests/ui_main.py")
 
 def _select(user: User, label: str) -> ui.select:
     return next(s for s in user.find(kind=ui.select).elements if s.props.get("label") == label)
+
+
+async def test_stopped_session_shows_live_version_and_unavailable_mlsc(user: User) -> None:
+    ctx = fakes.CTX
+    await user.open("/models")
+    ctx.store.create_session(Session("closed-with-model", "glm", "stopped", fakes.NOW.isoformat(), version_id=1473))
+    ctx.observer.mlsc.data = [Version(1473, "fleet-console closed-with-model", "GLM", 1, 1)]
+    await user.open("/models/closed-with-model")
+    await user.should_see("Локальный статус расходится с MLSC. Версия 1473 ещё активна.")
+    await user.should_see("Погасить")
+
+    ctx.observer.mlsc.error = "MLSC offline"
+    await user.open("/models/closed-with-model")
+    await user.should_see("Актуальный статус MLSC недоступен")
+    await user.should_not_see("Локальный статус расходится с MLSC")
 
 
 async def test_header_and_branches(user: User) -> None:
@@ -173,11 +192,16 @@ async def test_models_page_sessions(user: User, job_priority: str) -> None:
     priority = _select(user, "Приоритет джобы")
     assert priority.value == ""
     priority.set_value(job_priority)
+    queue = _select(user, "Очередь MLSC")
+    assert queue.value == ""
+    if job_priority:
+        queue.set_value("shared")
     user.find("Запустить подъём").click()
     await user.should_see("Занять GPU под модель?")
     await user.should_see("стадии: preflight → mlsc.create_job")
     if job_priority == "high":
         await user.should_see("приоритет джобы high")
+        await user.should_see("очередь MLSC shared")
     user.find("Да, поднять").click()
     await user.should_see("подъём начат")
     await asyncio.gather(*fakes.CTX.sessions.tasks.values())
@@ -188,11 +212,101 @@ async def test_models_page_sessions(user: User, job_priority: str) -> None:
     for stage in stages[:2]:
         if not job_priority:
             assert "job_priority_class=" not in stage.command
+            assert "queue_name=" not in stage.command
         else:
             assert "++mlsc.create_job.job.job_priority_class=high" in stage.command
+            assert "++mlsc.create_job.job.queue_name=shared" in stage.command
     assert "session:" + session.id in fakes.CTX.sleep_reasons()
     await fakes.CTX.sessions.stop(session.id)
     assert fakes.CTX.sessions.get(session.id).status == "stopped"
+
+
+async def test_model_session_shows_failed_worker_log(user: User, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = fakes.CTX
+    ctx.store.create_session(Session("failed-before-mlsc", "glm", "failed", fakes.NOW.isoformat()))
+    ctx.store.create_session(Session("stopped-model", "glm", "stopped", fakes.NOW.isoformat(), version_id=1446))
+    monkeypatch.setattr(ctx.benches, "secrets", lambda: {"MLSC_TOKEN": "mock-secret-value"})
+    endpoint = ctx.settings.cluster.mlsc_base_url.rstrip("/") + "/api/v1/service/get_last_failed_log?application_version_id=1446"
+    prefix = (
+        "kubectl", "exec", "-i", "-n", "vllm-proxy", "litellm-noauth-abc", "--", "sh", "-c",
+        f'curl -sSf -k -H "Authorization: Bearer $(cat)" {quote(endpoint)}',
+    )
+    runner = ctx.observer.runner
+    monkeypatch.setattr(runner, "handlers", [(prefix, Result(prefix, 0, '{"log":"vLLM: HFValidationError mock-secret-value"}')), *runner.handlers])
+
+    await user.open("/models")
+    button = "Лог упавшего воркера модели"
+    user.find(kind=ui.table).trigger("rowClick", [None, {"id": "failed-before-mlsc"}])
+    await user.should_not_see(button)
+    user.find("Закрыть").click()
+    user.find(kind=ui.table).trigger("rowClick", [None, {"id": "stopped-model"}])
+    user.find(button).click()
+    await user.should_see("MLSC: последний упавший воркер · версия 1446")
+    await user.should_see("vLLM: HFValidationError <secret>")
+    assert any(argv == prefix and meta["stdin"] == "token" for argv, meta in runner.calls)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy: bool) -> None:
+    ctx = fakes.CTX
+    revision = await ctx.manager.prepare("master")
+    ctx.settings.quotas.user_gpus = ctx.settings.quotas.total_gpus = 32
+    extra = ("++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", "++mlsc.create_job.job.job_priority_class=high",
+             "++mlsc.create_job.job.queue_name=shared")
+    source = await ctx.sessions.start(revision, recipe="glm", model_name="GLM-personal", replicas=3,
+                                      inference="nginx", ttl_minutes=85, extra=extra)
+    await ctx.sessions.tasks[source.id]
+    await ctx.sessions.stop(source.id)
+    if legacy:
+        (Path(source.dir) / "launch.json").unlink()
+        import shlex
+        argv = ["uv", "run", "fleet", "console_model.yaml"]
+        for value in ["experiment.jobs=3", "output_dir=/old/out", "mlsc.served_model_name=GLM-personal", *extra, "main.run=[mlsc.create_job]"]:
+            argv += ["-o", value]
+        ctx.store.conn.execute("UPDATE session_stages SET command=? WHERE session_id=? AND stage='preflight'", (shlex.join(argv), source.id))
+        ctx.store.conn.commit()
+    await ctx.manager.prepare("feat/x")  # в шапке выбрана другая ревизия
+    await user.open("/models")
+    user.find(kind=ui.table).trigger("rowClick", [None, {"id": source.id}])
+    user.find("Повторить с правками").click()
+    await user.should_see("Будет создана новая сессия")
+    assert ctx.manager.prepared[-1] == source.sha
+    assert _select(user, "Рецепт mlsc/model").value == "glm"
+    assert _select(user, "Маршрут").value == "nginx"
+    assert _select(user, "Приоритет джобы").value == "high"
+    assert _select(user, "Очередь MLSC").value == "shared"
+    numbers = {e.props["label"]: e for e in user.find(kind=ui.number).elements}
+    assert numbers["Реплики"].value == 3 and numbers["Время жизни, мин"].value == 85
+    model = next(e for e in user.find(kind=ui.input).elements if e.props.get("label", "").startswith("Имя модели"))
+    assert model.value == "GLM-personal"
+    overrides = next(e for e in user.find(kind=ui.textarea).elements if e.props.get("label", "").startswith("overrides fleet"))
+    assert overrides.value == extra[0]
+    assert len(ctx.sessions.sessions()) == 1  # открытие формы не создаёт сессию и не занимает GPU
+    model.set_value("GLM-repeated")
+    user.find(marker="start-session").click()
+    await user.should_see("Занять GPU под модель?")
+    assert len(ctx.sessions.sessions()) == 1
+    user.find("Да, поднять").click()
+    await user.should_see("подъём начат")
+    await asyncio.gather(*ctx.sessions.tasks.values())
+    repeated = next(s for s in ctx.sessions.sessions() if s.id != source.id)
+    assert repeated.sha == source.sha and repeated.model.startswith("glm-repeated-")
+    assert ctx.sessions.launch_options(repeated)["extra"] == extra
+    assert ctx.sessions.get(source.id).model == source.model and ctx.sessions.get(source.id).status == "stopped"
+    await ctx.sessions.stop(repeated.id)
+
+
+async def test_repeat_model_session_shows_revision_prepare_error(user: User) -> None:
+    ctx = fakes.CTX
+    source = await ctx.sessions.start(await ctx.manager.prepare("master"), recipe="glm")
+    await ctx.sessions.tasks[source.id]
+    await ctx.sessions.stop(source.id)
+    ctx.manager.prepare_error = "Не удалось подготовить исходную ревизию"
+    await user.open("/models")
+    user.find(kind=ui.table).trigger("rowClick", [None, {"id": source.id}])
+    user.find("Повторить с правками").click()
+    await user.should_see("Не удалось подготовить исходную ревизию")
+    assert len(ctx.sessions.sessions()) == 1
 
 
 async def test_benches_page_form_preview_and_run(user: User) -> None:
@@ -218,40 +332,47 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.should_see("GPU: 1 × 8 = 8 · лимит агентов 1 × 2 = 2")
     priority = _select(user, "Приоритет джобы")
     assert priority.value == ""
+    queue = _select(user, "Очередь MLSC")
+    assert queue.value == ""
     user.find("Превью и preflight").click()
     await user.should_see("Что и где будет запущено")
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
     assert preview["GPU"] == "1 × a100plus.8gpu.80vG.96C.1456G = 8 GPU" and preview["Параллелизм"] == "лимит 2 = 1 реплик × 2 агентов"
-    assert preview["Модель"].startswith("GLM · образ fleet-vllm:0.24.0 · очередь gigacode · поднимет сервис")
+    assert " · образ fleet-vllm:0.24.0 · очередь gigacode · поднимет сервис" in preview["Модель"]
     assert preview["Приоритет джобы"] == "medium"
     (draft_dir,) = fakes.CTX.paths.runs.iterdir()
     assert "job_priority_class=" not in (draft_dir / "overrides.txt").read_text()
+    assert "queue_name=" not in (draft_dir / "overrides.txt").read_text()
     await user.should_see("Preflight: ✗ 0 · ⚠ 2")  # квота GPU и terminus-2 на Harbor 0.22
     await user.should_see("tasks → cowork (fleet)")
     start = user.find(marker="start-bench").elements.pop()
     assert not start.enabled  # предупреждения не приняты
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     assert start.enabled
-    priority.set_value("high")
+    queue.set_value("shared")
     assert not start.enabled
     await user.should_see("Обновите превью и preflight")
+    priority.set_value("high")
     user.find("Превью и preflight").click()
     await user.should_not_see("Обновите превью и preflight")
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
     assert preview["Приоритет джобы"] == "high"
+    assert "очередь shared" in preview["Модель"]
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     user.find(marker="start-bench").click()
     await user.should_see("Запустить прогон?")
     await user.should_see("приоритет джобы high")
+    await user.should_see("очередь MLSC shared")
     await user.should_see("стадии: preflight → материализация → create_job → start_llm → check → upload → launch → исполнение → stop_llm → замер")
     user.find("Да, запустить").click()
-    await user.should_see("начат")
+    await user.should_see("Заявка принята")
     await asyncio.gather(*fakes.CTX.benches.tasks.values())
     run = fakes.CTX.benches.runs()[0]
     assert run.status == "done" and run.version_id == 777 and run.task_limit == 3 and run.agents_per_replica == 2 and run.id.startswith("glm-cowork-")
     stages = fakes.CTX.benches.stages(run.id)
     assert [s.stage for s in stages] == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "stop_llm", "measure"]
     assert "++mlsc.create_job.job.job_priority_class=high" in stages[2].command
+    assert "++mlsc.create_job.job.queue_name=shared" in stages[2].command
     assert fakes.CTX.store.get_run(run.id) is not None and run.preview["gpu_per_instance"] == 8 and run.preview["tasks_total"] is None
     exp = (fakes.CTX.paths.runs / run.id / "exp.yaml").read_text()
     assert "harbor/dataset: cowork" in exp and "task_limit: 3" in exp and (fakes.CTX.paths.runs / run.id / "resolved.yaml").exists()
@@ -299,13 +420,16 @@ async def test_bench_on_existing_session_ignores_selected_priority(user: User) -
     await user.open("/runs")
     user.find("Запустить бенч").click()
     _select(user, "Приоритет джобы").set_value("high")
+    _select(user, "Очередь MLSC").set_value("shared")
     _select(user, "Модель").set_value("session:ready-model")
     await user.should_see("модель уже поднята: сессия GLM")
     await user.should_not_see("Приоритет джобы")
+    await user.should_not_see("Очередь MLSC")
     user.find("Превью и preflight").click()
     await user.should_see("Что и где будет запущено")
     (draft_dir,) = fakes.CTX.paths.runs.iterdir()
     assert "job_priority_class=" not in (draft_dir / "overrides.txt").read_text()
+    assert "queue_name=" not in (draft_dir / "overrides.txt").read_text()
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
     assert "сессия ready-model" in preview["Модель"] and "Приоритет джобы" not in preview
 
@@ -469,7 +593,7 @@ async def test_local_tasks_import_upload_and_run_form(user: User, tmp_path: Path
     user.find(marker="start-bench").click()
     await user.should_see("Запустить прогон?")
     user.find("Да, запустить").click()
-    await user.should_see("начат")
+    await user.should_see("Заявка принята")
     await asyncio.gather(*fakes.CTX.benches.tasks.values())
     run = next(r for r in fakes.CTX.benches.runs() if r.id == draft.parent.name)
     assert run.status == "done"
@@ -521,3 +645,18 @@ async def test_benches_form_offers_registry_benches_and_fills_path(user: User) -
     finally:
         for path in extra:
             path.unlink()
+
+
+async def test_queued_run_card_has_no_live_actions(user: User) -> None:
+    from fleet_console.store import BenchRun
+
+    ctx = fakes.CTX
+    ctx.store.create_bench(BenchRun(id="waiting", status="queued", created_at="2026-11-11", owner_id="local"))
+    await user.open("/runs")
+    table = next(t for t in user.find(kind=ui.table).elements if any(r.get("id") == "waiting" for r in t.rows))
+    row = next(r for r in table.rows if r.get("id") == "waiting")
+    user.find(kind=ui.table).elements = {table}
+    user.find(kind=ui.table).trigger("rowClick", [None, row])
+    await user.should_see("Ожидает свободной квоты. Ресурсы ещё не выделены.")
+    await user.should_see("Отменить заявку")
+    await user.should_not_see("Задачи прогона")

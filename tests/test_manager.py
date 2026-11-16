@@ -117,3 +117,19 @@ async def test_restore_last_revision_after_restart(manager: RevisionManager) -> 
     restored = await manager.restore()
     assert restored is not None and restored.info.sha == ready.info.sha and restored.from_cache and manager.current is restored
     assert await manager.restore() is restored  # повторно — без работы
+
+
+async def test_user_revision_choices_are_independent_and_survive_restart(manager):
+    await manager.ensure_mirror()
+    first = await manager.select("alice", "master")
+    second = await manager.select("bob", "feat/x")
+    assert first.info.sha != second.info.sha
+    assert manager.selected("alice").info.sha == first.info.sha
+    assert manager.selected("bob").info.sha == second.info.sha
+    manager.store.reserve_draft("draft", "alice", first.info.sha)
+    assert await manager.gc_worktrees(ttl_days=0) == []
+    manager.current = None
+    manager._ready.clear()
+    await manager.restore()
+    assert manager.selected("alice").info.sha == first.info.sha
+    assert manager.selected("bob").info.sha == second.info.sha

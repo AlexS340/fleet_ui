@@ -14,7 +14,8 @@ ROOT = "/manifests/harbor_run"
 # Один проход по /proc (423 каталога × 190 процессов перебором по каждому — минута, так — секунды).
 # submit_workflows[.]py: шаблон с классом, чтобы grep не нашёл собственную командную строку.
 SCRIPT = f"""
-cd {ROOT} 2>/dev/null || exit 0
+[ -e {ROOT} ] || exit 0
+cd {ROOT} || exit 1
 procs=$(for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' 2>/dev/null < "$f"; echo; done | grep 'submit_workflows[.]py')
 for d in */; do
   r="${{d%/}}"

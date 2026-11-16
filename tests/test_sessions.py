@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
+import json
 
 from fleet_console.fleetref.git import CommitInfo
 from fleet_console.fleetref.manager import ReadyRevision
@@ -20,7 +22,7 @@ T0 = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
 
 
 def _override(argv: tuple[str, ...], key: str) -> str | None:
-    for a, b in zip(argv, argv[1:]):
+    for a, b in reversed(list(zip(argv, argv[1:]))):
         if a == "-o" and b.startswith(key + "="):
             return b.split("=", 1)[1]
     return None
@@ -29,6 +31,7 @@ def _override(argv: tuple[str, ...], key: str) -> str | None:
 class Harness:
     def __init__(self, tmp_path: Path) -> None:
         self.now = T0
+        self.configuration = {"application_versions": {}, "application_version_states": {}}
         self.paths = Paths(tmp_path / "home").ensure()
         self.store = Store(self.paths.db)
         self.runner = FakeRunner()
@@ -54,16 +57,23 @@ class Harness:
             if step in self.fail:
                 return Result(argv, 1, f"{step} упал", "")  # как настоящий stream: stderr слит в stdout и в лог
             if step == "create_job":
-                Path(_override(argv, "mlsc.version_id_file")).write_text("1234\n", encoding="utf-8")
-            return Result(argv, 0, "mlsc:\n  served_model_name: GLM-5.3-Flash\n" if step == "preflight" else f"{step} ok\n")
+                version_id = str(1234 + len(self.configuration["application_versions"]))
+                Path(_override(argv, "mlsc.version_id_file")).write_text(version_id + "\n", encoding="utf-8")
+                self.configuration["application_versions"][version_id] = {"application_name": f"fleet-console {_override(argv, 'experiment.run_id')}"}
+            data = {"mlsc": {"served_model_name": _override(argv, "mlsc.served_model_name"), "create_job": {"job": {"instance_type_name": "a100plus.8gpu"}}},
+                    "experiment": {"jobs": int(_override(argv, "experiment.jobs")), "model_name": _override(argv, "mlsc.served_model_name")}}
+            return Result(argv, 0, yaml.safe_dump(data, sort_keys=False) if step == "preflight" else f"{step} ok\n")
 
         self.runner.on("uv", "run", result=fleet)
         self.runner.on("osascript")
+        self.runner.on("kubectl", "exec", "-i", result=lambda argv: Result(argv, 0, json.dumps(self.configuration)))
 
         async def pod() -> str:
             return "litellm-noauth-abc"
 
         settings = Settings()
+        settings.quotas.user_runs = settings.quotas.total_runs = 20
+        settings.quotas.user_gpus = settings.quotas.total_gpus = 160
         settings.session_grace_minutes = 10
         self.mgr = SessionManager(self.store, self.runner, self.paths, settings, token=lambda: "tok", mlsc_pod=pod, clock=lambda: self.now, platform="darwin")
 
@@ -82,7 +92,7 @@ def h(tmp_path: Path) -> Harness:
 
 
 def test_compose_helpers(tmp_path: Path, h: Harness) -> None:
-    assert make_run_id("GLM-5.3-Flash", T0) == "console-glm-5-3-flash-20261021-120000"
+    assert make_run_id("GLM-5.3-Flash", T0).startswith("console-glm-5-3-flash-20261021-120000-")
     assert gpu_in("a100plus.8gpu.80vG.96C.1456G") == 8 and gpu_in("${mlsc.instance_types.gpu1}") == 1 and gpu_in("cpu.48C") is None
     summary = recipe_summary(h.revision.worktree, "glm")
     assert summary["served_model_name"] == "GLM-5.3-Flash" and summary["gpu_per_instance"] == 8 and summary["image"] == "fleet-vllm:0.24.0"
@@ -101,7 +111,7 @@ async def test_session_comes_up_through_fleet_stages(h: Harness) -> None:
     session = await h.start(ttl_minutes=60)
     assert session.status == "ready" and session.version_id == 1234 and session.stage == ""
     assert session.expires_at == (T0 + timedelta(minutes=60)).isoformat(timespec="seconds")
-    assert h.steps == ["preflight", "create_job", "start_llm", "check"]
+    assert h.steps == ["preflight", "preflight", "create_job", "start_llm", "check"]
     cmds = h.commands(session.id)
     assert "main.run=[mlsc.create_job]" in cmds["create_job"] and "main.run=[mlsc.check_llm_works]" in cmds["check"]
     assert "experiment.jobs=2" in cmds["start_llm"] and "--print-config" in cmds["preflight"] and "tok" not in cmds["create_job"]
@@ -110,15 +120,16 @@ async def test_session_comes_up_through_fleet_stages(h: Harness) -> None:
     assert (run_dir / "version_id").read_text().strip() == "1234" and (run_dir / "logs" / "check.log").exists()
     envs = [meta["env"] for argv, meta in h.runner.calls if argv[:2] == ("uv", "run")]
     assert envs[0]["MLSC_TOKEN"] == "fleet-console-dummy" and "FLEET_DATASETS_ROOT" in envs[0]  # preflight: только заглушки, токен в resolved.yaml не попадает
-    assert envs[1] == {"MLSC_TOKEN": "tok"}  # стадии: только токен, остальное из окружения сервиса
+    assert envs[2] == {"MLSC_TOKEN": "tok"}  # стадии: только токен, остальное из окружения сервиса
     assert [s.returncode for s in h.store.stages(session.id)] == [0, 0, 0, 0]
     assert [e.action for e in h.store.events()][:2] == ["session_ready", "session_start"]
 
 
 async def test_failures_before_and_after_gpu(h: Harness) -> None:
     h.fail = {"preflight"}
-    session = await h.start()
-    assert session.status == "failed" and "preflight" in session.error and h.steps == ["preflight"]
+    with pytest.raises(SessionError, match="Preflight"):
+        await h.start()
+    assert h.steps == ["preflight"] and not h.mgr.sessions()
     h.fail = {"check"}
     session = await h.start()
     assert session.status == "attention" and session.version_id == 1234 and "check" in session.error and "упал" in session.error
@@ -163,26 +174,111 @@ async def test_timer_warns_then_stops_after_grace(h: Harness) -> None:
 
 
 async def test_resume_after_restart(h: Harness) -> None:
-    ready = await h.start()
+    ready = await h.start(extra=("mlsc.model_path=/models/custom",))
     h.store.update_session(ready.id, status="starting", stage="check")  # сервис перезапущен посреди check
     no_version = await h.start()
     h.store.update_session(no_version.id, status="starting", version_id=None)
+    h.configuration["application_versions"].pop(str(no_version.version_id))
+    (Path(no_version.dir) / "version_id").unlink()
     stopping = await h.start()
     h.store.update_session(stopping.id, status="stopping")
     h.steps.clear()
     await h.mgr.resume()
     await asyncio.gather(*h.mgr.tasks.values())
     assert h.mgr.get(ready.id).status == "ready" and h.steps == ["start_llm", "check"]  # без повторного create_job
-    assert h.mgr.get(no_version.id).status == "failed" and "version_id" in h.mgr.get(no_version.id).error
-    assert h.mgr.get(stopping.id).status == "attention"
+    assert all("mlsc.model_path=/models/custom" in stage.command for stage in h.store.stages(ready.id)[-2:])
+    assert h.mgr.get(no_version.id).status == "attention" and "create_job" in h.mgr.get(no_version.id).error
+    assert h.mgr.get(stopping.id).status == "stopped"
 
 
-async def test_start_without_model_name_takes_served_model_name_from_recipe(h: Harness) -> None:
+async def test_interrupted_stop_keeps_reservation_until_mlsc_confirms(h: Harness) -> None:
+    session = await h.start()
+    h.store.update_session(session.id, status="stopping")
+    state = {"planned": 0, "current": 1}
+    h.configuration["application_version_states"][str(session.version_id)] = state
+    h.steps.clear()
+    await h.mgr.resume()
+    assert "ещё активна" in h.mgr.get(session.id).error
+    assert h.store.request(session.id)["state"] == "reserved"
+    state["current"] = 0
+    await h.mgr.tick()
+    assert h.mgr.get(session.id).status == "stopped" and h.store.request(session.id)["state"] == "released"
+    assert h.steps == []
+
+
+async def test_start_without_model_name_allocates_unique_route(h: Harness) -> None:
     session = await h.mgr.start(h.revision, recipe="glm", model_name="", replicas=1)
     await h.mgr.tasks[session.id]
-    assert h.mgr.get(session.id).model == "GLM-5.3-Flash"
+    assert h.mgr.get(session.id).model.startswith("glm-")
     assert session.id.startswith("console-glm-")  # id по рецепту, как и раньше
-    assert "mlsc.served_model_name=" not in h.commands(session.id)["create_job"]  # имя из рецепта не переопределяется
+    assert f"mlsc.served_model_name={session.model}" in h.commands(session.id)["create_job"]
+
+
+async def test_repeat_keeps_launch_options_and_config_after_restart(h: Harness) -> None:
+    extra = ("++mlsc.create_job.job.job_priority_class=high", "++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", "experiment.jobs=4")
+    source = await h.start(ttl_minutes=75, inference="nginx", extra=extra)
+    config = Path(source.dir) / "console_model.yaml"
+    config.write_text(config.read_text() + "\n# настройка этой сессии\n", encoding="utf-8")
+    await h.mgr.set_replicas(source.id, 5)
+    assert [value for value in h.runner.calls[-1][0] if value.startswith("experiment.jobs=")][-1] == "experiment.jobs=5"
+    await h.mgr.stop(source.id)
+    h.store.close()
+    h.mgr.store = h.store = Store(h.paths.db)
+    options = h.mgr.launch_options(h.mgr.get(source.id))
+    assert options == {"recipe": "glm", "model_name": "GLM-5.3-Flash", "replicas": 2, "inference": "nginx", "ttl_minutes": 75, "extra": extra}
+    repeated = await h.mgr.start(h.revision, source_id=source.id, **options)
+    await h.mgr.tasks[repeated.id]
+    assert repeated.id != source.id and repeated.dir != source.dir
+    assert h.mgr.get(repeated.id).status == "ready"
+    assert (Path(repeated.dir) / "console_model.yaml").read_text() == config.read_text()
+    assert h.mgr.get(source.id).status == "stopped"
+    spec = await h.mgr.spec(h.mgr.get(repeated.id))
+    assert spec.extra == extra and spec.version_id_file.parent == Path(repeated.dir)
+    assert all(value in spec.overrides("check") for value in extra)
+    assert f"{source.dir}/" not in h.commands(repeated.id)["create_job"]
+
+
+@pytest.mark.parametrize("model_name", ["", "GLM-custom"])
+async def test_repeat_recovers_legacy_overrides_from_original_command(h: Harness, model_name: str) -> None:
+    extra = ("++mlsc.create_job.job.command='vllm serve /models/a --chat-template {x}'", "experiment.jobs=3", "++mlsc.create_job.job.job_priority_class=high")
+    source = await h.mgr.start(h.revision, recipe="glm", model_name=model_name, replicas=2, extra=extra)
+    await h.mgr.tasks[source.id]
+    (Path(source.dir) / "launch.json").unlink()
+    import shlex
+    legacy = ["uv", "run", "fleet", "console_model.yaml"]
+    values = ["experiment.jobs=2", "output_dir=/old/out"]
+    if model_name:
+        values.append(f"mlsc.served_model_name={model_name}")
+    values += [*extra, "main.run=[mlsc.create_job]"]
+    for value in values:
+        legacy += ["-o", value]
+    h.store.conn.execute("UPDATE session_stages SET command=? WHERE session_id=? AND stage='preflight'", (shlex.join(legacy), source.id))
+    h.store.conn.commit()
+    await h.mgr.set_replicas(source.id, 4)  # последняя команда — не исходная; пользовательский experiment.jobs надо сохранить
+    options = h.mgr.launch_options(h.mgr.get(source.id))
+    assert options["model_name"] == model_name and options["extra"] == extra
+    spec = await h.mgr.spec(h.mgr.get(source.id))
+    assert spec.extra == extra
+    assert "main.run=[mlsc.check_llm_works]" == spec.overrides("check")[-1]
+
+
+async def test_repeat_refuses_missing_config_or_changed_sha(h: Harness) -> None:
+    from dataclasses import replace
+
+    source = await h.start()
+    with pytest.raises(SessionError, match="исходный SHA"):
+        await h.mgr.start(replace(h.revision, info=replace(h.revision.info, sha="f" * 40)), recipe="glm", source_id=source.id)
+    (Path(source.dir) / "console_model.yaml").unlink()
+    with pytest.raises(SessionError, match="исходный конфиг"):
+        await h.mgr.start(h.revision, recipe="glm", source_id=source.id)
+    path = Path(source.dir) / "launch.json"
+    path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(SessionError, match="параметры сессии"):
+        h.mgr.launch_options(source)
+    path.unlink()
+    h.store.conn.execute("DELETE FROM session_stages WHERE session_id = ?", (source.id,))
+    with pytest.raises(SessionError, match="исходной команды"):
+        h.mgr.launch_options(source)
 
 
 async def test_session_under_bench_is_paused_and_protected(h: Harness) -> None:

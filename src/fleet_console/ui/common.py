@@ -1,14 +1,24 @@
-"""Общие кусочки UI: диалог подтверждения разрушительного действия, вопросик с подсказкой."""
+"""Общие диалоги и подсказки UI."""
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from nicegui import ui
 
+from fleet_console.settings import scrub
+
 JOB_PRIORITY_OVERRIDE = "++mlsc.create_job.job.job_priority_class"
+JOB_QUEUE_KEY = "mlsc.create_job.job.queue_name"
+JOB_QUEUES = ("gigacode", "shared")
 
 
 def job_priority_select() -> ui.select:
     return ui.select({"": "Из рецепта", "medium": "medium", "high": "high"}, value="", label="Приоритет джобы").classes("w-40")
+
+
+def job_queue_select() -> ui.select:
+    return ui.select({"": "Из рецепта", **{queue: queue for queue in JOB_QUEUES}}, value="", label="Очередь MLSC").classes("w-36")
 
 
 def hint(text: str) -> ui.icon:
@@ -17,6 +27,26 @@ def hint(text: str) -> ui.icon:
     with icon:
         ui.tooltip(text).props('max-width="24rem"').classes("text-sm")
     return icon
+
+
+def text_dialog(title: str, text_coro: Awaitable[str], secrets: Callable[[], dict[str, str]]) -> None:
+    """Диалог с текстом, который ещё читается. Секреты вырезаются при показе."""
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
+        ui.label(title).classes("text-xs opacity-60 break-all")
+        body = ui.label("читаю…").classes("font-mono text-xs whitespace-pre-wrap break-all w-full").style("max-height: 65vh; overflow: auto")
+        ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+    dialog.open()
+
+    async def load() -> None:
+        try:
+            text = await text_coro
+        except Exception as exc:  # noqa: BLE001 — ошибку команды показываем в диалоге
+            body.set_text(scrub(str(exc), secrets().values()))
+            body.classes("text-negative")
+            return
+        body.set_text(scrub(text, secrets().values()) or "(пусто)")
+
+    ui.timer(0, load, once=True)
 
 
 def confirm_dialog(title: str, lines: list[str], action, after=None, button: str = "Выполнить") -> None:

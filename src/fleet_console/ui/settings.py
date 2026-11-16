@@ -19,18 +19,26 @@ def settings_page(ctx: AppContext) -> None:
         ssh_host = ui.input("ssh host бастиона (пусто — сервис не управляет сессией)", value=s.bastion.ssh_host).classes("w-full")
         socks = ui.input("SOCKS-прокси для uv sync при ошибке прямого подключения", value=s.bastion.socks_proxy).classes("w-full")
         with ui.row().classes("gap-4 flex-wrap"):
-            auto_fetch = ui.number("Авто-fetch, минут (0 — выключен)", value=s.auto_fetch_minutes, min=0, precision=0)
+            auto_fetch = ui.number("Авто-fetch, минут (0 — выключен)", value=s.auto_fetch_minutes, min=0, precision=0).classes("w-64 max-w-full")
             ttl = ui.number("TTL worktree, дней", value=s.worktree_ttl_days, min=1, precision=0)
         datasets_root = ui.input("Корень датасетов Harbor (FLEET_DATASETS_ROOT; пусто — из окружения сервиса)", value=s.datasets_root).classes("w-full")
         s3_profile = ui.input("Профиль ключей S3 для чтения из сервиса (AWS_*_<профиль>: список файлов прогона, скачивание датасетов)", value=s.s3_read_profile).classes("w-full")
         s3_write = ui.input("Профиль ключей S3 для загрузки локальных задач (нужно право PutObject)", value=s.s3_write_profile).classes("w-full")
         with ui.row().classes("gap-4 flex-wrap"):
-            requeue = ui.number("Раундов requeue упавших", value=s.bench.requeue_rounds, min=0, max=3, precision=0)
-            attention = ui.number("Автогашение без ответа, мин (0 — нет)", value=s.bench.attention_minutes, min=0, precision=0)
+            requeue = ui.number("Раундов requeue упавших", value=s.bench.requeue_rounds, min=0, max=3, precision=0).classes("w-48 max-w-full")
+            attention = ui.number("Автогашение без ответа, мин (0 — нет)", value=s.bench.attention_minutes, min=0, precision=0).classes("w-72 max-w-full")
             poll = ui.number("Опрос прогона, с", value=s.bench.poll_seconds, min=5, precision=0)
+        with ui.expansion("Квоты и приватные результаты").classes("w-full"):
+            with ui.row().classes("gap-4 flex-wrap"):
+                user_runs = ui.number("Заявок на пользователя", value=s.quotas.user_runs, min=1, precision=0)
+                total_runs = ui.number("Заявок всего", value=s.quotas.total_runs, min=1, precision=0)
+                user_gpus = ui.number("GPU на пользователя", value=s.quotas.user_gpus, min=1, precision=0)
+                total_gpus = ui.number("GPU всего", value=s.quotas.total_gpus, min=1, precision=0)
+            private_s3 = ui.input("Закрытый S3-корень результатов", value=s.results.private_s3_root).classes("w-full")
+            ui.label("Для общего режима нужен отдельный бакет без доступа из общего Benchboard. Права хранилища настраивает оператор.").classes("text-sm opacity-70")
         ui.label(
             f"Данные сервиса: {ctx.paths.home} · MLSC_TOKEN — окружение или {ctx.paths.secrets_env.name}; ключи S3 — профиль gcvmfleet в ~/.aws/credentials"
-        ).classes("text-sm opacity-70")
+        ).classes("text-sm opacity-70 break-all")
 
         def save() -> None:
             ctx.access.require_admin()
@@ -47,6 +55,9 @@ def settings_page(ctx: AppContext) -> None:
             s.bench.requeue_rounds = int(requeue.value or 0)
             s.bench.attention_minutes = int(attention.value or 0)
             s.bench.poll_seconds = int(poll.value or 20)
+            for name, element in (("user_runs", user_runs), ("total_runs", total_runs), ("user_gpus", user_gpus), ("total_gpus", total_gpus)):
+                setattr(s.quotas, name, max(1, int(element.value or 1)))
+            s.results.private_s3_root = private_s3.value.strip().rstrip("/")
             s.save(ctx.paths)
             ui.notify("Сохранено. Пробросы и зеркало применят новые значения после перезапуска сервиса.")
 

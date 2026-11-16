@@ -27,6 +27,16 @@ def test_round_trip_and_partial_file(tmp_path: Path) -> None:
     assert Settings.load(paths).auto_fetch_minutes == 15
 
 
+def test_previous_mlsc_address_is_migrated_without_rewriting_user_file(tmp_path):
+    paths = Paths(tmp_path).ensure()
+    original = "cluster:\n  mlsc_base_url: https://text-coordinator-proxy.mlrnd.ru/mlc/\n"
+    paths.settings_file.write_text(original)
+    assert Settings.load(paths).cluster.mlsc_base_url == "https://text-coordinator-proxy.sberai-rnd.ru/mlc/"
+    assert paths.settings_file.read_text() == original
+    paths.settings_file.write_text("cluster:\n  mlsc_base_url: https://custom/mlc/\n")
+    assert Settings.load(paths).cluster.mlsc_base_url == "https://custom/mlc/"
+
+
 def test_home_from_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("FLEET_CONSOLE_HOME", str(tmp_path / "x"))
     assert default_home() == tmp_path / "x"

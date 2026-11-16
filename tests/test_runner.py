@@ -1,6 +1,8 @@
 from pathlib import Path
 import sys
 
+import pytest
+
 from fleet_console.runner import CommandError, FakeRunner, Result, SubprocessRunner
 
 
@@ -130,3 +132,15 @@ async def test_fake_runner_detach_writes_stage_files(tmp_path: Path) -> None:
     proc = await fake.detach(["uv", "run", "fleet"], files=files, cwd=tmp_path)
     assert await proc.wait() == 0 and files.read_exit() == 0 and "ok" in files.log.read_text()
     assert fake.calls[-1][1]["files"] is files
+
+
+async def test_stage_ignores_pid_reused_after_pod_replacement(tmp_path: Path, monkeypatch) -> None:
+    import os
+    from fleet_console.runner import StageFiles, attach, kill_stage
+
+    files = StageFiles.for_stage(tmp_path, "launch")
+    files.pid.write_text(str(os.getpid()))
+    files.process.write_text("marker-from-old-pod")
+    monkeypatch.setattr(os, "killpg", lambda *args: pytest.fail("PID принадлежит другому процессу"))
+    assert not files.alive() and not kill_stage(files)
+    assert await attach(files, poll=0.01) is None

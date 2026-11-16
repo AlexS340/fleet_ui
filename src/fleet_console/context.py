@@ -75,6 +75,10 @@ class AppContext:
     def user_datasets(self):
         return [dataset for dataset in self.local_datasets.all() if self.access.allows(dataset)]
 
+    @property
+    def revision(self):
+        return self.manager.selected(self.access.id)
+
     def user_dataset(self, dataset_id: str):
         try:
             dataset = self.local_datasets.get(dataset_id)
@@ -173,6 +177,16 @@ class AppContext:
 
     async def set_replicas(self, version_id: int, count: int) -> str:
         """Плановое число инстансов версии MLSC: реплики на лету или 0 — погасить."""
+        session = next((s for s in self.sessions.sessions() if s.version_id == version_id and self.store.request(s.id)), None)
+        if session:
+            await self.sessions.set_replicas(session.id, count)
+            return f"planned={count}"
+        bench = next((b for b in self.benches.runs() if b.own_model and b.version_id == version_id and self.store.request(b.id)), None)
+        if bench:
+            per_gpu = bench.preview.get("gpu_per_instance")
+            if type(per_gpu) is not int or count < 0:
+                raise ValueError("Неизвестно число GPU на реплику")
+            self.store.grow_reservation(bench.id, count * per_gpu, self.settings.quotas)
         c = self.settings.cluster
         try:
             token = self.observer.require_token()
@@ -198,6 +212,7 @@ class AppContext:
 
     # --- бенч-прогоны ----------------------------------------------------
     async def _benches_loop(self) -> None:
+        await self._wait_for_cluster()
         try:
             await self.benches.resume()
             await self.benches.restore_measurements()
@@ -212,6 +227,7 @@ class AppContext:
 
     # --- сессии моделей --------------------------------------------------
     async def _sessions_loop(self) -> None:
+        await self._wait_for_cluster()
         await self.sessions.resume()
         while True:
             await asyncio.sleep(SESSIONS_POLL_SEC)
@@ -219,6 +235,10 @@ class AppContext:
                 await self.sessions.tick()
             except Exception as exc:  # noqa: BLE001 — таймер не должен умереть из-за одной ошибки kubectl
                 self.store.event("sessions_tick", "-", "error", str(exc))
+
+    async def _wait_for_cluster(self) -> None:
+        while not self.kube_status.ready:
+            await asyncio.sleep(KUBE_RETRY_SEC)
 
     # --- защита от сна ---------------------------------------------------
     def sleep_reasons(self) -> dict[str, str]:

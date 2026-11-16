@@ -14,6 +14,7 @@ from fleet_console.auth import AccessDenied
 from fleet_console.context import AppContext
 from fleet_console.observe import Source
 from fleet_console.observe.argo import argo_ui_url
+from fleet_console.observe.mlsc import console_run_id
 from fleet_console.observe.submitter import ROOT
 from fleet_console.settings import scrub
 from fleet_console.ui.common import confirm_dialog, hint
@@ -224,6 +225,12 @@ def _render_mlsc(card: _Card, ctx: AppContext) -> None:
         return
     own = [o for o in ctx.store.own_runs().values() if ctx.access.allows(o)]
     versions = [v for v in card.source.data if ctx.access.admin or any(o.version_id == v.version_id for o in own)]
+    journal_ids = set()
+    if ctx.access.admin and ctx.observer.current(card.source) is not None:
+        journal_ids = {o.run_id for o in own} | {s.id for s in ctx.sessions.sessions()} | {r.id for r in ctx.benches.runs()}
+        unmatched = [str(v.version_id) for v in versions if (run_id := console_run_id(v.application)) and run_id not in journal_ids]
+    else:
+        unmatched = []
     rows = [
         {
             "id": v.version_id,
@@ -237,7 +244,8 @@ def _render_mlsc(card: _Card, ctx: AppContext) -> None:
         }
         for v in versions
     ]
-    card.render(rows, f"живых версий: {len(versions)} · GPU занято: {sum(v.gpus or 0 for v in versions)}")
+    note = f"Версии Console без записи в журнале: {', '.join(unmatched)}" if unmatched else ""
+    card.render(rows, f"живых версий: {len(versions)} · GPU занято: {sum(v.gpus or 0 for v in versions)}", note)
 
 
 def _render_nginx(card: _Card) -> None:
@@ -428,7 +436,7 @@ def _stop_dialog(ctx: AppContext, run_id: str, row: dict, version, on_change) ->
         async def run() -> None:
             ctx.access.require(ctx.store.get_run(run_id))
             log.set_text("останавливаю…")
-            if ctx.settings.auth.mode != "local" and ctx.store.get_bench(run_id):
+            if ctx.store.get_bench(run_id) and (ctx.settings.auth.mode != "local" or ctx.store.request(run_id)):
                 bench = await ctx.benches.stop(run_id, access=ctx.access)
                 log.set_text(bench.error or "Прогон остановлен")
                 on_change()

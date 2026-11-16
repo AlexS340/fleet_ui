@@ -76,7 +76,22 @@ class RevisionManager:
         self.sync_gate = sync_gate
         self.progress = Progress()
         self.current: ReadyRevision | None = None
+        self._ready: dict[str, ReadyRevision] = {}
         self._lock = asyncio.Lock()
+
+    def selected(self, owner_id: str) -> ReadyRevision | None:
+        if self.current:
+            self._ready[self.current.info.sha] = self.current
+        sha = self.store.selected_revision(owner_id)
+        if sha is None and self.current:
+            sha = self.current.info.sha
+            self.store.select_revision(owner_id, sha)
+        return self._ready.get(sha) if sha else None
+
+    async def select(self, owner_id: str, ref: str) -> ReadyRevision:
+        revision = await self.prepare(ref)
+        self.store.select_revision(owner_id, revision.info.sha)
+        return revision
 
     # --- зеркало ---------------------------------------------------------
     async def ensure_mirror(self) -> None:
@@ -161,6 +176,7 @@ class RevisionManager:
                 raise PrepareError(str(exc)) from exc
             self.progress.phase = "done"
             self.current = ReadyRevision(ref, info, worktree, profile, from_cache=cached is not None)
+            self._ready[sha] = self.current
             return self.current
 
     async def file_at(self, sha: str, rel: str) -> str | None:
@@ -181,7 +197,12 @@ class RevisionManager:
             if not self.is_ready(rev.sha):
                 continue
             try:
-                return await self.prepare(rev.ref or rev.sha)
+                default = await self.prepare(rev.sha)
+                for row in self.store.conn.execute("SELECT DISTINCT sha FROM revision_choices").fetchall():
+                    if self.is_ready(row["sha"]) and row["sha"] not in self._ready:
+                        await self.prepare(row["sha"])
+                self.current = default
+                return default
             except PrepareError:
                 return None
         return None
@@ -192,6 +213,10 @@ class RevisionManager:
         now = datetime.now(timezone.utc)
         removed: list[str] = []
         for sha in self.mirror.worktrees():
+            if (self.store.conn.execute("SELECT 1 FROM drafts WHERE sha=?", (sha,)).fetchone()
+                    or self.store.conn.execute("SELECT 1 FROM revision_choices WHERE sha=?", (sha,)).fetchone()
+                    or any(r.sha == sha for r in [*self.store.benches(True), *self.store.sessions(True)])):
+                continue
             rev = self.store.get_revision(sha)
             if rev is not None:
                 last_used = datetime.fromisoformat(rev.last_used_at)
