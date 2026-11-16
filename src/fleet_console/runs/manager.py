@@ -29,6 +29,7 @@ from fleet_console.compose.policy import check_gpu, private_root, supports_priva
 from fleet_console.control.runs import active_workflows
 from fleet_console.fleetref.profile import DUMMY_ENV
 from fleet_console.models import SessionManager
+from fleet_console.models.compose import job_priority_problem
 from fleet_console.observe import ClusterObserver
 from fleet_console.observe import argo, mlsc, s3, submitter
 from fleet_console.observe.argo import TaskWorkflow
@@ -376,6 +377,8 @@ class BenchManager:
         system = resolved.get("system") or {}
         if preview.run_id != spec.run_id or preview.model != spec.effective_model:
             raise BenchError("Итоговый конфиг меняет ID прогона или маршрут модели")
+        if not spec.session and (problem := job_priority_problem(preview.queue, preview.job_priority)):
+            raise BenchError(problem)
         if spec.read_only_measure and (system.get("measure_run") or {}).get("read_only") is not True:
             raise BenchError("Итоговый конфиг не подтверждает приватный замер read_only")
         if spec.private_s3_root:

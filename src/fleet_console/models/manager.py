@@ -22,7 +22,7 @@ import yaml
 
 from fleet_console.fleetref.manager import ReadyRevision
 from fleet_console.fleetref.profile import DUMMY_ENV
-from fleet_console.models.compose import CONFIG_NAME, SessionSpec, make_run_id, write_config
+from fleet_console.models.compose import CONFIG_NAME, SessionSpec, job_priority_problem, make_run_id, write_config
 from fleet_console.auth import Access
 from fleet_console.compose.spec import model_route
 from fleet_console.compose.preview import from_resolved
@@ -226,6 +226,8 @@ class SessionManager:
         spec.resolved.write_text(scrub(result.stdout, [self.token() or ""]))
         try:
             preview = from_resolved(yaml.safe_load(spec.resolved.read_text()))
+            if problem := job_priority_problem(preview.queue, preview.job_priority):
+                raise ValueError(problem)
             _, user_limit = self.store.user_limits(access.id if access else LOCAL_OWNER, self.settings.quotas)
             gpu = check_gpu(preview.gpu_total, self.settings, user_limit=user_limit)
             if preview.model != model or preview.replicas != replicas:
@@ -508,6 +510,8 @@ class SessionManager:
             spec.resolved.write_text(scrub(result.stdout, secrets), encoding="utf-8")
             if request := self.store.request(session_id):
                 preview = from_resolved(yaml.safe_load(result.stdout))
+                if problem := job_priority_problem(preview.queue, preview.job_priority):
+                    raise SessionError(problem)
                 if preview.model != spec.model_name or preview.gpu_total != request["gpu"]:
                     raise SessionError("Конфиг модели изменился после принятия заявки; создайте новую сессию")
         else:

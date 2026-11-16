@@ -13,6 +13,7 @@ from fleet_console.compose.registry import Mapping, find_mapping
 from fleet_console.compose.spec import prefix_problem
 from fleet_console.connect.kube import KubeStatus
 from fleet_console.fleetref.profile import Profile
+from fleet_console.models.compose import job_priority_problem
 from fleet_console.settings import KNOWN_ISSUES, SECRET_NAMES
 
 # Шаги fleet, без которых стадии сервиса не собрать.
@@ -140,6 +141,11 @@ def run_checks(
         checks.append(Check("config", "Сборка конфига (--print-config)", "fail", f"experiment.workflow_prefix {problem}: workflow не создастся"))
     else:
         checks.append(Check("config", "Сборка конфига (--print-config)", "ok", "resolved.yaml записан"))
+
+    if own_model and resolved is not None:
+        job = ((resolved.get("mlsc") or {}).get("create_job") or {}).get("job") or {}
+        if problem := job_priority_problem(str(job.get("queue_name") or ""), str(job.get("job_priority_class") or "")):
+            checks.append(Check("job_priority", "Приоритет MLSC", "fail", problem))
 
     if registry_errors:
         checks.append(Check("registry", "Реестр датасетов", "fail", "; ".join(registry_errors)))

@@ -30,6 +30,17 @@ STEPS = {
 }
 GPU_RE = re.compile(r"(\d+)gpu|gpu(\d+)")  # a100plus.8gpu.… или ${mlsc.instance_types.gpu8} из рецептов fleet
 SLUG_RE = re.compile(r"[^a-z0-9]+")
+JOB_PRIORITIES_BY_QUEUE = {
+    "gigacode": ("low", "medium", "high"),
+    "shared": ("shared-low", "shared-medium"),
+}
+
+
+def job_priority_problem(queue: str, priority: str) -> str:
+    allowed = JOB_PRIORITIES_BY_QUEUE.get(queue)
+    if allowed and priority and priority not in allowed:
+        return f"Очередь {queue} не принимает приоритет {priority}. Допустимые: {', '.join(allowed)}."
+    return ""
 
 
 def mlsc_url_overrides(base_url: str) -> list[str]:

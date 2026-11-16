@@ -6,20 +6,29 @@ from collections.abc import Awaitable, Callable
 
 from nicegui import ui
 
+from fleet_console.models.compose import JOB_PRIORITIES_BY_QUEUE
 from fleet_console.settings import scrub
 
 JOB_PRIORITY_OVERRIDE = "++mlsc.create_job.job.job_priority_class"
-JOB_PRIORITIES = ("low", "medium", "high")
+JOB_PRIORITIES = tuple(p for priorities in JOB_PRIORITIES_BY_QUEUE.values() for p in priorities)
 JOB_QUEUE_KEY = "mlsc.create_job.job.queue_name"
-JOB_QUEUES = ("gigacode", "shared")
+JOB_QUEUES = tuple(JOB_PRIORITIES_BY_QUEUE)
+DEFAULT_JOB_PRIORITIES = {"gigacode": "medium", "shared": "shared-low"}
 
 
-def job_priority_select() -> ui.select:
-    return ui.select({"": "Из рецепта", **{priority: priority for priority in JOB_PRIORITIES}}, value="", label="Приоритет джобы").classes("w-40")
+def set_job_priority_options(priority: ui.select, queue: str, preferred: str) -> None:
+    options = {p: p for p in JOB_PRIORITIES_BY_QUEUE.get(queue, JOB_PRIORITIES)}
+    if queue not in JOB_PRIORITIES_BY_QUEUE:
+        options = {"": "Из рецепта", **options}
+    priority.set_options(options, value=preferred if preferred in options else DEFAULT_JOB_PRIORITIES.get(queue, ""))
 
 
-def job_queue_select() -> ui.select:
-    return ui.select({"": "Из рецепта", **{queue: queue for queue in JOB_QUEUES}}, value="", label="Очередь MLSC").classes("w-36")
+def job_options_select(queue_value: str = "", priority_value: str = "") -> tuple[ui.select, ui.select]:
+    queue = ui.select({"": "Из рецепта", **{q: q for q in JOB_QUEUES}}, value=queue_value, label="Очередь MLSC").classes("w-36")
+    priority = ui.select({}, label="Приоритет джобы").classes("w-40")
+    set_job_priority_options(priority, queue_value, priority_value)
+    queue.on_value_change(lambda e: set_job_priority_options(priority, e.value, priority.value if e.value else ""))
+    return queue, priority
 
 
 def split_job_options(overrides: list[str]) -> tuple[str, str, list[str]]:

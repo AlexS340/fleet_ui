@@ -184,8 +184,8 @@ async def test_header_shows_sleep_guard(user: User) -> None:
         fakes.CTX.guard.last_sleep = None
 
 
-@pytest.mark.parametrize("job_priority", ["", "low", "high"])
-async def test_models_page_sessions(user: User, job_priority: str) -> None:
+@pytest.mark.parametrize(("job_queue", "job_priority"), [("", ""), ("shared", "shared-medium"), ("gigacode", "high")])
+async def test_models_page_sessions(user: User, job_queue: str, job_priority: str) -> None:
     await user.open("/models")
     await user.should_see("Сессии моделей")
     user.find("Поднять модель").click()
@@ -197,17 +197,19 @@ async def test_models_page_sessions(user: User, job_priority: str) -> None:
     await user.should_see("в рецепте: served_model_name GLM")
     priority = _select(user, "Приоритет джобы")
     assert priority.value == ""
-    priority.set_value(job_priority)
     queue = _select(user, "Очередь MLSC")
     assert queue.value == ""
-    if job_priority:
-        queue.set_value("shared")
+    queue.set_value(job_queue)
+    if job_queue == "shared":
+        assert list(priority.options) == ["shared-low", "shared-medium"]
+        assert priority.value == "shared-low"
+    priority.set_value(job_priority)
     user.find("Запустить подъём").click()
     await user.should_see("Занять GPU под модель?")
     await user.should_see("стадии: preflight → mlsc.create_job")
     if job_priority:
         await user.should_see(f"приоритет джобы {job_priority}")
-        await user.should_see("очередь MLSC shared")
+        await user.should_see(f"очередь MLSC {job_queue}")
     user.find("Да, поднять").click()
     await user.should_see("подъём начат")
     await asyncio.gather(*fakes.CTX.sessions.tasks.values())
@@ -221,7 +223,7 @@ async def test_models_page_sessions(user: User, job_priority: str) -> None:
             assert "queue_name=" not in stage.command
         else:
             assert f"++mlsc.create_job.job.job_priority_class={job_priority}" in stage.command
-            assert "++mlsc.create_job.job.queue_name=shared" in stage.command
+            assert f"++mlsc.create_job.job.queue_name={job_queue}" in stage.command
     assert "session:" + session.id in fakes.CTX.sleep_reasons()
     await fakes.CTX.sessions.stop(session.id)
     assert fakes.CTX.sessions.get(session.id).status == "stopped"
@@ -257,7 +259,7 @@ async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy:
     ctx = fakes.CTX
     revision = await ctx.manager.prepare("master")
     ctx.settings.quotas.user_gpus = ctx.settings.quotas.total_gpus = 32
-    extra = ("++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", "++mlsc.create_job.job.job_priority_class=low",
+    extra = ("++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", "++mlsc.create_job.job.job_priority_class=shared-medium",
              "++mlsc.create_job.job.queue_name=shared")
     source = await ctx.sessions.start(revision, recipe="glm", model_name="GLM-personal", replicas=3,
                                       inference="nginx", ttl_minutes=85, extra=extra)
@@ -279,7 +281,7 @@ async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy:
     assert ctx.manager.prepared[-1] == source.sha
     assert _select(user, "Рецепт mlsc/model").value == "glm"
     assert _select(user, "Маршрут").value == "nginx"
-    assert _select(user, "Приоритет джобы").value == "low"
+    assert _select(user, "Приоритет джобы").value == "shared-medium"
     assert _select(user, "Очередь MLSC").value == "shared"
     numbers = {e.props["label"]: e for e in user.find(kind=ui.number).elements}
     assert numbers["Реплики"].value == 3 and numbers["Время жизни, мин"].value == 85
@@ -355,19 +357,31 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     assert not start.enabled  # предупреждения не приняты
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     assert start.enabled
+    extra = next(e for e in user.find(kind=ui.textarea).elements if e.props.get("label", "").startswith("overrides fleet"))
+    extra.set_value("++mlsc.create_job.job.queue_name=shared\n++mlsc.create_job.job.job_priority_class=low")
+    user.find("Превью и preflight").click()
+    await user.should_see("Очередь shared не принимает приоритет low")
+    assert not start.enabled
+    extra.set_value("")
+    queue.set_value("shared")
+    assert list(priority.options) == ["shared-low", "shared-medium"]
+    assert priority.value == "shared-low"
+    priority.set_value("shared-medium")
+    queue.set_value("gigacode")
+    assert list(priority.options) == ["low", "medium", "high"]
+    assert priority.value == "medium"
     queue.set_value("shared")
     assert not start.enabled
     await user.should_see("Обновите превью и preflight")
-    priority.set_value("low")
     user.find("Превью и preflight").click()
     await user.should_not_see("Обновите превью и preflight")
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
-    assert preview["Приоритет джобы"] == "low"
+    assert preview["Приоритет джобы"] == "shared-low"
     assert "очередь shared" in preview["Модель"]
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     user.find(marker="start-bench").click()
     await user.should_see("Запустить прогон?")
-    await user.should_see("приоритет джобы low")
+    await user.should_see("приоритет джобы shared-low")
     await user.should_see("очередь MLSC shared")
     await user.should_see("стадии: preflight → материализация → create_job → start_llm → check → upload → launch → исполнение → stop_llm → замер")
     user.find("Да, запустить").click()
@@ -377,7 +391,7 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     assert run.status == "done" and run.version_id == 777 and run.task_limit == 3 and run.agents_per_replica == 2 and run.id.startswith("glm-cowork-")
     stages = fakes.CTX.benches.stages(run.id)
     assert [s.stage for s in stages] == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "stop_llm", "measure"]
-    assert "++mlsc.create_job.job.job_priority_class=low" in stages[2].command
+    assert "++mlsc.create_job.job.job_priority_class=shared-low" in stages[2].command
     assert "++mlsc.create_job.job.queue_name=shared" in stages[2].command
     assert fakes.CTX.store.get_run(run.id) is not None and run.preview["gpu_per_instance"] == 8 and run.preview["tasks_total"] is None
     exp = (fakes.CTX.paths.runs / run.id / "exp.yaml").read_text()
@@ -451,13 +465,13 @@ async def test_bench_can_save_preset_and_repeat_on_original_sha(user: User) -> N
     assert len(ctx.store.benches()) == 1
     assert ctx.manager.prepared[-1] == source.sha
     assert ctx.manager.selected(ctx.access.id).info.sha == fakes.SHA_FEAT
-    assert _select(user, "Приоритет джобы").value == "low"
+    assert _select(user, "Приоритет джобы").value == "shared-low"
     assert _select(user, "Очередь MLSC").value == "shared"
     assert _select(user, "Маршрут").value == "nginx"
     draft_dir, = [p for p in ctx.paths.runs.iterdir() if p != source.run_dir]
     clone = BenchSpec.from_json((draft_dir / "spec.json").read_text())
     assert clone.run_id != source.run_id and clone.effective_model != source.effective_model
-    assert clone.extra == (source.extra[-1], *source.extra[:2])
+    assert clone.extra == (source.extra[-1], "++mlsc.create_job.job.job_priority_class=shared-low", source.extra[1])
     assert clone.harbor_job == source.harbor_job and clone.task_limit == source.task_limit
     assert (draft_dir / edit.relative_to(source.run_dir)).read_text() == edit.read_text()
     assert "should-not-be-copied" not in (draft_dir / "resolved.yaml").read_text()
@@ -468,7 +482,7 @@ async def test_bench_can_save_preset_and_repeat_on_original_sha(user: User) -> N
     await user.should_see("Параметры из «smoke-copy»")
     assert ctx.manager.prepared[-1] == source.sha
     priority_fields = [e for e in user.find(kind=ui.select).elements if e.props.get("label") == "Приоритет джобы"]
-    assert max(priority_fields, key=lambda e: e.id).value == "low"
+    assert max(priority_fields, key=lambda e: e.id).value == "shared-low"
 
 
 async def test_bench_on_existing_session_ignores_selected_priority(user: User) -> None:

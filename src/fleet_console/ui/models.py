@@ -19,7 +19,7 @@ from fleet_console.models.compose import recipe_summary
 from fleet_console.observe.mlsc import Version
 from fleet_console.settings import scrub
 from fleet_console.store import Session
-from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_priority_select, job_queue_select, split_job_options, text_dialog
+from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_options_select, split_job_options, text_dialog
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
 
 GATEWAY_OPTIONS = {"litellm": "litellm — маршрут fleet по умолчанию", "nginx": "nginx — vllm-proxy"}
@@ -146,15 +146,12 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
         recipe = ui.select(recipes, value=options["recipe"] or (recipes[0] if recipes else None), label="Рецепт mlsc/model").classes("w-full")
         info = ui.label().classes("text-xs opacity-70")
         model = ui.input("Имя модели (уникальный суффикс добавится автоматически)", value=options["model_name"]).classes("w-full")
+        saved_priority, saved_queue, saved_extra = split_job_options(list(options["extra"]))
         with ui.row().classes("gap-3 flex-wrap"):
             replicas = ui.number("Реплики", value=options["replicas"], min=1, precision=0).classes("w-28")
             ttl = ui.number("Время жизни, мин", value=options["ttl_minutes"], min=5, precision=0).classes("w-40")
             inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value=options["inference"], label="Маршрут").classes("w-32")
-            priority = job_priority_select()
-            queue = job_queue_select()
-        saved_priority, saved_queue, saved_extra = split_job_options(list(options["extra"]))
-        priority.set_value(saved_priority)
-        queue.set_value(saved_queue)
+            queue, priority = job_options_select(saved_queue, saved_priority)
         with ui.expansion("Дополнительно").classes("w-full").set_visibility(ctx.access.admin):
             extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение", value="\n".join(saved_extra)).classes("w-full").props("autogrow")
         gpu_label = ui.label().classes("text-sm")
