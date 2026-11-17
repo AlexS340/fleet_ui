@@ -44,6 +44,7 @@ class ClusterObserver:
         self.version = 0  # растёт по каждому ответившему источнику: UI перерисовывается по изменению, не ждёт самый медленный
         self.busy = False
         self._mlsc_pod: str | None = None
+        self._mlsc_versions: dict[int, mlsc.Version] = {}
 
     @property
     def sources(self) -> list[Source]:
@@ -64,6 +65,11 @@ class ClusterObserver:
             return next((version for version in versions if version.version_id == version_id), None)
         matches = [version for version in versions if mlsc.console_run_id(version.application) == run_id]
         return matches[0] if len(matches) == 1 else None
+
+    def model_version(self, version_id: int) -> mlsc.Version | None:
+        if self.current(self.mlsc) is None:
+            return None
+        return self._mlsc_versions.get(version_id)
 
     async def refresh(self) -> None:
         if self.busy:
@@ -127,4 +133,5 @@ class ClusterObserver:
         except Exception:
             self._mlsc_pod = None  # под мог быть передеплоен: в следующий раз ищем заново
             raise
-        return mlsc.active_versions(configuration)
+        self._mlsc_versions = mlsc.parse_versions(configuration)
+        return [v for v in self._mlsc_versions.values() if v.planned or v.current]

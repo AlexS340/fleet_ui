@@ -28,6 +28,7 @@ class Version:
     instance_type: str = ""
     queue: str = ""
     image: str = ""
+    last_deploy_error: str = ""
 
     @property
     def gpu_per_instance(self) -> int | None:
@@ -54,31 +55,28 @@ def model_name(version: dict) -> str:
     return ""
 
 
-def active_versions(configuration: dict) -> list[Version]:
-    """Версии с planned > 0 или current > 0, по возрастанию id."""
+def parse_versions(configuration: dict) -> dict[int, Version]:
+    """Все известные версии, включая погашенные и версии с ошибкой старта."""
     states = configuration.get("application_version_states")
     versions = configuration.get("application_versions")
     if not isinstance(states, dict) or not isinstance(versions, dict):
         raise RuntimeError("MLSC не вернула списки версий и их состояний")
-    rows = []
-    for version_id, state in states.items():
-        planned, current = int(state.get("planned") or 0), int(state.get("current") or 0)
-        if planned == 0 and current == 0:
-            continue
+    rows = {}
+    for version_id in sorted(versions.keys() | states.keys(), key=int):
+        state = states.get(version_id) or {}
         v = versions.get(str(version_id)) or {}
-        rows.append(
-            Version(
-                int(version_id),
-                v.get("application_name") or "",
-                model_name(v),
-                planned,
-                current,
-                v.get("instance_type_name") or "",
-                v.get("queue_name") or "",
-                v.get("base_image") or "",
-            )
+        rows[int(version_id)] = Version(
+            int(version_id),
+            v.get("application_name") or "",
+            model_name(v),
+            int(state.get("planned") or 0),
+            int(state.get("current") or 0),
+            v.get("instance_type_name") or "",
+            v.get("queue_name") or "",
+            v.get("base_image") or "",
+            str(v.get("last_deploy_error") or "").strip(),
         )
-    return sorted(rows, key=lambda r: r.version_id)
+    return rows
 
 
 def console_run_id(application: str) -> str:

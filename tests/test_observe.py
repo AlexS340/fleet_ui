@@ -21,12 +21,11 @@ def test_argo_groups_runs_newest_first() -> None:
     assert argo.argo_ui_url("http://127.0.0.1:2746/", NS, "run-a") == f"http://127.0.0.1:2746/workflows/{NS}?label=fleet%2Frun-name%3Drun-a"
 
 
-def test_mlsc_active_versions_and_gpus() -> None:
+def test_mlsc_versions_and_gpus() -> None:
     import json
 
-    versions = mlsc.active_versions(json.loads(samples.CONFIGURATION))
-    assert [v.version_id for v in versions] == [41, 42]  # версия 40 с 0/0 не живая
-    glm, qwen = versions
+    versions = mlsc.parse_versions(json.loads(samples.CONFIGURATION))
+    glm, qwen = versions[41], versions[42]
     assert glm.model == "GLM-5.3-Flash" and glm.gpu_per_instance == 8 and glm.gpus == 24  # current=3
     assert qwen.model == "Qwen3" and qwen.gpus == 4
     assert mlsc.model_name({"job_command_line": "MODEL_PATH=/models/deepseek-v4/ serve"}) == "deepseek-v4"
@@ -74,6 +73,8 @@ async def test_observer_isolates_source_errors() -> None:
     assert obs.nginx.error and "forbidden" in obs.nginx.error and obs.nginx.data is None
     assert [r.run_name for r in obs.runs.data][:2] == ["run-a", "run-b"]
     assert [v.version_id for v in obs.mlsc.data] == [41, 42] and obs.mlsc.error == ""
+    stopped = obs.model_version(40)
+    assert stopped and (stopped.current, stopped.planned) == (0, 0)
     assert obs.submitter.data[0].run_id == "run-a" and obs.nodes.data.total == 3
     assert all(s.at is not None for s in obs.sources)
     assert await obs.submitter_log("run-a") == "[1/3] submitted wf-a-1\n"
@@ -91,6 +92,7 @@ async def test_observer_without_token_and_pod_rediscovery() -> None:
     fake.handlers.insert(0, (("kubectl", "exec", "-i"), Result(("x",), 1, "", "pod not found")))
     await obs.refresh()
     assert "pod not found" in obs.mlsc.error and obs._mlsc_pod is None  # под ищется заново
+    assert obs.model_version(41) is None
 
 
 def test_argo_tasks_parse_and_urls() -> None:

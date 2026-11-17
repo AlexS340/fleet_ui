@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from shlex import quote
 
@@ -6,6 +7,7 @@ from nicegui import ui
 from nicegui.testing import User
 import pytest
 
+import cluster_samples
 from fleet_console.fleetref.profile import CONFIGS_REL
 from fleet_console.compose import BenchSpec
 from fleet_console.presets import load_presets, personal_dir
@@ -746,3 +748,48 @@ async def test_queued_run_card_has_no_live_actions(user: User) -> None:
     await user.should_see("Ожидает свободной квоты. Ресурсы ещё не выделены.")
     await user.should_see("Отменить заявку")
     await user.should_not_see("Задачи прогона")
+
+
+async def test_bench_status_and_open_card_follow_mlsc_and_stage_changes(user: User) -> None:
+    ctx = fakes.CTX
+    now = fakes.NOW.isoformat()
+    conf = json.loads(cluster_samples.CONFIGURATION)
+    conf["application_version_states"]["41"] = {"planned": 1, "current": 0}
+    conf["application_versions"]["40"] = {"last_deploy_error": "PriorityNotApplicable"}
+    del conf["application_version_states"]["40"]  # MLSC не возвращает состояние погашенной версии
+    ctx.runner.handlers.insert(0, (("kubectl", "exec", "-i"), lambda argv: Result(argv, 0, json.dumps(conf))))
+    ctx.store.create_bench(BenchRun("waiting-model", "running", now, stage="check", version_id=41))
+    ctx.store.create_bench(BenchRun("stopped-model", "stopped", now, version_id=40))
+    ctx.store.create_bench(BenchRun("failed-run", "failed", now, stage="materialize", error="Задачи датасета не найдены"))
+    stage_id = ctx.store.start_bench_stage("waiting-model", "check", "fleet check")
+    await ctx.observer.refresh()
+
+    await user.open("/runs")
+    run_list = user.find(marker="bench-runs").elements.pop()
+    rows = {row["id"]: row for row in run_list.rows}
+    assert rows["waiting-model"]["status"] == "ждёт готовности модели"
+    assert rows["waiting-model"]["replicas"] == "Реплики готовы: 0/1"
+    assert rows["stopped-model"]["errors"] == ["MLSC · последняя ошибка: PriorityNotApplicable"]
+    assert rows["failed-run"]["status_color"] == "text-negative"
+    assert rows["failed-run"]["errors"] == ["Задачи датасета не найдены"]
+
+    user.find(marker="bench-runs").trigger("rowClick", [None, rows["waiting-model"]])
+    await user.should_see("Реплики готовы: 0/1")
+    stage = next(e for e in user.find("подъём модели: check_llm_works · идёт").elements if isinstance(e, ui.expansion))
+    stage.open()
+    dialog = user.find(kind=ui.dialog).elements.pop()
+    assert dialog.value
+    user.find("Остановить прогон").click()
+    await user.should_see("Остановить прогон waiting-model?")
+
+    conf["application_version_states"]["41"]["current"] = 1
+    ctx.store.finish_bench_stage(stage_id, 0)
+    ctx.store.update_bench("waiting-model", stage="execute", counters_json='{"running": 2, "failed": 1}')
+    await ctx.observer.refresh()
+    await user.should_see("Реплики готовы: 1/1", retries=40)
+    await user.should_see("Сбои workflows: 1")
+    assert stage.value and stage.text.startswith("подъём модели: check_llm_works · код 0")
+    assert dialog.value and dialog in user.find(kind=ui.dialog).elements
+    await user.should_see("Остановить прогон waiting-model?")
+    row = next(row for row in run_list.rows if row["id"] == "waiting-model")
+    assert "исполнение" in row["status"] and row["replicas"] == "Реплики готовы: 1/1"

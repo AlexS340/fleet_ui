@@ -6,8 +6,9 @@ harbor_job) → «Полный конфиг» (exp.yaml, файлы defaults с 
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
 import asyncio
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
@@ -63,14 +64,23 @@ from fleet_console.ui.local_datasets import local_panel
 STATUS_TEXT = {"queued": "в очереди", "running": "идёт", "attention": "требует внимания", "stopping": "останавливается", "stopped": "остановлен", "failed": "не удался", "done": "готов"}
 LEVEL_ICON = {"ok": ("check_circle", "text-positive"), "warn": ("warning", "text-warning"), "fail": ("cancel", "text-negative")}
 COLUMNS = [
-    {"name": "id", "label": "Прогон", "field": "id", "align": "left", "sortable": True},
+    {"name": "id", "label": "Прогон", "field": "id", "align": "left", "sortable": True,
+     "style": "white-space: normal; overflow-wrap: anywhere; min-width: 8rem; max-width: 19rem"},
+    {"name": "status", "label": "Статус", "field": "status", "align": "left"},
     {"name": "model", "label": "Модель", "field": "model", "align": "left"},
     {"name": "dataset", "label": "Датасет", "field": "dataset", "align": "left"},
-    {"name": "status", "label": "Статус", "field": "status", "align": "left"},
     {"name": "tasks", "label": "Задачи: идут / очередь / готово", "field": "tasks", "align": "left"},
     {"name": "limit", "label": "Лимит", "field": "limit", "align": "right"},
     {"name": "started", "label": "Начат", "field": "started", "align": "left"},
 ]
+RUN_STATUS_SLOT = """
+<q-td :props="props" style="white-space: normal; overflow-wrap: anywhere; min-width: 10rem; max-width: 22rem">
+  <div class="text-weight-medium" :class="props.row.status_color">{{ props.value }}</div>
+  <div v-if="props.row.replicas" class="text-xs">{{ props.row.replicas }}</div>
+  <div v-if="props.row.failed_workflows" class="text-negative text-xs">{{ props.row.failed_workflows }}</div>
+  <div v-for="error in props.row.errors" :key="error" class="text-negative text-xs">{{ error }}</div>
+</q-td>
+"""
 TASK_COLUMNS = [
     {"name": "task", "label": "Задача", "field": "task", "align": "left", "sortable": True},
     {"name": "phase", "label": "Argo", "field": "phase", "align": "left", "sortable": True},
@@ -93,7 +103,31 @@ def _when(text: str | None) -> str:
 
 def _status_text(run: BenchRun) -> str:
     text = STATUS_TEXT.get(run.status, run.status)
-    return f"{text}: {STAGE_TITLES.get(run.stage, run.stage)}" if run.status == "running" and run.stage else text
+    if run.status == "queued":
+        return "в очереди · ждёт свободной квоты"
+    if run.status == "running" and run.stage == "check":
+        return "ждёт готовности модели"
+    if run.status == "stopping":
+        return "останавливается · ждёт освобождения ресурсов"
+    if run.status in {"running", "attention", "failed"} and run.stage:
+        return f"{text} · {STAGE_TITLES.get(run.stage, run.stage)}"
+    return text
+
+
+def _status_color(run: BenchRun) -> str:
+    return "text-negative" if run.status in {"attention", "failed"} else ""
+
+
+def _run_mlsc(ctx: AppContext, run: BenchRun, secrets: Iterable[str]) -> tuple[str, str]:
+    if run.version_id is None:
+        return "", ""
+    observer = ctx.observer
+    if version := observer.model_version(run.version_id):
+        error = f"MLSC · последняя ошибка: {scrub(version.last_deploy_error, secrets)}" if version.last_deploy_error else ""
+        return f"Реплики готовы: {version.current}/{version.planned}", error
+    if observer.current(observer.mlsc) is None:
+        return "Данные MLSC недоступны", ""
+    return "Версия не найдена в MLSC", ""
 
 
 def _remaining_resources(ctx: AppContext, run: BenchRun) -> list[str]:
@@ -159,14 +193,24 @@ class Draft:
 
 async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
     build_header(ctx)
+    ui.add_css("""
+        .body--dark :is(.bench-runs, .bench-run-card, .bench-run-banner) { --q-negative: #ff929b; }
+        @media (max-width: 599px) {
+            .bench-runs table { table-layout: fixed; }
+            .bench-runs th:first-child { width: 42%; }
+            .bench-runs td { min-width: 0 !important; }
+            .bench-runs th:nth-child(n+3), .bench-runs td:nth-child(n+3) { display: none; }
+        }
+    """)
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
         with ui.row().classes("w-full items-center gap-3 flex-wrap"):
             ui.label("Прогоны").classes("text-xl")
             hint("Бенч — прогон задач датасета агентом на модели: от материализации до замера в Console.")
             ui.space()
             ui.button("Запустить бенч", on_click=lambda: _new_bench_dialog(ctx, render)).props("unelevated no-caps")
-        banner = ui.label().classes("w-full text-negative text-sm whitespace-pre-wrap")
-        table = ui.table(columns=COLUMNS, rows=[], row_key="id").classes("w-full").props("dense flat")
+        banner = ui.label().classes("w-full text-negative text-sm whitespace-pre-wrap bench-run-banner")
+        table = ui.table(columns=COLUMNS, rows=[], row_key="id").classes("w-full bench-runs").props("dense flat").mark("bench-runs")
+        table.add_slot("body-cell-status", RUN_STATUS_SLOT)
         table.on("rowClick", lambda e: _run_dialog(ctx, e.args[1]["id"], render))
         empty = ui.label("Прогонов ещё нет. «Запустить бенч» собирает exp.yaml из пресета, показывает превью и preflight, затем ведёт стадии fleet.").classes(
             "text-sm opacity-70"
@@ -178,16 +222,23 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
         runs = [r for r in ctx.benches.runs() if ctx.access.allows(r)]
         remaining = {r.id: _remaining_resources(ctx, r) for r in runs}
         runs.sort(key=lambda run: not remaining[run.id])
+        secrets = list(ctx.benches.secrets().values())
         rows = []
         for r in runs[:50]:
             c = r.counters
             tasks = f"{c.get('running', 0)} / {c.get('queue') if c.get('queue') is not None else '—'} / {c.get('completed') if c.get('completed') is not None else '—'}"
+            replicas, mlsc_error = _run_mlsc(ctx, r, secrets)
+            errors = [" ".join(err.split()) for err in (mlsc_error, scrub(r.error, secrets)) if err]
             rows.append(
                 {
                     "id": r.id,
                     "model": r.model or r.recipe,
                     "dataset": dataset_of(r) if isinstance(dataset_of(r), str) else dataset_of(r).label,
                     "status": _status_text(r) + (" · активны ресурсы" if remaining[r.id] else ""),
+                    "status_color": _status_color(r),
+                    "replicas": replicas,
+                    "failed_workflows": f"Сбои workflows: {c['failed']}" if c.get("failed") else "",
+                    "errors": [err if len(err) <= 200 else err[:199] + "…" for err in errors],
                     "tasks": tasks if r.status != "running" or r.stage == "execute" or c else "—",
                     "limit": r.agent_limit if r.agent_limit is not None else "—",
                     "started": _when(r.started_at),
@@ -198,12 +249,12 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
         empty.set_visibility(not rows)
         attention = [r for r in runs if r.status == "attention"]
         lines = [
-            f"⚠ {r.id}: {'модель поднята, GPU тратятся' if r.holds_gpu else 'задачи могут идти'} — {r.error}"
+            f"⚠ {r.id}: {'проверьте ресурсы модели' if r.holds_gpu else 'задачи могут идти'} — {r.error}"
             + (f" · автогашение через {ctx.settings.bench.attention_minutes} мин без ответа" if r.holds_gpu and ctx.settings.bench.attention_minutes else "")
             for r in attention
         ]
         lines.extend(f"⚠ {r.id}: {r.error}" for r in runs if r.status == "stopping" and r.error)
-        banner.set_text(scrub("\n".join(lines), ctx.benches.secrets().values()) if lines else "")
+        banner.set_text(scrub("\n".join(lines), secrets))
         banner.set_visibility(bool(lines))
 
     render()
@@ -1068,14 +1119,17 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         ui.notify(str(exc), type="negative")
         return
     preview = Preview.from_json(run.preview_json)
-    if preview.tasks_total is None:  # в превью на момент запуска числа задач ещё нет — оно появляется после материализации
-        preview = replace(preview, tasks_total=tasks_total(ctx.paths.runs / run_id))
     secrets = list(ctx.benches.secrets().values())
+    spec_path = Path(run.dir) / "spec.json"
+    stage_items: dict[int, ui.expansion] = {}
+    last_controls = None
+    last_tasks = None
+    load_tasks = None
 
     def refresh() -> None:
-        dialog.close()
         after()
-        _run_dialog(ctx, run_id, after)
+        if dialog.value:
+            tick()
 
     async def do(coro) -> None:
         try:
@@ -1085,7 +1139,144 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
             return
         refresh()
 
-    with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl"):
+    @ui.refreshable
+    def controls(run: BenchRun, show_stop: bool) -> None:
+        with ui.row().classes("gap-3 flex-wrap text-sm"):
+            if run.status != "queued":
+                ui.link("Argo UI по прогону", argo_ui_url(ctx.settings.argo_ui_url, ctx.settings.namespace, run_id), new_tab=True)
+            if run.status == "done" and not ctx.store.request(run_id):
+                ui.link("Benchboard", ctx.settings.benchboard_url, new_tab=True)
+                hint("Прямых ссылок на прогон у Benchboard нет: ищите в каталоге по модели и run_id.")
+            if preview.s3 and run.status != "queued":
+                ui.label(f"S3: {preview.s3}").classes("opacity-70 break-all")
+            ui.label(f"каталог: {run.dir}").classes("opacity-70 break-all")
+        for line in ctx.benches.measure_summary(run_id):
+            ui.label("замер: " + line).classes("text-sm")
+        with ui.row().classes("items-end gap-2 flex-wrap"):
+            if spec_path.is_file() and run.sha:
+                ui.button("Запустить с теми же параметрами", on_click=repeat).props("unelevated no-caps")
+                ui.button("Сохранить как пресет", on_click=save_preset).props("flat no-caps")
+            if run.status == "queued":
+                ui.label("Ожидает свободной квоты. Ресурсы ещё не выделены.").classes("text-sm")
+                ui.button("Отменить заявку", on_click=lambda: do(ctx.benches.stop(run_id, access=ctx.access))).props("flat no-caps")
+            if show_stop:
+                ui.button("Остановить прогон", on_click=stop).props("flat no-caps color=negative")
+            if run.status in ("attention", "failed", "stopped") and run.stage:
+                ui.button(f"Повторить стадию {run.stage}", on_click=lambda: do(ctx.benches.retry(run_id, access=ctx.access))).props("unelevated no-caps")
+            if run.status == "attention":
+                ui.button("Погасить и остановить", on_click=stop).props("flat no-caps color=negative")
+            if not run.active and run.status != "done":
+                ui.button("Замер по тому, что есть", on_click=lambda: do(ctx.benches.measure(run_id, access=ctx.access))).props("flat no-caps")
+            if run.status == "done":
+                ui.button("Замер заново", on_click=lambda: do(ctx.benches.measure(run_id, access=ctx.access))).props("flat no-caps")
+            if run.status != "queued" and (run.version_id is not None or run.session_id):
+                ui.button("Лог упавшего воркера модели", on_click=model_log).props("flat dense no-caps")
+
+    async def repeat() -> None:
+        with dialog.client.layout:
+            await _repeat_run(ctx, run_id, after, dialog.close)
+
+    def save_preset() -> None:
+        with dialog:
+            _save_run_preset_dialog(ctx, run_id)
+
+    def stop() -> None:
+        with dialog:
+            _stop_dialog(ctx, ctx.access.run(run_id), refresh)
+
+    def model_log() -> None:
+        with dialog:
+            text_dialog(f"MLSC: последний упавший воркер · {run_id}", ctx.benches.model_log(run_id, access=ctx.access), ctx.benches.secrets)
+
+    def tick() -> None:
+        nonlocal run, last_controls, last_tasks, load_tasks, preview
+        try:
+            run = ctx.access.run(run_id)
+        except AccessDenied:
+            dialog.close()
+            return
+        status.set_text(_status_text(run))
+        color = _status_color(run)
+        status.classes(add=color, remove=None if color else "text-negative")
+        facts.set_text(" · ".join([
+            f"ревизия {run.ref}@{run.sha[:8]}" if run.ref and run.ref != run.sha else f"ревизия {run.sha[:8]}",
+            f"version_id {run.version_id if run.version_id is not None else '—'}" + (f" (сессия {run.session_id})" if run.session_id else ""),
+            f"начат {_when(run.started_at)}",
+            f"завершён {_when(run.finished_at)}" if run.finished_at else _duration(run),
+            f"requeue {run.requeues}",
+        ]))
+        readiness, deploy_error = _run_mlsc(ctx, run, secrets)
+        replicas.set_text(readiness)
+        mlsc_error.set_text(deploy_error)
+        run_error.set_text(scrub(run.error, secrets))
+        remaining = _remaining_resources(ctx, run)
+        warning = "После завершения прогона остались ресурсы. " + ", ".join(remaining) if remaining else ""
+        if run.status == "attention":
+            warning = ("Повторите стадию или погасите модель." if run.holds_gpu
+                       else "Задачи могут идти: повторите стадию или остановите прогон.")
+        resources.set_text(warning)
+        c = run.counters
+        counters.set_text(
+            f"задачи: идут {c.get('running', 0)}, ждут {c.get('pending_wf', 0)} · очередь сабмиттера {c.get('queue', '—')}, отправлено {c.get('submitted', '—')} · "
+            f"завершено {c.get('completed', '—')} · сабмиттер {'жив' if c.get('submitter_alive') else 'не запущен'} · "
+            f"лимит агентов {run.agent_limit if run.agent_limit is not None else '—'} · на {_when(c.get('at'))}"
+            if c else ""
+        )
+        failed_workflows.set_text(f"Сбои workflows: {c['failed']}" if c.get("failed") else "")
+        for label in (replicas, run_error, mlsc_error, resources, counters, failed_workflows):
+            label.set_visibility(bool(label.text))
+
+        if preview.tasks_total is None and (total := tasks_total(ctx.paths.runs / run_id)) is not None:
+            preview = replace(preview, tasks_total=total)
+        parameters.set_text("Параметры заявки" if run.status == "queued" else "Что и где запущено")
+        rows = [{"k": k, "v": v} for k, v in preview.rows()] if run.preview_json != "{}" else []
+        ids = f"run_id {run.id} · лейбл Argo fleet/run-name={run.id}"
+        if run.version_id is not None:
+            ids += f" · MLSC version_id {run.version_id}"
+        rows.append({"k": "Идентификаторы", "v": ids})
+        if detail_table.rows != rows:
+            detail_table.update_rows(rows)
+        show_stop = run.status in ("running", "stopping") or bool(remaining)
+        control_state = (run.status, run.stage, show_stop, run.version_id)
+        if last_controls is None:
+            with actions:
+                controls(run, show_stop)
+        elif control_state != last_controls:
+            controls.refresh(run, show_stop)
+        last_controls = control_state
+
+        if run.status != "queued":
+            task_state = (run.stage, run.active, *(c.get(key) for key in ("running", "pending_wf", "succeeded", "failed", "submitted", "completed")))
+            with task_panel:
+                if load_tasks is None:
+                    load_tasks = _tasks_section(ctx, run, preview.s3)
+                    ui.timer(0, load_tasks, once=True)
+                elif task_state != last_tasks and (run.stage in {"execute", "requeue"} or last_tasks[1] and not run.active):
+                    ui.timer(0, load_tasks, once=True)
+            last_tasks = task_state
+        if load_tasks is not None:
+            task_panel.set_visibility(run.status != "queued")
+
+        stages = ctx.benches.stages(run_id)
+        no_stages.set_visibility(not stages)
+        for st in stages:
+            result = "идёт" if st.finished_at is None else ("прервана" if st.returncode is None else f"код {st.returncode}")
+            title = f"{STAGE_TITLES.get(st.stage, st.stage)} · {result} · {_when(st.started_at)}"
+            if st.id not in stage_items:
+                with stage_panel, ui.expansion(title).classes("w-full").props("dense") as item:
+                    ui.code(scrub(st.command, secrets), language="bash").classes("w-full")
+                    if st.log_path:
+                        ui.button("Хвост лога", on_click=lambda p=st.log_path: _run_log(ctx, run_id, p, secrets)).props("flat dense no-caps")
+                stage_items[st.id] = item
+            stage_items[st.id].set_text(title)
+            if st.finished_at and st.returncode not in (0, None):
+                stage_items[st.id].classes("text-negative")
+        events = [e for e in ctx.store.events(300) if e.object == run_id][:15]
+        journal.set_visibility(bool(events))
+        journal.set_text(f"Журнал ({len(events)})")
+        event_text.set_text(scrub("\n".join(f"{_when(e.ts)} {e.action} {e.result} {e.details}" for e in events), secrets))
+
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl bench-run-card"):
         ui.label(run.id).classes("text-lg break-all")
         if ctx.settings.auth.mode != "local":
             owner, coauthors = ctx.store.run_ownership(run.id)
@@ -1098,93 +1289,35 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
             if coauthors:
                 byline += " · Соавторы: " + ", ".join(map(name, coauthors))
             ui.label(byline).classes("text-sm break-all")
-        remaining = _remaining_resources(ctx, run)
-        facts = [
-            _status_text(run),
-            f"ревизия {run.ref}@{run.sha[:8]}" if run.ref and run.ref != run.sha else f"ревизия {run.sha[:8]}",
-            f"version_id {run.version_id if run.version_id is not None else '—'}" + (f" (сессия {run.session_id})" if run.session_id else ""),
-            f"начат {_when(run.started_at)}",
-            f"завершён {_when(run.finished_at)}" if run.finished_at else _duration(run),
-            f"requeue {run.requeues}",
-        ]
-        ui.label(" · ".join(facts)).classes("text-sm")
-        if remaining:
-            ui.label("После завершения прогона остались ресурсы. " + ", ".join(remaining)).classes("text-negative text-sm")
-        spec_path = Path(run.dir) / "spec.json"
+        status = ui.label().classes("font-medium")
+        facts = ui.label().classes("text-sm")
+        replicas = ui.label().classes("text-sm")
+        mlsc_error = ui.label().classes("text-negative text-sm whitespace-pre-wrap break-words w-full")
+        run_error = ui.label().classes("text-negative text-sm whitespace-pre-wrap break-words w-full")
+        resources = ui.label().classes("text-negative text-sm")
         if spec_path.is_file():
             origin = BenchSpec.from_json(spec_path.read_text(encoding="utf-8")).dataset_source
             if origin:
                 ui.label(f"Данные из локальной папки: {origin['source']} · загружены в S3 {origin.get('uploaded_at', '')}").classes("text-sm break-all")
-        if run.error:
-            ui.label(scrub(run.error, secrets)).classes("text-negative text-sm whitespace-pre-wrap")
-        if run.status == "attention":
-            ui.label("Модель поднята, GPU тратятся: повторите стадию или погасите." if run.holds_gpu else "Задачи могут идти: повторите стадию или остановите прогон.").classes(
-                "text-negative text-sm"
-            )
-        c = run.counters
-        if c:
-            ui.label(
-                f"задачи: идут {c.get('running', 0)}, ждут {c.get('pending_wf', 0)} · очередь сабмиттера {c.get('queue', '—')}, отправлено {c.get('submitted', '—')}, "
-                f"завершено {c.get('completed', '—')} · сабмиттер {'жив' if c.get('submitter_alive') else 'не запущен'} · реплик живых {c.get('replicas', '—')} · "
-                f"лимит агентов {run.agent_limit if run.agent_limit is not None else '—'} · на {_when(c.get('at'))}"
-            ).classes("text-sm")
-        rows = [{"k": k, "v": v} for k, v in preview.rows()] if run.preview_json != "{}" else []
-        rows += [{"k": "Идентификаторы", "v": f"run_id {run.id} · лейбл Argo fleet/run-name={run.id}" + (f" · MLSC version_id {run.version_id}" if run.version_id is not None else "")}]
-        with ui.expansion("Параметры заявки" if run.status == "queued" else "Что и где запущено", value=run.status == "running").classes("w-full"):
-            _facts_table(rows).mark("bench-facts")
-        base = ctx.settings.argo_ui_url
-        with ui.row().classes("gap-3 flex-wrap text-sm"):
-            if run.status != "queued":
-                ui.link("Argo UI по прогону", argo_ui_url(base, ctx.settings.namespace, run.id), new_tab=True)
-            if run.status == "done" and not ctx.store.request(run.id):
-                ui.link("Benchboard", ctx.settings.benchboard_url, new_tab=True)
-                hint("Прямых ссылок на прогон у Benchboard нет: ищите в каталоге по модели и run_id.")
-            if preview.s3 and run.status != "queued":
-                ui.label(f"S3: {preview.s3}").classes("opacity-70 break-all")
-            ui.label(f"каталог: {run.dir}").classes("opacity-70 break-all")
-        for line in ctx.benches.measure_summary(run.id):
-            ui.label("замер: " + line).classes("text-sm")
-        with ui.row().classes("items-end gap-2 flex-wrap"):
-            if spec_path.is_file() and run.sha:
-                ui.button("Запустить с теми же параметрами", on_click=lambda: _repeat_run(ctx, run.id, after, dialog.close)).props("unelevated no-caps")
-                ui.button("Сохранить как пресет", on_click=lambda: _save_run_preset_dialog(ctx, run.id)).props("flat no-caps")
-            if run.status == "queued":
-                ui.label("Ожидает свободной квоты. Ресурсы ещё не выделены.").classes("text-sm")
-                ui.button("Отменить заявку", on_click=lambda: do(ctx.benches.stop(run.id, access=ctx.access))).props("flat no-caps")
-            if run.status in ("running", "stopping") or remaining:
-                ui.button("Остановить прогон", on_click=lambda: _stop_dialog(ctx, run, refresh)).props("flat no-caps color=negative")
-            if run.status in ("attention", "failed", "stopped") and run.stage:
-                ui.button(f"Повторить стадию {run.stage}", on_click=lambda: do(ctx.benches.retry(run.id, access=ctx.access))).props("unelevated no-caps")
-            if run.status == "attention":
-                ui.button("Погасить и остановить", on_click=lambda: _stop_dialog(ctx, run, refresh)).props("flat no-caps color=negative")
-            if not run.active and run.status != "done":
-                ui.button("Замер по тому, что есть", on_click=lambda: do(ctx.benches.measure(run.id, access=ctx.access))).props("flat no-caps")
-            if run.status == "done":
-                ui.button("Замер заново", on_click=lambda: do(ctx.benches.measure(run.id, access=ctx.access))).props("flat no-caps")
-            if run.status == "running":
-                ui.label("лимит и реплики — в карточке прогона на странице «Кластер»").classes("text-xs opacity-60")
-        if run.status != "queued":
-            _tasks_section(ctx, run, preview.s3)
+        counters = ui.label().classes("text-sm")
+        failed_workflows = ui.label().classes("text-negative text-sm")
+        with ui.expansion(value=run.status == "running").classes("w-full") as parameters:
+            detail_table = _facts_table([]).mark("bench-facts")
+        actions = ui.column().classes("w-full")
+        task_panel = ui.column().classes("w-full")
         ui.label("Стадии").classes("mt-2")
-        stages = ctx.benches.stages(run.id)
-        if not stages:
-            ui.label("ещё не начинались").classes("text-sm opacity-70")
-        for st in stages:
-            result = "идёт" if st.returncode is None and st.finished_at is None else ("прервана" if st.returncode is None else f"код {st.returncode}")
-            title = f"{STAGE_TITLES.get(st.stage, st.stage)} · {result} · {_when(st.started_at)}"
-            with ui.expansion(title).classes("w-full").props("dense"):
-                ui.code(scrub(st.command, secrets), language="bash").classes("w-full")
-                if st.log_path:
-                    ui.button("Хвост лога", on_click=lambda p=st.log_path: _run_log(ctx, run.id, p, secrets)).props("flat dense no-caps")
-        events = [e for e in ctx.store.events(300) if e.object == run.id][:15]
-        if events:
-            with ui.expansion(f"Журнал ({len(events)})").classes("w-full").props("dense"):
-                ui.label(scrub("\n".join(f"{_when(e.ts)} {e.action} {e.result} {e.details}" for e in events), secrets)).classes("font-mono text-xs whitespace-pre-wrap")
+        no_stages = ui.label("ещё не начинались").classes("text-sm opacity-70")
+        stage_panel = ui.column().classes("w-full gap-0")
+        with ui.expansion().classes("w-full").props("dense") as journal:
+            event_text = ui.label().classes("font-mono text-xs whitespace-pre-wrap break-words w-full")
         ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
+        tick()
+        ui.timer(3.0, tick, immediate=False)
+    dialog.on("hide", dialog.delete)
     dialog.open()
 
 
-def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> None:
+def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> Callable[[], Awaitable[None]]:
     """Таблица задач прогона: фазы workflows Argo и результаты в S3 (попытки tryN, флаг COMPLETED/FAILED)."""
     state: dict[str, Any] = {"rows": [], "results": {}, "tasks": {}}
     ui.label("Задачи").classes("mt-2")
@@ -1193,12 +1326,6 @@ def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> None:
         ui.button("Обновить", on_click=lambda: load()).props("flat dense no-caps")
         if s3_base:
             ui.button("Файлы в S3", on_click=lambda: _s3_dialog(ctx, run, s3_base)).props("flat dense no-caps")
-        if run.version_id is not None or run.session_id:
-            ui.button(
-                "Лог упавшего воркера модели",
-                on_click=lambda: text_dialog(f"MLSC: последний упавший воркер · {run.id}", ctx.benches.model_log(run.id, access=ctx.access), ctx.benches.secrets),
-            ).props("flat dense no-caps")
-            hint("MLSC API отдаёт один лог на версию — последнего упавшего воркера (как вкладка LLM в TUI fleet); логов живых реплик у него нет.")
     note = ui.label("читаю workflows…").classes("text-xs opacity-70")
     table = ui.table(columns=TASK_COLUMNS, rows=[], row_key="task").classes("w-full").props("dense flat").mark("bench-tasks")
     table.on("rowClick", lambda e: _task_dialog(ctx, run, s3_base, e.args[1], state))
@@ -1207,7 +1334,15 @@ def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> None:
         table.rows = [r for r in state["rows"] if not only_failed.value or r["failed"]]
         table.update()
 
+    lock = asyncio.Lock()
+
     async def load() -> None:
+        if lock.locked():
+            return
+        async with lock:
+            await fetch()
+
+    async def fetch() -> None:
         now = datetime.now(timezone.utc)
         try:
             tasks = await ctx.benches.task_workflows(run.id, access=ctx.access)
@@ -1232,7 +1367,7 @@ def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> None:
         note.set_text(f"workflows: {len(tasks)} · задач в S3: {len(results)}, COMPLETED {done}, FAILED {sum(1 for r in results.values() if r.status == 'failed')}")
 
     only_failed.on_value_change(lambda _: render())
-    ui.timer(0, load, once=True)
+    return load
 
 
 def _task_rows(tasks: list[TaskWorkflow], results: dict[str, TaskResult], now: datetime) -> list[dict[str, Any]]:
