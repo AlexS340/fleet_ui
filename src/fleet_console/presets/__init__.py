@@ -41,6 +41,7 @@ class Resources(BaseModel):
 class Execution(BaseModel):
     profile: str = "production"  # группа execution/
     task_limit: int | None = Field(None, ge=1)  # null — все задачи датасета
+    repeats: int = Field(1, ge=1)  # experiment.repeats
 
 
 class Preset(BaseModel):
@@ -63,6 +64,16 @@ class Preset(BaseModel):
     @property
     def dataset_label(self) -> str:
         return self.dataset if isinstance(self.dataset, str) else self.dataset.label
+
+    def repeat_option(self) -> tuple[int, list[str]]:
+        """Перенести старый числовой override в поле формы, сохраняя переопределения ручного exp.yaml."""
+        overrides = self.overrides
+        matches = [o for o in overrides if o.partition("=")[0].lstrip("+") == "experiment.repeats"]
+        if matches and "exp.yaml" not in self.config_files:
+            value = matches[-1].partition("=")[2]
+            if re.fullmatch(r"[1-9][0-9]*", value):
+                return int(value), [o for o in overrides if o not in matches]
+        return self.execution.repeats, overrides
 
 
 def load_presets(directory: Path = PRESETS_DIR) -> tuple[list[Preset], list[str]]:

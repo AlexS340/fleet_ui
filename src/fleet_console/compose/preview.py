@@ -51,6 +51,7 @@ class Preview:
     pending_dir: str = ""
     session: str = ""  # id сессии, если бенч на ней
     job_priority: str = ""
+    repeats: int = 1
 
     @property
     def gpu_total(self) -> int | None:
@@ -77,6 +78,7 @@ class Preview:
             ("Инференс", f"{self.inference} · {self.gateway}"),
             ("Агент", f"{', '.join(self.agents) or '?'} · раннер {self.agent_image or '?'}"),
             ("Задачи", f"{self.benchmark}: {datasets} · {tasks} · пул узлов {self.node_pool}"),
+            ("Попыток на задачу", str(self.repeats)),
             ("Параллелизм", f"лимит {self.agent_limit} = {self.replicas} реплик × {self.agents_per_replica} агентов"),
             ("Таймауты", self.timeouts),
             ("Результаты", self.s3),
@@ -155,4 +157,5 @@ def from_resolved(
         pending_dir=str(system.get("pending_dir") or ""),
         session=session,
         job_priority=str(job.get("job_priority_class") or "") if not session else "",
+        repeats=_get(system, "materialize", "repeats", default=1),
     )

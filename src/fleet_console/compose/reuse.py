@@ -31,6 +31,6 @@ def preset_from_run(spec: BenchSpec, directory: Path, *, name: str, sha: str) ->
     return Preset(
         name=name, fleet=FleetRef(ref=sha), model=spec.recipe, model_name=spec.model_name, agent=spec.agent,
         dataset=spec.dataset, inference=spec.inference, resources=Resources(jobs=spec.jobs, agents_per_replica=spec.agents_per_replica),
-        execution=Execution(profile=spec.profile, task_limit=spec.task_limit), harbor_job=spec.harbor_job,
+        execution=Execution(profile=spec.profile, task_limit=spec.task_limit, repeats=spec.repeats), harbor_job=spec.harbor_job,
         overrides=list(spec.extra), config_files=config_files, base_preset=spec.preset,
     )

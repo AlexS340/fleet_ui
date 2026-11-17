@@ -337,6 +337,8 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     numbers = {n.props.get("label"): n for n in user.find(kind=ui.number).elements}
     numbers["Агентов на реплику"].set_value(2)
     numbers["Лимит задач (пусто — все)"].set_value(3)
+    repeats = numbers["Попыток на задачу"]
+    assert repeats.value == 1
     await user.should_see("GPU: 1 × 8 = 8 · лимит агентов 1 × 2 = 2")
     priority = _select(user, "Приоритет джобы")
     assert priority.value == ""
@@ -357,6 +359,11 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     assert not start.enabled  # предупреждения не приняты
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     assert start.enabled
+    repeats.set_value(2.5)
+    assert not start.enabled
+    user.find("Превью и preflight").click()
+    await user.should_see("задайте целое число от 1")
+    repeats.set_value(3)
     extra = next(e for e in user.find(kind=ui.textarea).elements if e.props.get("label", "").startswith("overrides fleet"))
     extra.set_value("++mlsc.create_job.job.queue_name=shared\n++mlsc.create_job.job.job_priority_class=low")
     user.find("Превью и preflight").click()
@@ -377,12 +384,14 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.should_not_see("Обновите превью и preflight")
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
     assert preview["Приоритет джобы"] == "shared-low"
+    assert preview["Попыток на задачу"] == "3"
     assert "очередь shared" in preview["Модель"]
     user.find(marker="accept-warnings").elements.pop().set_value(True)
     user.find(marker="start-bench").click()
     await user.should_see("Запустить прогон?")
     await user.should_see("приоритет джобы shared-low")
     await user.should_see("очередь MLSC shared")
+    await user.should_see("Попыток на задачу: 3")
     await user.should_see("стадии: preflight → материализация → create_job → start_llm → check → upload → launch → исполнение → stop_llm → замер")
     user.find("Да, запустить").click()
     await user.should_see("Заявка принята")
@@ -396,6 +405,7 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     assert fakes.CTX.store.get_run(run.id) is not None and run.preview["gpu_per_instance"] == 8 and run.preview["tasks_total"] is None
     exp = (fakes.CTX.paths.runs / run.id / "exp.yaml").read_text()
     assert "harbor/dataset: cowork" in exp and "task_limit: 3" in exp and (fakes.CTX.paths.runs / run.id / "resolved.yaml").exists()
+    assert "  repeats: 3" in exp
     # карточка прогона по клику на строку
     await user.open("/runs")
     await user.should_see("клик по строке — карточка прогона")
@@ -437,7 +447,7 @@ async def test_bench_can_save_preset_and_repeat_on_original_sha(user: User) -> N
         run_id="source-run", worktree=revision.worktree, run_dir=ctx.paths.runs / "source-run", overlay=OVERLAY_DIR,
         recipe="glm", agent="terminus2", dataset="cowork", sha=revision.info.sha, task_limit=3, agents_per_replica=2,
         model_name="custom-model", inference="nginx", harbor_job={"agent_timeout_multiplier": 2},
-        extra=("++mlsc.create_job.job.job_priority_class=low", "++mlsc.create_job.job.queue_name=shared", "execution.shuffle=false"),
+        extra=("++experiment.repeats=4", "++mlsc.create_job.job.job_priority_class=low", "++mlsc.create_job.job.queue_name=shared", "execution.shuffle=false"),
     )
     source.write()
     (source.run_dir / "harbor" / "agent").mkdir(parents=True)
@@ -471,8 +481,9 @@ async def test_bench_can_save_preset_and_repeat_on_original_sha(user: User) -> N
     draft_dir, = [p for p in ctx.paths.runs.iterdir() if p != source.run_dir]
     clone = BenchSpec.from_json((draft_dir / "spec.json").read_text())
     assert clone.run_id != source.run_id and clone.effective_model != source.effective_model
-    assert clone.extra == (source.extra[-1], "++mlsc.create_job.job.job_priority_class=shared-low", source.extra[1])
+    assert clone.extra == (source.extra[-1], "++mlsc.create_job.job.job_priority_class=shared-low", source.extra[-2])
     assert clone.harbor_job == source.harbor_job and clone.task_limit == source.task_limit
+    assert clone.repeats == 4 and "  repeats: 4" in clone.exp.read_text()
     assert (draft_dir / edit.relative_to(source.run_dir)).read_text() == edit.read_text()
     assert "should-not-be-copied" not in (draft_dir / "resolved.yaml").read_text()
 

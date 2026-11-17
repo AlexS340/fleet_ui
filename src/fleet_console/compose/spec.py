@@ -93,6 +93,7 @@ class BenchSpec:
     read_only_measure: bool = True
     private_s3_root: str = ""
     mlsc_base_url: str = ""
+    repeats: int = 1
 
     # --- пути -------------------------------------------------------------
     @property
@@ -188,6 +189,7 @@ class BenchSpec:
             "  model_name: ${mlsc.served_model_name}",
             f"  jobs: {self.jobs}" + ("                      # у сессии своё число реплик: сервис переопределяет" if self.session else ""),
             f"  agents_per_replica: {self.agents_per_replica}",
+            *([f"  repeats: {self.repeats}"] if self.repeats != 1 else []),
             (f"  workflow_prefix: {workflow_prefix(bench)}" + "   # h-<benchmark>, очищен сервисом: имя workflow Argo")
             if (bench := self.benchmark())
             else "  workflow_prefix: h-${harbor_dataset.benchmark}",

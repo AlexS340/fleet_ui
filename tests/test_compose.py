@@ -198,6 +198,10 @@ def test_preflight_checks(tmp_path: Path) -> None:
     assert summary(checks) == (0, 2) and by["quota"].level == "warn" and by["issue:terminus2-mcp-harbor-0.22"].level == "warn"
     assert by["dataset"].level == "ok" and "tasks → birdsql_sqlite (fleet)" in by["dataset"].detail and by["model_name"].ok
 
+    without_repeats = {**resolved, "experiment": {**resolved["experiment"], "repeats": 3}}
+    unsupported = run_checks(secrets={}, **{**common, "resolved": without_repeats})
+    assert {c.key: c for c in unsupported}["repeats"].level == "fail"
+
     bad = run_checks(secrets={"MLSC_TOKEN": "t"}, **{**common, "kube": KubeStatus(context="other", allowed=False, error="context «other» не разрешён"),
                                                      "foreign_models": {"GLM-console"}, "profile": _profile(steps=ALL_STEPS[:-4]), "resolved": None, "resolve_error": "Hydra: missing"})
     by = {c.key: c for c in bad}

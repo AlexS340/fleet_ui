@@ -242,6 +242,12 @@ def fake_fleet(argv: tuple[str, ...]) -> Result:
         data["experiment"]["model_name"] = overrides.get("mlsc.served_model_name", "GLM")
         data["mlsc"]["served_model_name"] = data["experiment"]["model_name"]
         data["experiment"]["jobs"] = int(overrides.get("experiment.jobs", 1))
+        exp = next((Path(arg) for arg in argv if Path(arg).name == "exp.yaml"), None)
+        if exp is not None:
+            experiment = yaml.safe_load(exp.read_text(encoding="utf-8"))["experiment"]
+            repeats = experiment.get("repeats", 1)
+            data["experiment"]["repeats"] = repeats
+            data["system"]["materialize"] = {"repeats": repeats}
         data["mlsc"]["create_job"]["job"]["job_priority_class"] = priority
         data["mlsc"]["create_job"]["job"]["queue_name"] = overrides.get("++mlsc.create_job.job.queue_name", "gigacode")
         data["system"]["measure_run"] = {"read_only": True}

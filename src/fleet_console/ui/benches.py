@@ -309,11 +309,12 @@ def _new_bench_dialog(
             custom_mapping = ui.select({"": "маппинг по tasks_root"} | {m: m for m in mapping_names}, value="", label="реестр datasets").classes("w-56")
         local_note = ui.label().classes("text-sm break-all").mark("local-origin")
         with ui.row().classes("gap-3 flex-wrap items-end"):
-            jobs = ui.number("Реплики", value=1, min=1, precision=0).classes("w-28")
-            apr = ui.number("Агентов на реплику", value=1, min=1, precision=0).classes("w-40")
-            task_limit = ui.number("Лимит задач (пусто — все)", value=None, min=1, precision=0).classes("w-44")
-            profile = ui.select(groups.get("execution", ["production"]), value="production" if "production" in groups.get("execution", []) else None, label="Профиль").classes("w-36")
-            inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value="litellm", label="Маршрут").classes("w-28")
+            jobs = ui.number("Реплики", value=1, min=1, precision=0).classes("w-20")
+            apr = ui.number("Агентов на реплику", value=1, min=1, precision=0).classes("w-36")
+            task_limit = ui.number("Лимит задач (пусто — все)", value=None, min=1, precision=0).classes("w-48")
+            repeats = ui.number("Попыток на задачу", value=1, min=1, step=1).classes("w-36")
+            profile = ui.select(groups.get("execution", ["production"]), value="production" if "production" in groups.get("execution", []) else None, label="Профиль").classes("w-32")
+            inference = ui.select({"litellm": "litellm", "nginx": "nginx"}, value="litellm", label="Маршрут").classes("w-24")
         gpu_label = ui.label().classes("text-sm")
         with ui.expansion("Дополнительно").classes("w-full") as advanced:
             extra = ui.textarea("overrides fleet, по одному на строку: ключ=значение").classes("w-full").props("autogrow")
@@ -420,7 +421,9 @@ def _new_bench_dialog(
             if preset.execution.profile in profile.options or exact:
                 profile.set_value(preset.execution.profile if preset.execution.profile in profile.options else None)
             inference.set_value(preset.inference)
-            saved_priority, saved_queue, overrides = split_job_options(preset.overrides)
+            saved_repeats, preset_overrides = preset.repeat_option()
+            repeats.set_value(saved_repeats)
+            saved_priority, saved_queue, overrides = split_job_options(preset_overrides)
             queue.set_value(saved_queue)
             set_job_priority_options(priority, saved_queue, saved_priority)
             extra.set_value("\n".join(overrides))
@@ -459,6 +462,7 @@ def _new_bench_dialog(
             for element in (model_select, agent_select, dataset_select, custom_path, custom_benchmark, custom_mapping,
                             apr, task_limit, profile, inference, harbor_job_text):
                 element.set_enabled(not frozen)
+            repeats.set_enabled(not (frozen or draft.manual))
             manual_note.set_visibility(frozen)
             refresh_gpu()
             if frozen:
@@ -488,6 +492,9 @@ def _new_bench_dialog(
                 raise BenchError("для своего датасета нужны путь и benchmark")
             if not model_select.value or not agent_select.value or profile.value not in profile.options:
                 raise BenchError("выберите модель, агента и профиль")
+            attempts = repeats.value
+            if attempts is None or attempts < 1 or not float(attempts).is_integer():
+                raise BenchError("Попыток на задачу: задайте целое число от 1")
             if admin:
                 try:
                     harbor_job = yaml.safe_load(harbor_job_text.value or "") or {}
@@ -505,7 +512,7 @@ def _new_bench_dialog(
                 session = ctx.benches.session_link(session_id)
                 recipe = session.recipe
             overrides = ([line.strip() for line in (extra.value or "").splitlines() if line.strip()] if admin
-                         else split_job_options(setup.overrides)[2] if setup else [])
+                         else split_job_options(setup.repeat_option()[1])[2] if setup else [])
             if not session and priority.value in JOB_PRIORITIES:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={priority.value}")
             if not session and queue.value in JOB_QUEUES:
@@ -525,6 +532,7 @@ def _new_bench_dialog(
                 run_id=draft.run_id, worktree=revision.worktree, run_dir=ctx.paths.runs / draft.run_id, overlay=OVERLAY_DIR, recipe=recipe,
                 agent=str(agent_select.value), dataset=dataset, jobs=int(jobs.value or 1), agents_per_replica=int(apr.value or 1),
                 task_limit=int(task_limit.value) if task_limit.value else None, profile=str(profile.value or "production"), inference=str(inference.value),
+                repeats=int(attempts),
                 model_name=(model_name.value or "").strip() if not session else "", harbor_job=harbor_job,
                 private_s3_root=private_root(ctx.settings),
                 extra=tuple(overrides), pod=draft.spec.pod if draft.spec else "",
@@ -589,6 +597,8 @@ def _new_bench_dialog(
                 busy.set_visibility(False)
                 preview_button.enable()
             config_button.enable()
+            if draft.manual:
+                repeats.disable()
             render_preview()
 
         def render_preview() -> None:
@@ -647,6 +657,7 @@ def _new_bench_dialog(
                 f"{preview.model} × {spec.dataset_label} × {spec.agent}; реплик {preview.replicas}, агентов на реплику {spec.agents_per_replica}",
                 f"GPU: {gpu if gpu is not None else '?'}" + (" — модель уже поднята (сессия)" if spec.session else " — сервис поднимет и погасит модель сам"),
                 f"задач: {preview.tasks_total if preview.tasks_total is not None else 'узнаем после материализации'}" + (f", лимит {spec.task_limit}" if spec.task_limit else ""),
+                f"Попыток на задачу: {preview.repeats}",
                 "стадии: " + stages,
                 f"результаты: {preview.s3}",
             ]
@@ -683,7 +694,7 @@ def _new_bench_dialog(
         for element in (model_select, dataset_select, jobs, apr):
             element.on_value_change(lambda _: refresh_gpu())
         for element in (model_select, model_name, priority, queue, extra, agent_select, dataset_select,
-                        custom_path, custom_benchmark, custom_mapping, jobs, apr, task_limit, profile, inference, harbor_job_text):
+                        custom_path, custom_benchmark, custom_mapping, jobs, apr, task_limit, repeats, profile, inference, harbor_job_text):
             element.on_value_change(lambda _: mark_model_config_changed())
         carry_files.on_value_change(lambda _: (sync_manual_fields(), mark_model_config_changed()))
         accept.on_value_change(lambda _: refresh_start())
@@ -707,7 +718,7 @@ def _check_saved_setup(ctx: AppContext, setup: Preset, shipped: list[Preset]) ->
         return
     base = next((p for p in shipped if p.name == setup.base_preset), None)
     if (setup.config_files or setup.harbor_job != (base.harbor_job if base else {})
-            or split_job_options(setup.overrides)[2] != (split_job_options(base.overrides)[2] if base else [])):
+            or split_job_options(setup.repeat_option()[1])[2] != (split_job_options(base.repeat_option()[1])[2] if base else [])):
         raise BenchError("Этот запуск содержит расширенные настройки вне штатного пресета; для повтора нужны права администратора.")
 
 

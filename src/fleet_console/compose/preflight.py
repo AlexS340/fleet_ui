@@ -142,6 +142,14 @@ def run_checks(
     else:
         checks.append(Check("config", "Сборка конфига (--print-config)", "ok", "resolved.yaml записан"))
 
+    if resolved is not None and "repeats" in (experiment := resolved.get("experiment") or {}):
+        requested = experiment["repeats"]
+        actual = ((resolved.get("system") or {}).get("materialize") or {}).get("repeats", 1)
+        if type(requested) is not int or requested < 1:
+            checks.append(Check("repeats", "Попыток на задачу", "fail", "Задайте целое число от 1"))
+        elif actual != requested:
+            checks.append(Check("repeats", "Попыток на задачу", "fail", f"Fleet применяет {actual} вместо {requested}. Проверьте ревизию и конфиг."))
+
     if own_model and resolved is not None:
         job = ((resolved.get("mlsc") or {}).get("create_job") or {}).get("job") or {}
         if problem := job_priority_problem(str(job.get("queue_name") or ""), str(job.get("job_priority_class") or "")):
