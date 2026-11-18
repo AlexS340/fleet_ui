@@ -26,6 +26,7 @@ import yaml
 from fleet_console.auth import Access, AccessDenied
 from fleet_console.compose import BenchSpec, Preview, SessionLink, from_resolved
 from fleet_console.compose.policy import check_gpu, private_root, supports_private_measure
+from fleet_console.connect.gateway import parse_target
 from fleet_console.control.runs import active_workflows
 from fleet_console.fleetref.profile import DUMMY_ENV
 from fleet_console.models import SessionManager
@@ -67,6 +68,8 @@ STAGE_TITLES = {
     "launch": "сабмит: запуск сабмиттера",
     "execute": "исполнение: ждём задачи, держим лимит агентов",
     "requeue": "requeue упавших",
+    "prepare_retry": "возврат неудачных попыток в очередь",
+    "retry_limit": "проверка модели и восстановление лимита агентов",
     "stop_llm": "гашение модели",
     "measure": "замер (Benchboard)",
 }
@@ -158,6 +161,9 @@ class BenchManager:
         return self.store.bench_stages(run_id)
 
     def plan_of(self, run: BenchRun) -> list[str]:
+        if run.retry_selection:
+            return (["prepare_retry"] + (["start_llm", "check"] if run.own_model else [])
+                    + ["retry_limit", "launch", "execute"] + (["stop_llm"] if run.own_model else []) + ["measure"])
         return plan(run.own_model, self.settings.bench.requeue_rounds)
 
     def busy_sessions(self) -> set[str]:
@@ -406,6 +412,79 @@ class BenchManager:
                     self.store.update_bench(run_id, started_at=run.started_at or _iso(self.clock()))
                     self._launch(run_id, spec, position(self.plan_of(run), run.stage or "preflight", run.requeues))
 
+    async def _final_failed_count(self, run_id: str) -> int | None:
+        if not self.get(run_id).preview.get("s3") or not any(s.stage == "launch" for s in self.stages(run_id)):
+            return None
+        try:
+            results = s3.scan_results(await self.s3_objects(run_id))
+        except (CommandError, OSError):
+            return None  # карточка повторит чтение при открытии
+        return len(s3.failed_selection(results))
+
+    async def retry_failed(self, run_id: str, selection: dict[str, int], *, access: Access | None = None) -> None:
+        async with self._actions.setdefault(run_id, asyncio.Lock()):
+            run = access.run(run_id) if access else self.get(run_id)
+            if run.active or not selection or run.version_id is None:
+                raise BenchError("Для повтора нужен завершённый прогон с неудачными попытками")
+            if access and run.session_id:
+                access.session(run.session_id)
+            if not self.store.request(run_id):
+                raise BenchError("У прогона нет заявки для резервирования ресурсов")
+            await self._retry_sources(run, selection)
+            self.store.queue_failed_attempts(run_id, selection)
+            self.store.event("bench_retry_failed", run_id, "ok", f"Попыток: {len(selection)}")
+            await self.dispatch()
+
+    async def _retry_sources(self, run: BenchRun, selection: dict[str, int]) -> dict[str, s3.TaskResult]:
+        sub = await self._read_submitter(run.id)
+        if sub is None or sub.alive or await active_workflows(self.runner, self.settings.namespace, run.id):
+            raise BenchError("Нужен остановленный сабмиттер без активных workflows и сохранённые манифесты")
+        spec = await self.spec_of(run)
+        configuration = await self._configuration()
+        if run.own_model:
+            version = mlsc.created_version(configuration, run.id, run.version_id)
+            if spec.read_version_id() != version or not mlsc.is_stopped(configuration, version):
+                raise BenchError("MLSC не подтвердил остановку исходной версии модели")
+        elif (not spec.session or spec.session.version_id != run.version_id
+              or not mlsc.replica_counts(configuration, run.version_id)[1]):
+            raise BenchError("Исходная сессия модели недоступна")
+        results = s3.scan_results(await self.s3_objects(run.id))
+        if s3.failed_selection(results) != selection:
+            raise BenchError("Последние попытки в S3 изменились. Обновите список задач")
+        return results
+
+    async def _restore_retry_limit(self, run: BenchRun, spec: BenchSpec) -> None:
+        _, live = mlsc.replica_counts(await self._configuration(), run.version_id)
+        if not live:
+            raise BenchError("Модель недоступна: MLSC показывает 0 реплик")
+        if run.inference == "litellm":
+            base = str(run.preview.get("gateway") or "").rstrip("/")
+            if not base:
+                namespace, service, port = parse_target(self.settings.cluster.litellm_gateway)
+                base = f"http://{service}.{namespace}.svc:{port}"
+            url = base + ("/models" if base.endswith("/v1") else "/v1/models")
+            response = await self.runner.run(
+                ["kubectl", "exec", "-n", self.settings.namespace, self.settings.cluster.submitter_pod,
+                 "--", "curl", "-fsS", "--proto", "=http,https", "--max-time", "15", "--", url], timeout=25)
+            if not response.ok or run.model not in {m.get("id") for m in json.loads(response.stdout)["data"]}:
+                raise BenchError(f"Шлюз LiteLLM не подтвердил доступность модели {run.model}")
+        limit = live * spec.agents_per_replica
+        await self.agent_limit(run.id, limit)
+        self.store.update_bench(run.id, agent_limit=limit)
+
+    async def _prepare_retry(self, run: BenchRun) -> None:
+        selection = json.loads(run.retry_selection)
+        results = await self._retry_sources(run, selection)
+        base = self.s3_base(run.id).rstrip("/") + "/"
+        payload = {"failed": [base + rel for rel in selection],
+                   "completed": [base + rel for rel, task in results.items() if task.status == "completed"]}
+        script = Path(__file__).with_name("retry_manifests.py").read_text()
+        cmd = ["kubectl", "exec", "-i", "-n", self.settings.namespace, self.settings.cluster.submitter_pod,
+               "--", "python3", "-c", script, f"{submitter.ROOT}/{run.id}"]
+        result = await self.runner.run(cmd, stdin=json.dumps(payload), timeout=120)
+        if not result.ok:
+            raise BenchError("Не удалось подготовить манифесты: " + result.stderr.strip()[-500:])
+
     async def retry(self, run_id: str, *, access: Access | None = None) -> BenchRun:
         async with self._actions.setdefault(run_id, asyncio.Lock()):
             return await self._retry(run_id, access=access)
@@ -487,7 +566,8 @@ class BenchManager:
             except Exception as exc:
                 failed.append(str(exc))
         status = "stopping" if failed else "stopped"
-        self.store.update_bench(run_id, status=status, stage="", finished_at=None if failed else _iso(self.clock()), error="; ".join(failed))
+        self.store.update_bench(run_id, status=status, stage="", finished_at=None if failed else _iso(self.clock()), error="; ".join(failed),
+                                failed_attempts=None if failed else await self._final_failed_count(run_id))
         self.store.event("bench_stop", run_id, "ok" if not failed else "error", reason + ("; " + "; ".join(failed) if failed else ""))
         if not failed:
             self.store.release(run_id)
@@ -588,7 +668,8 @@ class BenchManager:
             except Exception as exc:
                 self.store.update_bench(run_id, error=f"Не удалось сверить остановку: {exc}")
                 return
-            self.store.update_bench(run_id, status="stopped", stage="", finished_at=_iso(self.clock()), error="")
+            self.store.update_bench(run_id, status="stopped", stage="", finished_at=_iso(self.clock()), error="",
+                                    failed_attempts=await self._final_failed_count(run_id))
             self.store.release(run_id)
             self.store.event("bench_stop", run_id, "ok", "после перезапуска кластер подтвердил остановку")
 
@@ -647,7 +728,19 @@ class BenchManager:
             while index < len(stages):
                 stage = stages[index]
                 self.store.update_bench(run_id, stage=stage, status="running")
-                if stage == "execute":
+                if stage in ("prepare_retry", "retry_limit"):
+                    sid = self.store.start_bench_stage(run_id, stage, STAGE_TITLES[stage])
+                    try:
+                        if stage == "prepare_retry":
+                            await self._prepare_retry(self.get(run_id))
+                        else:
+                            await self._restore_retry_limit(self.get(run_id), spec)
+                    except Exception:
+                        self.store.finish_bench_stage(sid, 1)
+                        raise
+                    self.store.finish_bench_stage(sid, 0)
+                    ok = True
+                elif stage == "execute":
                     ok = await self._execute(run_id, spec)
                 elif stage == "preflight":
                     resolved, error = await self.print_config(spec, run_id)
@@ -678,7 +771,8 @@ class BenchManager:
                 moved = False
                 interrupted = False
                 index += 1
-            self.store.update_bench(run_id, status="done", stage="", error="", finished_at=_iso(self.clock()))
+            self.store.update_bench(run_id, status="done", stage="", error="", finished_at=_iso(self.clock()),
+                                    failed_attempts=await self._final_failed_count(run_id))
             self.store.release(run_id)
             self.store.event("bench_done", run_id, "ok")
             await self._notify("Fleet Console", f"Прогон {run_id} завершён: замер готов")
@@ -721,7 +815,7 @@ class BenchManager:
         return bool(matches) and int(matches[-1][0]) > 0
 
     async def _reconcile_model(self, run: BenchRun, spec: BenchSpec, stage: str) -> None:
-        if stage in (*BEFORE_GPU, "create_job", "measure"):
+        if stage in (*BEFORE_GPU, "prepare_retry", "create_job", "measure"):
             return
         version_id = spec.session.version_id if spec.session else run.version_id
         if version_id is None:
@@ -739,7 +833,7 @@ class BenchManager:
     def _fail(self, run_id: str, stage: str, spec: BenchSpec, detail: str = "") -> None:
         tail = detail or _log_tail(spec.logs_dir / f"{stage}.log") or self.get(run_id).error  # у execute лога нет: причина в журнале
         error = f"стадия {stage} не удалась" + (f": {tail}" if tail else "")
-        if stage in BEFORE_GPU:
+        if stage in (*BEFORE_GPU, "prepare_retry"):
             self.store.update_bench(run_id, status="failed", error=error, finished_at=_iso(self.clock()))
             self.store.release(run_id)
             self.store.event("bench_fail", run_id, "error", error)
@@ -783,14 +877,15 @@ class BenchManager:
         return await mlsc.get_configuration(self.runner, c.mlsc_namespace, await self.mlsc_pod(), c.mlsc_base_url,
                                            self.secrets().get("MLSC_TOKEN", ""))
 
-    async def _snapshot(self, run_id: str, spec: BenchSpec) -> dict[str, Any]:
+    async def _snapshot(self, run_id: str, spec: BenchSpec, *, fresh: bool = False) -> dict[str, Any]:
         """Свежие данные дашборда: прогон Argo, каталог на сабмиттере, живые реплики модели."""
         obs = self.observer
         while obs.busy:
             await asyncio.sleep(0.01)
         stale = obs.runs.at is None or (datetime.now(timezone.utc) - obs.runs.at).total_seconds() > self.settings.bench.poll_seconds
         # Даже свежий общий снимок мог быть снят до upload/launch этого прогона.
-        if stale or not any(s.run_id == run_id for s in obs.submitter.data or []):
+        missing = not any(s.run_id == run_id for s in obs.submitter.data or [])
+        if fresh or stale or missing or any(src.error for src in (obs.runs, obs.submitter, obs.mlsc)):
             await obs.refresh()
         for source in (obs.runs, obs.submitter, obs.mlsc):
             if source.error or source.data is None:
@@ -799,7 +894,9 @@ class BenchManager:
         sub = next((s for s in obs.submitter.data or [] if s.run_id == run_id), None)
         run = self.get(run_id)
         version_id = spec.session.version_id if spec.session else run.version_id
-        version = next((v for v in obs.mlsc.data or [] if v.version_id == version_id), None) if version_id is not None else None
+        version = next((v for v in obs.mlsc.data or [] if v.version_id == version_id), None)
+        if version is None and version_id is not None and run.counters.get("replicas"):
+            version = obs.model_version(version_id)
         return {"argo": argo, "sub": sub, "version": version}
 
     async def _read_submitter(self, run_id: str) -> submitter.SubmitterRun | None:
@@ -811,7 +908,7 @@ class BenchManager:
         row = await self._read_submitter(run_id)
         if row is None:
             raise BenchError("Состояние submitter не установлено: каталог прогона отсутствует")
-        previous = next((s for s in reversed(self.stages(run_id)) if s.stage in {"launch", "requeue"}), None)
+        previous = next((s for s in reversed(self.stages(run_id)) if s.stage in {"launch", "requeue", "prepare_retry"}), None)
         if row.alive:
             return "сабмиттер прогона уже жив на поде"
         previous_launch = previous if previous and previous.stage == "launch" else None
@@ -831,12 +928,26 @@ class BenchManager:
         )
         started = self.clock()
         seen_alive = False
+        poll_errors = 0
+        fresh = True  # первый снимок после launch, включая повтор в прежнем run_id
         last_limit = self.get(run_id).agent_limit
         try:
             while True:
-                snap = await self._snapshot(run_id, spec)
+                try:
+                    snap = await self._snapshot(run_id, spec, fresh=fresh)
+                except BenchError:
+                    poll_errors += 1
+                    if poll_errors >= 3:
+                        raise
+                    await self.sleep(cfg.poll_seconds)
+                    continue
+                poll_errors = 0
+                fresh = False
                 argo, sub, version = snap["argo"], snap["sub"], snap["version"]
                 live = version.current if version is not None else None
+                if live == 0 and (sub and sub.alive or argo and argo.active):
+                    raise BenchError("Модель недоступна: MLSC подтверждает 0 готовых реплик. "
+                                     "Возможное вытеснение можно проверить в логе воркера.")
                 desired = live * spec.agents_per_replica if live is not None else None
                 if desired is not None and desired != last_limit:
                     try:
@@ -878,6 +989,9 @@ class BenchManager:
                 await self.sleep(cfg.poll_seconds)
         except asyncio.CancelledError:
             self.store.finish_bench_stage(stage_id, None)
+            raise
+        except Exception:
+            self.store.finish_bench_stage(stage_id, 1)
             raise
 
     async def _notify(self, title: str, text: str) -> None:

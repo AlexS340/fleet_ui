@@ -481,3 +481,110 @@ async def test_spec_roundtrip_and_dataset_json(h: Harness) -> None:
     h.settings.bench.requeue_rounds = 0
     run = await h.start(dataset=DatasetRef(path="cowork/tasks", benchmark="cowork"))
     assert json.loads(run.dataset)["benchmark"] == "cowork" and dataset_of(run).path == "cowork/tasks" and dataset_of(h.mgr.get("run-x")).benchmark == "cowork"
+
+
+async def test_failed_attempt_recovery_reserves_quota_and_uses_existing_version(h: Harness, monkeypatch) -> None:
+    from fleet_console.observe.s3 import S3Object
+
+    h.submitter = "done"
+    run = await h.start()
+    h.store.update_bench(run.id, status="stopped")  # an older, already closed run
+    rel = "b/a/results/t1"
+    flags = [S3Object(rel + "/try3/FAILED", 0, ""), S3Object("b/a/results/t2/try2/COMPLETED", 0, "")]
+
+    async def objects(_):
+        return flags
+
+    monkeypatch.setattr(h.mgr, "s3_objects", objects)
+    with pytest.raises(BenchError, match="изменились"):
+        await h.mgr.retry_failed(run.id, {rel: 2})
+    h.argo_active = 1
+    with pytest.raises(BenchError, match="активных workflows"):
+        await h.mgr.retry_failed(run.id, {rel: 3})
+    h.argo_active = 0
+    h.settings.quotas.total_gpus = 0
+    await h.mgr.retry_failed(run.id, {rel: 3})
+    assert h.mgr.get(run.id).status == "queued"
+    with pytest.raises(BenchError):
+        await h.mgr.retry_failed(run.id, {rel: 3})
+
+    orig = h.mgr._stage
+
+    async def stage(rid, spec, name):
+        if name == "start_llm":
+            h.configuration["application_version_states"][str(run.version_id)] = {"planned": 1, "current": 1}
+        if name == "launch":
+            flags[0] = S3Object(rel + "/try4/COMPLETED", 0, "")
+        return await orig(rid, spec, name)
+
+    monkeypatch.setattr(h.mgr, "_stage", stage)
+    h.runner.on("kubectl", "exec", "-i", "-n", NS)
+    h.runner.on("kubectl", "exec", "-n", NS, "fleet-submitter-python", "--", "curl", stdout=json.dumps({"data": [{"id": run.model}]}))
+    h.stages.clear()
+    h.settings.quotas.total_gpus = 160
+    await h.mgr.dispatch()
+    await h.mgr.tasks[run.id]
+    assert h.stages == ["start_llm", "check", "launch", "stop_llm", "measure"]
+    assert h.mgr.get(run.id).failed_attempts == 0
+    assert h.mgr.get(run.id).version_id == run.version_id
+    assert h.store.request(run.id)["state"] == "released"
+    cmd = next(meta for argv, meta in h.runner.calls if argv[:7] == ("kubectl", "exec", "-i", "-n", NS, "fleet-submitter-python", "--"))
+    assert json.loads(cmd["stdin"])["failed"] == [run.preview["s3"] + "/" + rel]
+
+
+def test_retry_manifest_selection_is_exact_and_resumable(tmp_path):
+    from fleet_console.runs.retry_manifests import prepare
+
+    root = tmp_path / "run"
+    pending, submitted = root / "pending", root / "submitted"
+    pending.mkdir(parents=True)
+    submitted.mkdir()
+
+    def manifest(folder, key):
+        (folder / (key + ".yaml")).write_text(yaml.safe_dump({"metadata": {
+            "labels": {"fleet/run-name": "run"}, "annotations": {"fleet/results-s3": "s3://b/" + key},
+        }}))
+
+    manifest(submitted, "failed")
+    manifest(submitted, "completed")
+    manifest(pending, "unrelated")
+    with pytest.raises(ValueError):
+        prepare(root, {"s3://b/failed"}, {"s3://b/completed"})
+    assert (submitted / "failed.yaml").exists()
+    (pending / "unrelated.yaml").unlink()
+    for _ in range(2):
+        prepare(root, {"s3://b/failed"}, {"s3://b/completed"})
+    assert [p.name for p in pending.iterdir()] == ["failed.yaml"]
+    assert [p.name for p in submitted.iterdir()] == ["completed.yaml"]
+
+
+async def test_poll_timeout_recovers_but_zero_replicas_requires_attention(h, monkeypatch):
+    from fleet_console.observe.mlsc import Version
+    from fleet_console.observe.submitter import SubmitterRun
+    from fleet_console.ui.benches import _status_text
+
+    h.submitter = "done"
+    run = await h.start()
+    original = h.mgr._snapshot
+    errors = 0
+
+    async def flaky(run_id, spec, *, fresh):
+        nonlocal errors
+        errors += 1
+        if errors < 3:
+            raise BenchError("Не удалось получить свежий статус прогона: таймаут 60 с")
+        return await original(run_id, spec, fresh=fresh)
+
+    monkeypatch.setattr(h.mgr, "_snapshot", flaky)
+    assert await h.mgr._execute(run.id, h.spec())
+    assert errors == 3
+
+    async def lost(run_id, spec, *, fresh):
+        return {"argo": None, "sub": SubmitterRun(run_id, 4, 1, 2, 0, True, None),
+                "version": Version(run.version_id, run_id, run.model, 1, 0)}
+
+    monkeypatch.setattr(h.mgr, "_snapshot", lost)
+    h.store.update_bench(run.id, status="running", stage="execute", requeues=0)
+    await h.mgr._drive(run.id, h.spec(), h.mgr.plan_of(run).index("execute"), None, False)
+    assert _status_text(h.mgr.get(run.id)) == "требует внимания · модель недоступна"
+    assert h.store.open_bench_stage(run.id) is None

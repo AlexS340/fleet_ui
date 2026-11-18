@@ -278,6 +278,8 @@ class BenchRun:
     version_id: int | None = None
     error: str = ""
     manual: int = 0  # ручные правки конфига в каталоге прогона
+    retry_selection: str = ""  # снимок последних FAILED (путь в S3 → номер попытки)
+    failed_attempts: int | None = None
     requeues: int = 0  # сделано раундов requeue
     agent_limit: int | None = None  # последнее записанное значение файла лимита
     counters_json: str = "{}"
@@ -343,6 +345,7 @@ class Store:
                 "run_limit": "INTEGER", "gpu_limit": "INTEGER", "password_hash": "TEXT",
                 "session_version": "INTEGER NOT NULL DEFAULT 0", "role_managed": "INTEGER NOT NULL DEFAULT 0",
             })
+            self._add_columns("bench_runs", {"retry_selection": "TEXT NOT NULL DEFAULT ''", "failed_attempts": "INTEGER"})
             self._add_columns("events", {"actor_id": "TEXT NOT NULL DEFAULT ''"})
 
     def _add_columns(self, table: str, definitions: dict[str, str]) -> None:
@@ -544,6 +547,20 @@ class Store:
                     or gpu + sum(r["gpu"] for r in rows if r["owner_id"] == request["owner_id"]) > gpu_limit):
                 raise ValueError("Для увеличения числа реплик не хватает квоты GPU")
             self.conn.execute("UPDATE requests SET gpu=? WHERE id=?", (gpu, request_id))
+
+    def queue_failed_attempts(self, run_id: str, selection: dict[str, int]) -> None:
+        with self.conn:
+            cur = self.conn.execute("UPDATE requests SET state='queued' WHERE id=? AND state='released' AND kind='bench'", (run_id,))
+            if not cur.rowcount:
+                raise ValueError("Заявка уже в очереди или её резерв не освобождён")
+            cur = self.conn.execute(
+                "UPDATE bench_runs SET status='queued', stage='prepare_retry', retry_selection=?, "
+                "requeues=0, finished_at=NULL, attention_at=NULL, error='', agent_limit=NULL, counters_json='{}', "
+                "failed_attempts=NULL WHERE id=? AND status IN ('stopped','failed','done')",
+                (json.dumps(selection), run_id),
+            )
+            if not cur.rowcount:
+                raise ValueError("Статус прогона изменился")
 
     def requeue_request(self, request_id: str) -> None:
         with self.conn:

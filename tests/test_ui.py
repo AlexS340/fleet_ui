@@ -412,7 +412,7 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.open("/runs")
     await user.should_see("клик по строке — карточка прогона")
     table = next(iter(user.find(kind=ui.table).elements))
-    assert table.rows[0]["tasks"] == "0 / 0 / 3" and table.rows[0]["status"] == "готов"
+    assert table.rows[0]["tasks"] == "0 / 0 / 3" and table.rows[0]["status"] == "завершён с ошибками · неудачных попыток: 1"
     (fakes.CTX.paths.runs / run.id / "out" / ".fleet").mkdir(parents=True, exist_ok=True)
     (fakes.CTX.paths.runs / run.id / "out" / ".fleet" / "tasks.json").write_text('[{"a": 1}, {"a": 2}, {"a": 3}]')  # появился после материализации
     user.find(kind=ui.table).trigger("rowClick", [None, {"id": run.id}])
@@ -793,3 +793,19 @@ async def test_bench_status_and_open_card_follow_mlsc_and_stage_changes(user: Us
     await user.should_see("Остановить прогон waiting-model?")
     row = next(row for row in run_list.rows if row["id"] == "waiting-model")
     assert "исполнение" in row["status"] and row["replicas"] == "Реплики готовы: 1/1"
+
+
+async def test_closed_run_opens_failed_retry_confirmation(user: User):
+    ctx = fakes.CTX
+    run = BenchRun("retry-demo", "queued", fakes.NOW.isoformat(), version_id=1677,
+                   preview_json=json.dumps({"s3": "s3://b/ns/GLM/retry-demo"}))
+    ctx.store.enqueue(run, 8, run.id)
+    ctx.store.update_bench(run.id, status="stopped")
+    ctx.store.release(run.id)
+    await user.open("/runs/retry-demo")
+    await user.should_see("Повторить неудачные попытки")
+    user.find("Повторить неудачные попытки").click()
+    await user.should_see("последних попыток с FAILED: 1")
+    await user.should_see("резерв 8 GPU")
+    user.find("Отмена").click()
+    assert ctx.store.request(run.id)["state"] == "released"

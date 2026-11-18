@@ -52,7 +52,7 @@ from fleet_console.fleetref.manager import PrepareError, ReadyRevision
 from fleet_console.fleetref.profile import CONFIGS_REL, list_groups
 from fleet_console.models.compose import recipe_summary
 from fleet_console.observe.argo import TaskWorkflow, argo_ui_url, workflow_url
-from fleet_console.observe.s3 import S3Object, TaskResult, scan_results
+from fleet_console.observe.s3 import S3Object, TaskResult, failed_selection, scan_results
 from fleet_console.presets import DatasetRef, Preset, compatibility, load_presets, personal_dir, save_personal
 from fleet_console.runs import STAGE_TITLES, BenchError, dataset_of
 from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
@@ -103,6 +103,11 @@ def _when(text: str | None) -> str:
 
 def _status_text(run: BenchRun) -> str:
     text = STATUS_TEXT.get(run.status, run.status)
+    if not run.active and run.failed_attempts:
+        outcome = "завершён с ошибками" if run.status == "done" else text
+        return f"{outcome} · неудачных попыток: {run.failed_attempts}"
+    if run.status == "attention" and "Модель недоступна:" in run.error:
+        return "требует внимания · модель недоступна"
     if run.status == "queued":
         return "в очереди · ждёт свободной квоты"
     if run.status == "running" and run.stage == "check":
@@ -115,7 +120,7 @@ def _status_text(run: BenchRun) -> str:
 
 
 def _status_color(run: BenchRun) -> str:
-    return "text-negative" if run.status in {"attention", "failed"} else ""
+    return "text-negative" if run.status in {"attention", "failed"} or (not run.active and run.failed_attempts) else ""
 
 
 def _run_mlsc(ctx: AppContext, run: BenchRun, secrets: Iterable[str]) -> tuple[str, str]:
@@ -1212,7 +1217,8 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         remaining = _remaining_resources(ctx, run)
         warning = "После завершения прогона остались ресурсы. " + ", ".join(remaining) if remaining else ""
         if run.status == "attention":
-            warning = ("Повторите стадию или погасите модель." if run.holds_gpu
+            warning = ("После остановки можно повторить попытки с FAILED в этом прогоне." if "Модель недоступна:" in run.error
+                       else "Повторите стадию или погасите модель." if run.holds_gpu
                        else "Задачи могут идти: повторите стадию или остановите прогон.")
         resources.set_text(warning)
         c = run.counters
@@ -1251,7 +1257,7 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
                 if load_tasks is None:
                     load_tasks = _tasks_section(ctx, run, preview.s3)
                     ui.timer(0, load_tasks, once=True)
-                elif task_state != last_tasks and (run.stage in {"execute", "requeue"} or last_tasks[1] and not run.active):
+                elif task_state != last_tasks and (run.stage in {"execute", "requeue"} or run.active != last_tasks[1]):
                     ui.timer(0, load_tasks, once=True)
             last_tasks = task_state
         if load_tasks is not None:
@@ -1326,6 +1332,22 @@ def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> Callable[[],
         ui.button("Обновить", on_click=lambda: load()).props("flat dense no-caps")
         if s3_base:
             ui.button("Файлы в S3", on_click=lambda: _s3_dialog(ctx, run, s3_base)).props("flat dense no-caps")
+        retry = ui.button("Повторить неудачные попытки", on_click=lambda: confirm_retry()).props("unelevated no-caps")
+        retry.set_visibility(False)
+
+    def confirm_retry() -> None:
+        selected = failed_selection(state["results"])
+        current = ctx.access.run(run.id)
+        if current.active or not selected:
+            return
+        request = ctx.store.request(run.id)
+        confirm_dialog("Повторить неудачные попытки?", [
+            f"Прогон {run.id} · последних попыток с FAILED: {len(selected)}.",
+            (f"Будет поднята версия MLSC {current.version_id}, резерв {request['gpu']} GPU."
+             if current.own_model else "Будет использована готовая сессия модели."),
+            "Результаты новых попыток появятся в том же прогоне. После исполнения замер будет пересчитан.",
+        ], lambda: ctx.benches.retry_failed(run.id, selected, access=ctx.access), button="Повторить")
+
     note = ui.label("читаю workflows…").classes("text-xs opacity-70")
     table = ui.table(columns=TASK_COLUMNS, rows=[], row_key="task").classes("w-full").props("dense flat").mark("bench-tasks")
     table.on("rowClick", lambda e: _task_dialog(ctx, run, s3_base, e.args[1], state))
@@ -1343,6 +1365,7 @@ def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> Callable[[],
             await fetch()
 
     async def fetch() -> None:
+        retry.set_visibility(False)
         now = datetime.now(timezone.utc)
         try:
             tasks = await ctx.benches.task_workflows(run.id, access=ctx.access)
@@ -1360,6 +1383,11 @@ def _tasks_section(ctx: AppContext, run: BenchRun, s3_base: str) -> Callable[[],
         except Exception as exc:  # noqa: BLE001 — нет ключей или aws: таблица остаётся по Argo
             note.set_text(f"workflows: {len(tasks)} · S3: {exc}")
             return
+        current = ctx.access.run(run.id)
+        failures = len(failed_selection(results))
+        if not current.active:
+            ctx.store.update_bench(run.id, failed_attempts=failures)
+            retry.set_visibility(bool(failures and current.version_id and ctx.store.request(run.id)))
         state["results"] = results
         state["rows"] = _task_rows(tasks, results, now)
         render()
@@ -1415,7 +1443,7 @@ def _task_dialog(ctx: AppContext, run: BenchRun, s3_base: str, row: dict[str, An
         if result is None:
             ui.label("в S3 результатов нет" if s3_base else "путь S3 неизвестен").classes("text-sm opacity-70")
         else:
-            n = result.tries
+            n = result.latest_try
             ui.label(f"S3: попыток {n} · итог {RESULT_TEXT.get(result.status, result.status)} · {s3_base.rstrip('/')}/{result.rel}").classes("text-sm break-all")
             for obj in result.files:
                 uri = f"{s3_base.rstrip('/')}/{result.rel}/try{n}/{obj.key}"

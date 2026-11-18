@@ -41,6 +41,7 @@ class TaskResult:
     tries: int = 0  # попыток (папок tryN)
     status: str = "no_attempt"  # completed | failed | no_flag | no_attempt — как scan_run_statuses fleet
     files: list[S3Object] = field(default_factory=list)  # файлы последней попытки
+    latest_try: int = 0
 
     @property
     def task(self) -> str:
@@ -131,13 +132,19 @@ def scan_results(objects: list[S3Object]) -> dict[str, TaskResult]:
         last_try[rel] = max(last_try.get(rel, 0), n)
         per_try.setdefault((rel, n), []).append(S3Object("/".join(parts[5:]), obj.size, obj.modified))
         if len(parts) == 6 and parts[5] in FLAGS:
-            flags[(rel, n)] = FLAGS[parts[5]]
+            if flags.get((rel, n)) != "completed":
+                flags[(rel, n)] = FLAGS[parts[5]]
     for rel, task in tasks.items():
         n = last_try.get(rel, 0)
+        task.latest_try = n
         task.tries = len({k[1] for k in per_try if k[0] == rel})
         task.files = sorted(per_try.get((rel, n), []), key=lambda o: o.key)
         task.status = flags.get((rel, n), "no_flag" if n else "no_attempt")
     return tasks
+
+
+def failed_selection(results: dict[str, TaskResult]) -> dict[str, int]:
+    return {rel: task.latest_try for rel, task in results.items() if task.status == "failed"}
 
 
 def last_try(objects: list[S3Object], rel: str) -> int:
