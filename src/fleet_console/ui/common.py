@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Awaitable, Callable
 
 from nicegui import ui
@@ -15,34 +14,6 @@ JOB_PRIORITIES = tuple(p for priorities in JOB_PRIORITIES_BY_QUEUE.values() for 
 JOB_QUEUE_KEY = "mlsc.create_job.job.queue_name"
 JOB_QUEUES = tuple(JOB_PRIORITIES_BY_QUEUE)
 DEFAULT_JOB_PRIORITIES = {"gigacode": "medium", "shared": "shared-low"}
-
-
-def checkpoint_select(paths: list[str]) -> ui.select:
-    names = {path: path.rstrip("/").rsplit("/", 1)[-1] for path in paths if path}
-    counts = Counter(names.values())
-    options = {"": "Из рецепта", **{path: name if counts[name] == 1 else path for path, name in names.items()}}
-    return ui.select(options, value="", label="Чекпоинт", with_input=True).props('popup-content-style="overflow-wrap: anywhere"').classes("w-full min-w-0")
-
-
-def restore_checkpoint(field: ui.select, overrides: list[str]) -> list[str]:
-    """Переносим одиночный знакомый путь в поле, сохраняя сложные ручные overrides дословно."""
-    matches = [entry for entry in overrides if entry.partition("=")[0].lstrip("+~") == "mlsc.model_path"]
-    if len(matches) == 1 and matches[0].startswith("mlsc.model_path="):
-        path = matches[0].partition("=")[2]
-        if path and path in field.options:
-            field.set_value(path)
-            return [entry for entry in overrides if entry != matches[0]]
-    field.set_value("")
-    return overrides
-
-
-def checkpoint_overrides(path: str, extra: str) -> list[str]:
-    entries = [line.strip() for line in extra.splitlines() if line.strip()]
-    if path:
-        if any(entry.partition("=")[0].lstrip("+~") == "mlsc.model_path" for entry in entries):
-            raise ValueError("Чекпоинт уже выбран. Уберите mlsc.model_path из overrides или выберите «Из рецепта».")
-        entries.append(f"mlsc.model_path={path}")
-    return entries
 
 
 def set_job_priority_options(priority: ui.select, queue: str, preferred: str) -> None:

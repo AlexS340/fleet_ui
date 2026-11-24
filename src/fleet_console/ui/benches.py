@@ -57,21 +57,7 @@ from fleet_console.presets import DatasetRef, Preset, compatibility, load_preset
 from fleet_console.runs import STAGE_TITLES, BenchError, dataset_of
 from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
 from fleet_console.store import BenchRun
-from fleet_console.ui.common import (
-    JOB_PRIORITIES,
-    JOB_PRIORITY_OVERRIDE,
-    JOB_QUEUES,
-    JOB_QUEUE_KEY,
-    checkpoint_overrides,
-    checkpoint_select,
-    confirm_dialog,
-    hint,
-    job_options_select,
-    restore_checkpoint,
-    set_job_priority_options,
-    split_job_options,
-    text_dialog,
-)
+from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_options_select, set_job_priority_options, split_job_options, text_dialog
 from fleet_console.ui.header import build_header
 from fleet_console.ui.local_datasets import local_panel
 
@@ -363,7 +349,6 @@ def _new_bench_dialog(
             model_select = ui.select(model_options, value=next(iter(model_options), None), label="Модель", with_input=True).classes("flex-1 min-w-[18rem]")
             model_name = ui.input("Имя модели (уникальный суффикс добавится автоматически)").classes("flex-1 min-w-[14rem]")
             queue, priority = job_options_select()
-        checkpoint = checkpoint_select(ctx.settings.checkpoint_paths if admin else [])
         with ui.row().classes("w-full gap-3 flex-wrap items-end"):
             agents = groups.get("harbor/agent", [])
             agent_select = ui.select({a: label_of("harbor/agent", a) for a in agents}, value=agents[0] if agents else None, label="Агент · harbor/agent", with_input=True).classes(
@@ -444,7 +429,6 @@ def _new_bench_dialog(
             selected_mapping = registry.get(str(dataset_select.value or ""))
             custom_row.set_visibility(admin and is_path_dataset() and not (selected_mapping and selected_mapping.name in local_items))
             model_name.set_visibility(not is_session())
-            checkpoint.set_visibility(admin and bool(model_select.value) and not is_session())
             priority.set_visibility(bool(model_select.value) and not is_session())
             queue.set_visibility(bool(model_select.value) and not is_session())
             n = int(jobs.value or 1)
@@ -498,9 +482,7 @@ def _new_bench_dialog(
             saved_priority, saved_queue, overrides = split_job_options(preset_overrides)
             queue.set_value(saved_queue)
             set_job_priority_options(priority, saved_queue, saved_priority)
-            extra.set_value("\n".join(restore_checkpoint(checkpoint, overrides) if not session_id else overrides))
-            if session_id:
-                checkpoint.set_value("")
+            extra.set_value("\n".join(overrides))
             harbor_job_text.set_value(yaml.safe_dump(preset.harbor_job, allow_unicode=True, sort_keys=False) if preset.harbor_job else "")
             carry_files.set_visibility(admin and bool(preset.config_files))
             carry_files.set_value(admin and bool(preset.config_files) and not (session_id and model_select.value is None))
@@ -585,13 +567,8 @@ def _new_bench_dialog(
                 ctx.access.session(session_id)
                 session = ctx.benches.session_link(session_id)
                 recipe = session.recipe
-            if admin:
-                try:
-                    overrides = checkpoint_overrides("" if session else checkpoint.value, extra.value or "")
-                except ValueError as exc:
-                    raise BenchError(str(exc)) from exc
-            else:
-                overrides = split_job_options(setup.repeat_option()[1])[2] if setup else []
+            overrides = ([line.strip() for line in (extra.value or "").splitlines() if line.strip()] if admin
+                         else split_job_options(setup.repeat_option()[1])[2] if setup else [])
             if not session and priority.value in JOB_PRIORITIES:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={priority.value}")
             if not session and queue.value in JOB_QUEUES:
@@ -772,7 +749,7 @@ def _new_bench_dialog(
         dataset_select.on_value_change(lambda e: fill_from_registry(e.value))
         for element in (model_select, dataset_select, jobs, apr):
             element.on_value_change(lambda _: refresh_gpu())
-        for element in (model_select, model_name, priority, queue, checkpoint, extra, agent_select, dataset_select,
+        for element in (model_select, model_name, priority, queue, extra, agent_select, dataset_select,
                         custom_path, custom_benchmark, custom_mapping, jobs, apr, task_limit, repeats, profile, inference, harbor_job_text):
             element.on_value_change(lambda _: mark_model_config_changed())
         carry_files.on_value_change(lambda _: (sync_manual_fields(), mark_model_config_changed()))

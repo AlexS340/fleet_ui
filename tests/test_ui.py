@@ -261,8 +261,7 @@ async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy:
     ctx = fakes.CTX
     revision = await ctx.manager.prepare("master")
     ctx.settings.quotas.user_gpus = ctx.settings.quotas.total_gpus = 32
-    checkpoint = ctx.settings.checkpoint_paths[1]
-    extra = ("++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", f"mlsc.model_path={checkpoint}", "++mlsc.create_job.job.job_priority_class=shared-medium",
+    extra = ("++mlsc.create_job.job.env.MODEL_PATH='/models/my model'", "++mlsc.create_job.job.job_priority_class=shared-medium",
              "++mlsc.create_job.job.queue_name=shared")
     source = await ctx.sessions.start(revision, recipe="glm", model_name="GLM-personal", replicas=3,
                                       inference="nginx", ttl_minutes=85, extra=extra)
@@ -291,7 +290,6 @@ async def test_repeat_model_session_uses_saved_setup_and_sha(user: User, legacy:
     model = next(e for e in user.find(kind=ui.input).elements if e.props.get("label", "").startswith("Имя модели"))
     assert model.value == "GLM-personal"
     overrides = next(e for e in user.find(kind=ui.textarea).elements if e.props.get("label", "").startswith("overrides fleet"))
-    assert _select(user, "Чекпоинт").value == checkpoint
     assert overrides.value == extra[0]
     assert len(ctx.sessions.sessions()) == 1  # открытие формы не создаёт сессию и не занимает GPU
     model.set_value("GLM-repeated")
@@ -373,14 +371,7 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     user.find("Превью и preflight").click()
     await user.should_see("Очередь shared не принимает приоритет low")
     assert not start.enabled
-    checkpoint = fakes.CTX.settings.checkpoint_paths[0]
-    field = _select(user, "Чекпоинт")
-    assert field.value == ""
-    field.set_value(checkpoint)
-    extra.set_value("mlsc.model_path=/manual")
-    user.find("Превью и preflight").click()
-    await user.should_see("Чекпоинт уже выбран")
-    extra.set_value("execution.retry_limit=0")
+    extra.set_value("")
     queue.set_value("shared")
     assert list(priority.options) == ["shared-low", "shared-medium"]
     assert priority.value == "shared-low"
@@ -411,8 +402,6 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     assert run.status == "done" and run.version_id == 777 and run.task_limit == 3 and run.agents_per_replica == 2 and run.id.startswith("glm-cowork-")
     stages = fakes.CTX.benches.stages(run.id)
     assert [s.stage for s in stages] == ["preflight", "materialize", "create_job", "start_llm", "check", "upload", "launch", "execute", "stop_llm", "measure"]
-    assert f"mlsc.model_path={checkpoint}" in stages[2].command
-    assert "execution.retry_limit=0" in stages[2].command
     assert "++mlsc.create_job.job.job_priority_class=shared-low" in stages[2].command
     assert "++mlsc.create_job.job.queue_name=shared" in stages[2].command
     assert fakes.CTX.store.get_run(run.id) is not None and run.preview["gpu_per_instance"] == 8 and run.preview["tasks_total"] is None
@@ -520,11 +509,9 @@ async def test_bench_on_existing_session_ignores_selected_priority(user: User) -
     user.find("Запустить бенч").click()
     _select(user, "Приоритет джобы").set_value("high")
     _select(user, "Очередь MLSC").set_value("shared")
-    _select(user, "Чекпоинт").set_value(fakes.CTX.settings.checkpoint_paths[0])
     _select(user, "Модель").set_value("session:ready-model")
     await user.should_see("модель уже поднята: сессия GLM")
     await user.should_not_see("Приоритет джобы")
-    await user.should_not_see("Чекпоинт")
     await user.should_not_see("Очередь MLSC")
     user.find("Превью и preflight").click()
     await user.should_see("Что и где будет запущено")
@@ -532,7 +519,6 @@ async def test_bench_on_existing_session_ignores_selected_priority(user: User) -
     assert "job_priority_class=" not in (draft_dir / "overrides.txt").read_text()
     assert "queue_name=" not in (draft_dir / "overrides.txt").read_text()
     preview = {r["k"]: r["v"] for t in user.find(kind=ui.table).elements for r in t.rows if "k" in r}
-    assert "mlsc.model_path=" not in (draft_dir / "overrides.txt").read_text()
     assert "сессия ready-model" in preview["Модель"] and "Приоритет джобы" not in preview
 
 

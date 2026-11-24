@@ -179,10 +179,6 @@ class Settings(BaseModel):
     auto_fetch_minutes: int = 0
     worktree_ttl_days: int = 14
     ui_port: int = 8080
-    checkpoint_paths: list[str] = Field(default_factory=lambda: [
-        "/workspace-SR008.fs2/models/GigaLearn/models/3.3.1/3.3.1-strip_Qwen3-Coder-Next_base3.1-5ep-step6032_192k_5ep_step1560",
-        "/workspace-SR008.fs2/leopetrov/models/3.1_preview_Qwen3-Coder-Next_192k_5ep_step6032",
-    ])
     # Сессии моделей: время жизни по умолчанию и льготный интервал после уведомления до гашения.
     session_ttl_minutes: int = 120
     session_grace_minutes: int = 10
