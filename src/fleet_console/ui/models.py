@@ -19,7 +19,20 @@ from fleet_console.models.compose import recipe_summary
 from fleet_console.observe.mlsc import Version
 from fleet_console.settings import scrub
 from fleet_console.store import Session
-from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_options_select, split_job_options, text_dialog
+from fleet_console.ui.common import (
+    JOB_PRIORITIES,
+    JOB_PRIORITY_OVERRIDE,
+    JOB_QUEUES,
+    JOB_QUEUE_KEY,
+    checkpoint_overrides,
+    checkpoint_select,
+    confirm_dialog,
+    hint,
+    job_options_select,
+    restore_checkpoint,
+    split_job_options,
+    text_dialog,
+)
 from fleet_console.ui.header import STATUS_COLORS, STATUS_WORDS, build_header
 
 GATEWAY_OPTIONS = {"litellm": "litellm — маршрут fleet по умолчанию", "nginx": "nginx — vllm-proxy"}
@@ -147,6 +160,8 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
         info = ui.label().classes("text-xs opacity-70")
         model = ui.input("Имя модели (уникальный суффикс добавится автоматически)", value=options["model_name"]).classes("w-full")
         saved_priority, saved_queue, saved_extra = split_job_options(list(options["extra"]))
+        checkpoint = checkpoint_select(ctx.settings.checkpoint_paths if ctx.access.admin else []).set_visibility(ctx.access.admin)
+        saved_extra = restore_checkpoint(checkpoint, saved_extra)
         with ui.row().classes("gap-3 flex-wrap"):
             replicas = ui.number("Реплики", value=options["replicas"], min=1, precision=0).classes("w-28")
             ttl = ui.number("Время жизни, мин", value=options["ttl_minutes"], min=5, precision=0).classes("w-40")
@@ -180,7 +195,11 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
             ):
                 ui.notify("Проверьте имя модели и маршрут", type="negative")
                 return
-            overrides = [line.strip() for line in (extra.value or "").splitlines() if line.strip()] if ctx.access.admin else []
+            try:
+                overrides = checkpoint_overrides(checkpoint.value, extra.value or "") if ctx.access.admin else []
+            except ValueError as exc:
+                ui.notify(str(exc), type="negative")
+                return
             job_priority = priority.value
             lines = [
                 f"рецепт {recipe.value}, модель {name}, маршрут {inference.value}",
@@ -188,6 +207,8 @@ async def _new_session_dialog(ctx: AppContext, after, source_id: str | None = No
                 f"время жизни {int(ttl.value or 0)} мин, затем уведомление и гашение через {ctx.settings.session_grace_minutes} мин",
                 "стадии: preflight → mlsc.create_job → mlsc.start_llm → mlsc.check_llm_works; команды видны в карточке",
             ]
+            if ctx.access.admin and checkpoint.value:
+                lines.insert(1, f"чекпоинт {checkpoint.value}")
             if job_priority in JOB_PRIORITIES:
                 overrides.append(f"{JOB_PRIORITY_OVERRIDE}={job_priority}")
                 lines.insert(2, f"приоритет джобы {job_priority}")
