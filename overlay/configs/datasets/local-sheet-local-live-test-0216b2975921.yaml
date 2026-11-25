@@ -1,0 +1,5 @@
+benchmark: local-sheet-local-live-test-0216b2975921
+source:
+  tasks_root: local/local-sheet-local-live-test-0216b2975921/tasks
+runtime:
+  task_s3_base: s3://p-rndml-gcvmfleet/swe-bench-v2-20260308/harbor_datasets/local/local-sheet-local-live-test-0216b2975921/tasks/

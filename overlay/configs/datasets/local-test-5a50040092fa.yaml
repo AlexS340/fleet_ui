@@ -1,0 +1,5 @@
+benchmark: local-test-5a50040092fa
+source:
+  tasks_root: local/local-test-5a50040092fa/tasks
+runtime:
+  task_s3_base: s3://p-rndml-gcvmfleet/swe-bench-v2-20260308/harbor_datasets/local/local-test-5a50040092fa/tasks/
