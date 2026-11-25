@@ -57,11 +57,16 @@ from fleet_console.presets import DatasetRef, Preset, compatibility, load_preset
 from fleet_console.runs import STAGE_TITLES, BenchError, dataset_of
 from fleet_console.settings import OVERLAY_DIR, PRESETS_DIR, scrub
 from fleet_console.store import BenchRun
+from fleet_console.store.db import LOCAL_OWNER
 from fleet_console.ui.common import JOB_PRIORITIES, JOB_PRIORITY_OVERRIDE, JOB_QUEUE_KEY, JOB_QUEUES, confirm_dialog, hint, job_options_select, set_job_priority_options, split_job_options, text_dialog
 from fleet_console.ui.header import build_header
 from fleet_console.ui.local_datasets import local_panel
 
 STATUS_TEXT = {"queued": "в очереди", "running": "идёт", "attention": "требует внимания", "stopping": "останавливается", "stopped": "остановлен", "failed": "не удался", "done": "готов"}
+HIDDEN_STATUS_OPTIONS = {
+    "failed": "Неудачные и с ошибками", "stopped": "Остановленные", "running": "Выполняющиеся",
+    "queued": "В очереди", "attention": "Требуют внимания", "stopping": "Останавливаются", "done": "Успешные",
+}
 LEVEL_ICON = {"ok": ("check_circle", "text-positive"), "warn": ("warning", "text-warning"), "fail": ("cancel", "text-negative")}
 COLUMNS = [
     {"name": "id", "label": "Прогон", "field": "id", "align": "left", "sortable": True,
@@ -99,6 +104,18 @@ SESSION_PREFIX = "session:"
 
 def _when(text: str | None) -> str:
     return datetime.fromisoformat(text).astimezone().strftime("%d.%m %H:%M") if text else "—"
+
+
+def _matches_run_filters(run: BenchRun, hidden: list[str], owner: str | None, since: str, until: str) -> bool:
+    status = "failed" if run.status == "done" and run.failed_attempts else run.status
+    if status in hidden or (owner and run.owner_id != owner):
+        return False
+    if not (since or until):
+        return True
+    if not run.started_at:
+        return False
+    minute = datetime.fromisoformat(run.started_at).astimezone().strftime("%Y-%m-%dT%H:%M")
+    return (not since or since <= minute) and (not until or minute <= until)
 
 
 def _status_text(run: BenchRun) -> str:
@@ -214,17 +231,39 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
             ui.space()
             ui.button("Запустить бенч", on_click=lambda: _new_bench_dialog(ctx, render)).props("unelevated no-caps")
         banner = ui.label().classes("w-full text-negative text-sm whitespace-pre-wrap bench-run-banner")
+        with ui.expansion("Фильтры", icon="filter_list").classes("w-full").props("dense") as filters:
+            with ui.row().classes("w-full items-end gap-3"):
+                hidden = ui.select(
+                    HIDDEN_STATUS_OPTIONS, multiple=True, clearable=True, label="Скрыть статусы",
+                ).props("use-chips").classes("w-full sm:w-64")
+                owner = ui.select({}, label="Владелец", clearable=True).classes("w-full sm:w-44")
+                since = ui.input("Начат с").props("type=datetime-local stack-label").classes("w-full sm:w-52")
+                until = ui.input("Начат по").props("type=datetime-local stack-label").classes("w-full sm:w-52")
+                reset = ui.button("Сбросить", on_click=lambda: reset_filters()).props("flat no-caps")
         table = ui.table(columns=COLUMNS, rows=[], row_key="id").classes("w-full bench-runs").props("dense flat").mark("bench-runs")
         table.add_slot("body-cell-status", RUN_STATUS_SLOT)
         table.on("rowClick", lambda e: _run_dialog(ctx, e.args[1]["id"], render))
         empty = ui.label("Прогонов ещё нет. «Запустить бенч» собирает exp.yaml из пресета, показывает превью и preflight, затем ведёт стадии fleet.").classes(
             "text-sm opacity-70"
         )
-        ui.label("клик по строке — карточка прогона: что и где запущено, стадии с командами, логи, остановка и повтор").classes("text-xs opacity-60")
+        no_matches = ui.label("По этим фильтрам прогонов нет.").classes("text-sm opacity-70")
+        table_hint = ui.label("клик по строке — карточка прогона: что и где запущено, стадии с командами, логи, остановка и повтор").classes("text-xs opacity-60")
         local_panel(ctx, lambda item: _new_bench_dialog(ctx, render, local=item))
 
     def render() -> None:
-        runs = [r for r in ctx.benches.runs() if ctx.access.allows(r)]
+        access = ctx.access
+        accessible = [r for r in ctx.benches.runs() if access.allows(r)]
+        owners = {
+            key: "Локальный владелец" if key == LOCAL_OWNER else key
+            for key in sorted({r.owner_id for r in accessible})
+        }
+        if owner.options != owners:
+            owner.set_options(owners, value=owner.value if owner.value in owners else None)
+        runs = [r for r in accessible if _matches_run_filters(r, hidden.value or [], owner.value, since.value, until.value)]
+        filtering = bool(hidden.value or owner.value or since.value or until.value)
+        filters.set_text(f"Фильтры · найдено {len(runs)}" if filtering else "Фильтры")
+        filters.set_visibility(bool(accessible))
+        reset.set_visibility(filtering)
         remaining = {r.id: _remaining_resources(ctx, r) for r in runs}
         runs.sort(key=lambda run: not remaining[run.id])
         secrets = list(ctx.benches.secrets().values())
@@ -251,7 +290,11 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
             )
         table.update_rows(rows)
         table.set_visibility(bool(rows))
-        empty.set_visibility(not rows)
+        empty.set_visibility(not accessible)
+        no_matches.set_visibility(bool(accessible) and not rows)
+        reversed_range = since.value and until.value and since.value > until.value
+        no_matches.set_text("Дата «Начат с» позже «Начат по»." if reversed_range else "По этим фильтрам прогонов нет.")
+        table_hint.set_visibility(bool(rows))
         attention = [r for r in runs if r.status == "attention"]
         lines = [
             f"⚠ {r.id}: {'проверьте ресурсы модели' if r.holds_gpu else 'задачи могут идти'} — {r.error}"
@@ -262,6 +305,14 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
         banner.set_text(scrub("\n".join(lines), secrets))
         banner.set_visibility(bool(lines))
 
+    def reset_filters() -> None:
+        hidden.set_value([])
+        owner.set_value(None)
+        since.set_value("")
+        until.set_value("")
+
+    for field in (hidden, owner, since, until):
+        field.on_value_change(render)
     render()
     ui.timer(3.0, render)
     if run_id:
