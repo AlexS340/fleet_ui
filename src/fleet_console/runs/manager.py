@@ -25,6 +25,7 @@ import yaml
 
 from fleet_console.auth import Access, AccessDenied
 from fleet_console.compose import BenchSpec, Preview, SessionLink, from_resolved
+from fleet_console.compose.local_datasets import LocalDataset
 from fleet_console.compose.policy import check_gpu, private_root, supports_private_measure
 from fleet_console.connect.gateway import parse_target
 from fleet_console.control.runs import active_workflows
@@ -357,6 +358,15 @@ class BenchManager:
         actual = from_resolved(resolved, revision=preview.revision, context=preview.cluster.split(" · ")[0],
                                run_dir=spec.run_dir, session=spec.session.id if spec.session else "")
         self._validate_resolved(spec, resolved, actual)
+        if source := spec.dataset_source:
+            try:
+                current = LocalDataset.read(self.paths.home / "local-datasets", source["id"])
+            except (OSError, ValueError) as exc:
+                raise BenchError("Локальный набор недоступен. Выберите датасет заново.") from exc
+            if not current.uploaded_at or current.s3_uri != source.get("s3_uri") or (
+                "digest" in source and current.digest != source["digest"]
+            ):
+                raise BenchError("Состав локального набора изменился. Отправьте его в S3 и соберите новое превью.")
         # Пока выполнялся --print-config, владелец мог подтвердить удаление в другой вкладке.
         # До регистрации заявки ниже больше нет await.
         datasets_root = self.settings.datasets_root_path()

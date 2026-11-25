@@ -167,10 +167,15 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run, after) -> None:
     default_root = default_s3_root(ctx)
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-3xl"):
         ui.label(item.name).classes("text-lg")
-        ui.label(f"Из локальной папки · задач: {len(item.tasks)} · {item.size / 1024 / 1024:.1f} МБ").classes("text-sm")
+        summary = ui.label().classes("text-sm")
+        with ui.expansion("Состав набора").classes("w-full"):
+            selected = ui.select(item.tasks, label="Задача", with_input=True).classes("w-full").mark("local-task")
+            remove_task = ui.button("Удалить задачу", on_click=lambda: ask_remove_task()).props("flat no-caps color=negative")
+            remove_task.set_visibility(item.owner_id == ctx.access.id)
+            last_task = ui.label("В наборе должна остаться хотя бы одна задача.").classes("text-xs opacity-70")
         ui.label(f"Источник: {item.source}").classes("w-full text-sm break-all")
         ui.label(f"Сохранённая копия: {item.path}").classes("w-full text-xs opacity-60 break-all")
-        saved_root = item.s3_uri.split(f"/local/{item.id}/tasks/")[0] if item.s3_uri else default_s3_root(ctx)
+        saved_root = item.s3_root or default_root
         root = ui.input("S3-префикс датасетов", value=saved_root).classes("w-full")
         ui.label(f"Профиль записи: {ctx.settings.s3_write_profile} · отправка создаёт отдельную папку этого набора в S3").classes("text-xs opacity-70")
         with ui.expansion("Команда загрузки").classes("w-full"):
@@ -201,6 +206,22 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run, after) -> None:
                 "Исходная папка и файлы в S3 сохранятся.",
             ], remove, after, button="Да, удалить набор")
 
+        def ask_remove_task() -> None:
+            name = selected.value
+            if not name:
+                return
+
+            async def remove() -> None:
+                ctx.user_dataset(item.id)
+                await ctx.local_datasets.remove_task(item.id, name, owner_id=ctx.access.id)
+                refresh()
+                after()
+
+            confirm_dialog(f"Удалить задачу «{name}» из набора «{item.name}»?", [
+                "Исходная папка и ранее загруженные файлы в S3 сохранятся.",
+                "Перед следующим запуском отправьте обновлённый набор в S3.",
+            ], remove, button="Да, удалить задачу")
+
         def refresh() -> None:
             try:
                 current = ctx.user_dataset(item.id)
@@ -210,6 +231,11 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run, after) -> None:
                 after()
                 return
             active = item.id in ctx.local_datasets.jobs and not ctx.local_datasets.jobs[item.id].done()
+            summary.set_text(f"Из локальной папки · задач: {len(current.tasks)} · {current.size / 1024 / 1024:.1f} МБ")
+            if selected.options != current.tasks:
+                selected.set_options(current.tasks, value=selected.value if selected.value in current.tasks else None)
+            remove_task.set_enabled(bool(selected.value) and len(current.tasks) > 1 and not active)
+            last_task.set_visibility(len(current.tasks) == 1 and item.owner_id == ctx.access.id)
             try:
                 command.set_content(shlex.join(ctx.local_datasets.upload_argv(current, (root.value or "") if ctx.access.admin else default_root)))
                 valid = True
@@ -241,6 +267,7 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run, after) -> None:
             dialog.close()
             on_run(ctx.user_dataset(item.id))
 
+        selected.on_value_change(lambda _: refresh())
         upload.on_click(send)
         run.on_click(start)
         root.on_value_change(lambda _: refresh())

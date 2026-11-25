@@ -9,7 +9,7 @@ import re
 import shlex
 import shutil
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -38,7 +38,7 @@ class Validation:
         return bool(self.tasks) and not self.errors and not any(issue.blocking for issue in self.image_issues.values())
 
 
-def validate_folder(folder: Path, *, allow_task_links: bool = True) -> Validation:
+def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task: str | None = None) -> Validation:
     """Без запуска кода задач: структура, TOML, образ и входные файлы; один уровень задач."""
     report = Validation()
     digest = hashlib.sha256()
@@ -48,6 +48,8 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True) -> Validatio
             raise ValueError("выберите папку с задачами")
         candidates = [folder] if (folder / "task.toml").is_file() else sorted(p for p in folder.iterdir() if p.is_dir() and not p.name.startswith("."))
         for task in candidates:
+            if task.name == exclude_task:
+                continue
             if (not allow_task_links and task.is_symlink()) or (task / "task.toml").is_symlink():
                 report.errors.append(f"{task.name}: ссылка на папку задачи или task.toml")
                 continue
@@ -135,6 +137,16 @@ class LocalDataset:
     digest: str = ""
     owner_id: str = LOCAL_OWNER
 
+    @property
+    def s3_root(self) -> str:
+        return self.s3_uri.rpartition(f"/local/{self.id}/")[0]
+
+    @classmethod
+    def read(cls, directory: Path, dataset_id: str) -> LocalDataset:
+        if not re.fullmatch(r"local-[a-z0-9-]+", dataset_id):
+            raise ValueError("неверный идентификатор набора")
+        return cls(**json.loads((directory / f"{dataset_id}.json").read_text(encoding="utf-8")))
+
 
 class LocalDatasets:
     def __init__(self, runner: Runner, paths: Paths, settings: Settings, overlay: Path, event, *, active_runs) -> None:
@@ -148,9 +160,7 @@ class LocalDatasets:
         return sorted(records, key=lambda item: item.imported_at, reverse=True)
 
     def get(self, dataset_id: str) -> LocalDataset:
-        if not re.fullmatch(r"local-[a-z0-9-]+", dataset_id):
-            raise ValueError("неверный идентификатор набора")
-        return LocalDataset(**json.loads((self.directory / f"{dataset_id}.json").read_text(encoding="utf-8")))
+        return LocalDataset.read(self.directory, dataset_id)
 
     def save(self, dataset: LocalDataset) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -239,6 +249,61 @@ class LocalDatasets:
         (self.directory / f"{dataset_id}.json").unlink()
         self.jobs.pop(dataset_id, None)
         self.event("dataset_delete", dataset_id, "ok", f"Владелец: {owner_id}")
+
+    async def remove_task(self, dataset_id: str, task_name: str, *, owner_id: str) -> None:
+        dataset = self.get(dataset_id)
+        if dataset.owner_id != owner_id:
+            raise ValueError("Удалить задачу может только владелец набора.")
+        if task_name not in dataset.tasks or Path(task_name).name != task_name or task_name in {"", ".", ".."}:
+            raise ValueError("Задачи нет в этом наборе.")
+        if len(dataset.tasks) == 1:
+            raise ValueError("В наборе должна остаться хотя бы одна задача.")
+        root = self.settings.datasets_root_path()
+        snapshot = Path(dataset.path)
+        if (dataset.id != dataset_id or root is None or snapshot != root.resolve() / "local" / dataset_id / "tasks"
+                or snapshot != snapshot.resolve() or Path(dataset.source).resolve().is_relative_to(snapshot)):
+            raise ValueError("Не удалось подтвердить путь к локальной копии набора.")
+        if reason := self.deletion_blocker(dataset):
+            raise ValueError(reason)
+
+        before = await asyncio.to_thread(validate_folder, snapshot, allow_task_links=False)
+        if not before.ok or before.digest != dataset.digest:
+            raise ValueError("Локальная копия изменилась. Проверьте набор перед удалением.")
+        remaining = await asyncio.to_thread(validate_folder, snapshot, allow_task_links=False, exclude_task=task_name)
+        if not remaining.ok:
+            raise ValueError("\n".join(remaining.errors))
+        if self.get(dataset_id) != dataset:
+            raise ValueError("Набор изменился. Выберите задачу заново.")
+        if reason := self.deletion_blocker(dataset):
+            raise ValueError(reason)
+
+        # Сохраняем результат проверки реестра при импорте для оставшихся задач с этим образом.
+        for warning in dataset.warnings:
+            message, separator, image = warning.rpartition(" · ")
+            if separator and image in remaining.images:
+                prefix = ", ".join(before.images[image]) + ": "
+                if message.startswith(prefix):
+                    remaining.warnings.append(f"{', '.join(remaining.images[image])}: {message[len(prefix):]} · {image}")
+        updated = replace(dataset, tasks=[p.name for p in remaining.tasks], size=remaining.size,
+                          warnings=remaining.warnings, digest=remaining.digest, uploaded_at="", error="")
+        if dataset.s3_uri:
+            if not dataset.s3_root:
+                raise ValueError("Не удалось определить S3-префикс набора.")
+            updated.s3_uri = f"{dataset.s3_root}/local/{dataset_id}/revisions/{remaining.digest}/tasks/"
+        task = snapshot / task_name
+        staged = snapshot.parent / f".remove-{uuid4().hex}"
+        task.rename(staged)
+        try:
+            if dataset.s3_uri:
+                self.mapping(updated)
+            self.save(updated)
+        except Exception:
+            staged.rename(task)
+            if dataset.s3_uri:
+                self.mapping(dataset)
+            raise
+        self.event("dataset_task_delete", dataset_id, "ok", f"{owner_id}: {task_name}")
+        await asyncio.to_thread(shutil.rmtree, staged)
 
     def upload_argv(self, dataset: LocalDataset, s3_root: str) -> list[str]:
         root = s3_root.strip().rstrip("/")

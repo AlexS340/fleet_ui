@@ -635,6 +635,8 @@ def _new_bench_dialog(
                 draft.run_id = run_id
             item = next((d for d in local_items.values() if isinstance(dataset, DatasetRef) and ctx.settings.datasets_root_path() is not None and
                          (ctx.settings.datasets_root_path() / dataset.path).resolve() == Path(d.path).resolve()), None)
+            if item:
+                item = ctx.user_dataset(item.id)
             return BenchSpec(
                 run_id=draft.run_id, worktree=revision.worktree, run_dir=ctx.paths.runs / draft.run_id, overlay=OVERLAY_DIR, recipe=recipe,
                 agent=str(agent_select.value), dataset=dataset, jobs=int(jobs.value or 1), agents_per_replica=int(apr.value or 1),
@@ -645,7 +647,7 @@ def _new_bench_dialog(
                 extra=tuple(overrides), pod=draft.spec.pod if draft.spec else "",
                 session=session, preset=base_preset, sha=revision.info.sha,
                 dataset_source={"id": item.id, "source": item.source, "imported_at": item.imported_at, "s3_uri": item.s3_uri,
-                                "uploaded_at": item.uploaded_at} if item else {},
+                                "uploaded_at": item.uploaded_at, "digest": item.digest} if item else {},
             )
 
         async def rebuild() -> None:
