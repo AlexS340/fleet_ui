@@ -88,7 +88,8 @@ class AppContext:
 
     @cached_property
     def local_datasets(self) -> LocalDatasets:
-        return LocalDatasets(self.runner, self.paths, self.settings, OVERLAY_DIR, self.store.event)
+        return LocalDatasets(self.runner, self.paths, self.settings, OVERLAY_DIR, self.store.event,
+                             active_runs=partial(self.store.benches, active_only=True))
 
     # --- шлюз моделей ----------------------------------------------------
     def open_gateway(self, key: str) -> Gateway:

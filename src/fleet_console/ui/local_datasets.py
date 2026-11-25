@@ -10,9 +10,11 @@ from pathlib import Path
 import yaml
 from nicegui import ui
 
+from fleet_console.auth import AccessDenied
 from fleet_console.compose.local_datasets import LocalDataset, validate_folder
 from fleet_console.context import AppContext
 from fleet_console.fleetref.profile import CONFIGS_REL
+from fleet_console.ui.common import confirm_dialog
 
 
 def folder_picker(on_select, root: Path | None = None) -> None:
@@ -135,7 +137,7 @@ def default_s3_root(ctx: AppContext) -> str:
         return ""
 
 
-def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run) -> None:
+def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run, after) -> None:
     item = ctx.user_dataset(item.id)
     default_root = default_s3_root(ctx)
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-3xl"):
@@ -154,10 +156,34 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run) -> None:
         with ui.row().classes("gap-2 flex-wrap"):
             upload = ui.button("Отправить в S3").props("unelevated no-caps").mark("local-upload")
             run = ui.button("Запустить на этих данных").props("flat no-caps").mark("local-run")
+            delete = ui.button("Удалить набор", on_click=lambda: ask_delete()).props("flat no-caps color=negative")
+            delete.set_visibility(item.owner_id == ctx.access.id)
             ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
 
+        def ask_delete() -> None:
+            if reason := ctx.local_datasets.deletion_blocker(ctx.user_dataset(item.id)):
+                ui.notify(reason, type="warning")
+                return
+
+            async def remove() -> None:
+                ctx.user_dataset(item.id)
+                ctx.local_datasets.delete(item.id, owner_id=ctx.access.id)
+                timer.deactivate()
+                dialog.close()
+
+            confirm_dialog("Удалить набор?", [
+                f"Console удалит запись импорта набора «{item.name}», маппинг и локальную копию задач.",
+                "Исходная папка и файлы в S3 сохранятся.",
+            ], remove, after, button="Да, удалить набор")
+
         def refresh() -> None:
-            current = ctx.user_dataset(item.id)
+            try:
+                current = ctx.user_dataset(item.id)
+            except AccessDenied:  # карточка может быть открыта в другой вкладке во время удаления
+                timer.deactivate()
+                dialog.close()
+                after()
+                return
             active = item.id in ctx.local_datasets.jobs and not ctx.local_datasets.jobs[item.id].done()
             try:
                 command.set_content(shlex.join(ctx.local_datasets.upload_argv(current, (root.value or "") if ctx.access.admin else default_root)))
@@ -167,6 +193,7 @@ def dataset_dialog(ctx: AppContext, item: LocalDataset, on_run) -> None:
                 valid = False
             state.set_text("Отправляется в S3…" if active else current.error or (f"Загружено в S3: {current.s3_uri}" if current.uploaded_at else "Пока только локальная копия. Сначала отправьте задачи в S3."))
             upload.set_enabled(valid and not active)
+            delete.set_enabled(not active)
             run.set_enabled(bool(current.uploaded_at) and not active)
             root.set_enabled(ctx.access.admin and not active and not current.s3_uri)
             log = ctx.paths.logs / "datasets" / f"{item.id}.upload.log"
@@ -205,7 +232,7 @@ def local_panel(ctx: AppContext, on_run) -> None:
         ui.label("Клик по набору — отправить в S3 или перейти к запуску.").classes("text-xs opacity-60")
         table = ui.table(columns=[{"name": k, "field": k, "label": label, "align": "left"} for k, label in
                                   (("name", "Набор"), ("tasks", "Задач"), ("status", "Состояние"))], rows=[], row_key="id").classes("w-full").props("dense flat wrap-cells").mark("local-datasets")
-        table.on("rowClick", lambda e: dataset_dialog(ctx, ctx.user_dataset(e.args[1]["id"]), on_run))
+        table.on("rowClick", lambda e: dataset_dialog(ctx, ctx.user_dataset(e.args[1]["id"]), on_run, refresh))
 
         def refresh() -> None:
             rows = []

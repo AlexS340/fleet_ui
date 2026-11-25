@@ -29,7 +29,8 @@ def task(root: Path, name: str = "one") -> Path:
 
 def service(tmp_path: Path) -> LocalDatasets:
     settings = Settings(datasets_root=str(tmp_path / "data"))
-    return LocalDatasets(FakeRunner(), Paths(tmp_path / "home").ensure(), settings, tmp_path / "overlay", lambda *args: None)
+    return LocalDatasets(FakeRunner(), Paths(tmp_path / "home").ensure(), settings, tmp_path / "overlay",
+                         lambda *args: None, active_runs=lambda: [])
 
 
 def test_validation_and_language_container(tmp_path: Path) -> None:

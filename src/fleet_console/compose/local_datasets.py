@@ -119,8 +119,9 @@ class LocalDataset:
 
 
 class LocalDatasets:
-    def __init__(self, runner: Runner, paths: Paths, settings: Settings, overlay: Path, event) -> None:
+    def __init__(self, runner: Runner, paths: Paths, settings: Settings, overlay: Path, event, *, active_runs) -> None:
         self.runner, self.paths, self.settings, self.overlay, self.event = runner, paths, settings, overlay, event
+        self.active_runs = active_runs
         self.directory = paths.home / "local-datasets"
         self.jobs: dict[str, asyncio.Task] = {}
 
@@ -182,6 +183,42 @@ class LocalDatasets:
             raise
         self.event("dataset_import", dataset.id, "ok", f"{dataset.source} → {dataset.path}; задач {len(dataset.tasks)}")
         return dataset
+
+    def deletion_blocker(self, dataset: LocalDataset) -> str:
+        job = self.jobs.get(dataset.id)
+        if job and not job.done():
+            return "Дождитесь завершения отправки в S3."
+        snapshot = Path(dataset.path)
+        for run in self.active_runs():
+            reference = json.loads(run.dataset) if run.dataset.startswith("{") else {}
+            if run.dataset == dataset.id or reference.get("mapping") == dataset.id:
+                return "Набор используется активным прогоном."
+            paths = [reference.get("path"), *(d.get("path") for d in run.preview.get("datasets", []))]
+            for path in filter(None, paths):
+                # В spec путь относительно корня импорта, в итоговом превью обычно абсолютный.
+                if (snapshot.parents[2] / path).resolve().is_relative_to(snapshot):
+                    return "Набор используется активным прогоном."
+        return ""
+
+    def delete(self, dataset_id: str, *, owner_id: str) -> None:
+        dataset = self.get(dataset_id)
+        if dataset.owner_id != owner_id:
+            raise ValueError("Удалить набор может только его владелец.")
+        snapshot = Path(dataset.path)
+        if (dataset.id != dataset_id or snapshot.parts[-3:] != ("local", dataset_id, "tasks")
+                or snapshot != snapshot.resolve() or Path(dataset.source).resolve().is_relative_to(snapshot)):
+            raise ValueError("Не удалось подтвердить путь к локальной копии набора.")
+        if reason := self.deletion_blocker(dataset):
+            raise ValueError(reason)
+        # Запись удаляется последней: при ошибке очистку можно повторить из карточки.
+        if snapshot.exists():
+            shutil.rmtree(snapshot)
+        if snapshot.parent.is_dir() and not any(snapshot.parent.iterdir()):
+            snapshot.parent.rmdir()
+        (self.overlay / "datasets" / f"{dataset_id}.yaml").unlink(missing_ok=True)
+        (self.directory / f"{dataset_id}.json").unlink()
+        self.jobs.pop(dataset_id, None)
+        self.event("dataset_delete", dataset_id, "ok", f"Владелец: {owner_id}")
 
     def upload_argv(self, dataset: LocalDataset, s3_root: str) -> list[str]:
         root = s3_root.strip().rstrip("/")

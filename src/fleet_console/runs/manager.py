@@ -357,6 +357,18 @@ class BenchManager:
         actual = from_resolved(resolved, revision=preview.revision, context=preview.cluster.split(" · ")[0],
                                run_dir=spec.run_dir, session=spec.session.id if spec.session else "")
         self._validate_resolved(spec, resolved, actual)
+        # Пока выполнялся --print-config, владелец мог подтвердить удаление в другой вкладке.
+        # До регистрации заявки ниже больше нет await.
+        datasets_root = self.settings.datasets_root_path()
+        if datasets_root:
+            paths = [d["path"] for d in actual.datasets]
+            if isinstance(spec.dataset, DatasetRef):
+                paths.append(spec.dataset.path)
+            local_root = datasets_root.resolve() / "local"
+            for path in paths:
+                full = (datasets_root / path).resolve()
+                if full.is_relative_to(local_root) and not full.is_dir():
+                    raise BenchError("Локальная копия набора недоступна. Выберите датасет заново.")
         try:
             _, user_limit = self.store.user_limits(access.id if access else LOCAL_OWNER, self.settings.quotas)
             gpu = check_gpu(0 if spec.session else actual.gpu_total, self.settings, user_limit=user_limit)
