@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from hashlib import sha256
 import shlex
+from hashlib import sha256
 from pathlib import Path
 
 import yaml
 from nicegui import ui
 
 from fleet_console.auth import AccessDenied
-from fleet_console.compose.local_datasets import LocalDataset, validate_folder
+from fleet_console.compose.local_datasets import ImportValidationError, LocalDataset, Validation, validate_import
 from fleet_console.context import AppContext
 from fleet_console.fleetref.profile import CONFIGS_REL
 from fleet_console.ui.common import confirm_dialog
@@ -73,24 +73,47 @@ def import_dialog(ctx: AppContext, after) -> None:
         ui.button("Выбрать папку…", on_click=lambda: folder_picker(selected, root)).props("flat no-caps")
         name = ui.input("Название набора").classes("w-full").mark("local-name")
         result = ui.label().classes("w-full text-sm whitespace-pre-wrap break-words").mark("local-validation")
-        ui.label("Проверяем структуру и TOML без исполнения файлов. Совместимость с выбранным Harbor дополнительно проверяется перед выделением GPU.").classes("text-xs opacity-60")
+        issues = ui.column().classes("w-full gap-2 overflow-y-auto").style("max-height: 30vh")
+        issues.set_visibility(False)
+        ui.label("Проверяем файлы задач и основные образы во внутреннем реестре. Совместимость с Harbor проверяется перед выделением GPU.").classes("text-xs opacity-60")
         with ui.row().classes("gap-2 flex-wrap"):
             check = ui.button("Проверить папку").props("flat no-caps").mark("local-check")
             save = ui.button("Добавить набор").props("unelevated no-caps").mark("local-import")
             save.disable()
             ui.button("Закрыть", on_click=dialog.close).props("flat no-caps")
 
-        async def validate() -> None:
+        def show_report(report: Validation) -> None:
+            lines = [f"Задач: {len(report.tasks)} · {report.size / 1024 / 1024:.1f} МБ",
+                     *report.errors[:15], *report.warnings[:5]]
+            lines.append("Минимальная проверка пройдена." if report.ok else "Исправьте ошибки перед добавлением.")
+            result.set_text("\n".join(lines))
+            issues.clear()
+            issues.set_visibility(bool(report.image_issues))
+            with issues:
+                for image, issue in report.image_issues.items():
+                    with ui.column().classes("w-full gap-0 text-sm"):
+                        ui.label(issue.message).classes("font-medium")
+                        ui.label(", ".join(report.images[image])).classes("w-full break-words")
+                        if issue.url:
+                            ui.link(image, issue.url, new_tab=True).classes("w-full break-all")
+                        else:
+                            ui.label(image).classes("w-full break-all")
+
+        def reset_result() -> None:
             save.disable()
+            result.set_text("")
+            issues.set_visibility(False)
+
+        async def validate() -> None:
+            reset_result()
+            result.set_text("Проверяем папку и образы…")
             check.disable()
             checked_path = folder.value or ""
             try:
-                report = await asyncio.to_thread(validate_folder, _import_path(checked_path, root), allow_task_links=root is None)
+                report = await asyncio.to_thread(validate_import, _import_path(checked_path, root), allow_task_links=root is None)
                 if folder.value != checked_path:
                     return
-                result.set_text(f"Задач: {len(report.tasks)} · {report.size / 1024 / 1024:.1f} МБ\n" +
-                                "\n".join(report.errors[:15] + report.warnings[:5]) +
-                                ("\nМинимальная проверка пройдена." if report.ok else "\nИсправьте ошибки перед добавлением."))
+                show_report(report)
                 if report.ok:
                     save.enable()
                     if not name.value:
@@ -114,12 +137,14 @@ def import_dialog(ctx: AppContext, after) -> None:
                 ui.notify(f"Добавлен набор «{item.name}»: {len(item.tasks)} задач")
                 dialog.close()
                 after()
+            except ImportValidationError as exc:
+                show_report(exc.report)
             except (OSError, ValueError) as exc:
                 result.set_text(str(exc))
 
         check.on_click(validate)
         save.on_click(add)
-        folder.on_value_change(lambda _: save.disable())
+        folder.on_value_change(lambda _: reset_result())
     dialog.open()
 
 

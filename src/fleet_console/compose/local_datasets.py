@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import yaml
 
+from fleet_console.compose.task_images import ImageIssue, check_images
 from fleet_console.observe.s3 import aws_env
 from fleet_console.runner import Runner
 from fleet_console.settings import Paths, Settings, aws_secret_names, scrub, secrets_env
@@ -29,10 +30,12 @@ class Validation:
     warnings: list[str] = field(default_factory=list)
     size: int = 0
     digest: str = ""
+    images: dict[str, list[str]] = field(default_factory=dict)
+    image_issues: dict[str, ImageIssue] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
-        return bool(self.tasks) and not self.errors
+        return bool(self.tasks) and not self.errors and not any(issue.blocking for issue in self.image_issues.values())
 
 
 def validate_folder(folder: Path, *, allow_task_links: bool = True) -> Validation:
@@ -61,8 +64,8 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True) -> Validatio
                 image = environment.get("docker_image")
                 if not isinstance(image, str) or not image.strip():
                     report.errors.append(f"{task.name}: нужен environment.docker_image — основной образ собирается заранее")
-                elif "/" not in image:
-                    report.warnings.append(f"Короткое имя образа {image}; проверьте доступность из кластера")
+                else:
+                    report.images.setdefault(image.strip(), []).append(task.name)
                 for rel in ("instruction.md", "tests/test.sh"):
                     if not (task / rel).is_file() or not (task / rel).stat().st_size:
                         report.errors.append(f"{task.name}: нет непустого {rel}")
@@ -99,6 +102,21 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True) -> Validatio
     report.digest = digest.hexdigest()
     report.warnings = list(dict.fromkeys(report.warnings))
     return report
+
+
+def validate_import(folder: Path, *, allow_task_links: bool = True) -> Validation:
+    report = validate_folder(folder, allow_task_links=allow_task_links)
+    if report.ok:
+        report.image_issues = check_images(report.images)
+    return report
+
+
+class ImportValidationError(ValueError):
+    def __init__(self, report: Validation) -> None:
+        self.report = report
+        details = [f"{', '.join(report.images[image])}: {issue.message} · {issue.url or image}"
+                   for image, issue in report.image_issues.items() if issue.blocking]
+        super().__init__("\n".join(report.errors + details))
 
 
 @dataclass
@@ -156,9 +174,9 @@ class LocalDatasets:
                                         "runtime": {"task_s3_base": dataset.s3_uri or relative.as_posix()}}, sort_keys=False), encoding="utf-8")
 
     def import_folder(self, folder: Path, name: str, *, owner_id: str = LOCAL_OWNER, allow_task_links: bool = True) -> LocalDataset:
-        report = validate_folder(folder, allow_task_links=allow_task_links)
+        report = validate_import(folder, allow_task_links=allow_task_links)
         if not report.ok:
-            raise ValueError("\n".join(report.errors[:20]))
+            raise ImportValidationError(report)
         root = self.settings.datasets_root_path()
         if root is None:
             raise ValueError("сначала задайте корень датасетов в настройках")
@@ -166,14 +184,16 @@ class LocalDatasets:
         slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:24] or "tasks"
         dataset_id = f"local-{slug}-{uuid4().hex[:12]}"
         dest = root.expanduser().resolve() / "local" / dataset_id / "tasks"
+        warnings = report.warnings + [f"{', '.join(report.images[image])}: {issue.message} · {image}"
+                                      for image, issue in report.image_issues.items()]
         dataset = LocalDataset(dataset_id, label, str(folder.expanduser().resolve()), str(dest), datetime.now(UTC).isoformat(),
-                               [p.name for p in report.tasks], report.size, report.warnings, digest=report.digest, owner_id=owner_id)
+                               [p.name for p in report.tasks], report.size, warnings, digest=report.digest, owner_id=owner_id)
         try:
             dest.mkdir(parents=True, exist_ok=False)
             for task in report.tasks:
                 shutil.copytree(task, dest / task.name, symlinks=True)
             copied = validate_folder(dest)
-            if not copied.ok or copied.digest != report.digest:
+            if not copied.ok or copied.digest != report.digest or copied.images != report.images:
                 raise ValueError("\n".join(copied.errors[:20]) or "исходные файлы изменились во время копирования; повторите импорт")
             self.mapping(dataset)
             self.save(dataset)
