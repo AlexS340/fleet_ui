@@ -11,7 +11,7 @@ from fleet_console.ui.header import build_header
 def _account_options(ctx: AppContext) -> dict[str, str]:
     return {
         user.id: (f"{user.display_name} · {user.id}" if user.display_name else user.id)
-        + (" · отключён" if not user.enabled else "")
+        + (" · ожидает одобрения" if user.pending_approval else " · отключён" if not user.enabled else "")
         for user in ctx.store.users()
     }
 

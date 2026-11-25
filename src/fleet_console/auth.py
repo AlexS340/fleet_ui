@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import pbkdf2_hmac
+from html import escape
 from hmac import compare_digest
 from secrets import token_bytes, token_urlsafe
 from urllib.parse import parse_qs, urlencode
@@ -98,6 +99,40 @@ async def hash_new_password(password: str) -> str:
     return await asyncio.to_thread(_password_hash, password)
 
 
+def _login_destination(request: Request) -> str:
+    path = request.query_params.get("next", "")
+    return path if SHARE_PATH.fullmatch(path) else "/"
+
+
+def _account_form(next_path: str, *, register: bool = False, message: str = "", status: int = 200, user: str = "") -> HTMLResponse:
+    query = urlencode({"next": next_path})
+    if register:
+        page, action, link = "Регистрация", "Зарегистрироваться", "Вернуться ко входу"
+        route, other = "/test-register", "/test-login"
+        hint = "<p>После регистрации администратор должен одобрить вашу учётную запись.</p>"
+        password_attrs = 'autocomplete="new-password" minlength="12" maxlength="256"'
+        password_hint = "<small>От 12 до 256 символов</small>"
+    else:
+        page, action, link = "Вход в Fleet Console", "Войти", "Зарегистрироваться"
+        route, other = "/test-login", "/test-register"
+        hint = password_hint = ""
+        password_attrs = 'autocomplete="current-password"'
+    notice = f'<p role="status">{escape(message)}</p>' if message else ""
+    return HTMLResponse(
+        '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>{page}</title><style>:root{{color-scheme:light dark;font:1rem/1.5 system-ui,sans-serif}}'
+        'main{max-width:24rem;margin:8vh auto;padding:0 1rem} h1{font-size:1.6rem} '
+        'input,button{font:inherit;padding:.4rem .6rem} input{display:block;width:100%;box-sizing:border-box} '
+        'small{display:block} button{cursor:pointer}</style>'
+        f'<main><h1>{page}</h1>{hint}{notice}'
+        f'<form method="post" action="{route}?{query}"><p><label>Логин '
+        f'<input name="user" autocomplete="username" value="{escape(user, quote=True)}" required></label></p>'
+        f'<p><label>Пароль <input name="password" type="password" {password_attrs} required></label>'
+        f'{password_hint}</p><button>{action}</button></form><p><a href="{other}?{query}">{link}</a></p></main></html>',
+        status_code=status, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
 class TestIdentityAdapter:
     """Вход для стенда: исходные пароли задаёт оператор, сброс сохраняется в SQLite."""
 
@@ -132,8 +167,7 @@ class TestIdentityAdapter:
         return Identity(user.id) if user and user.enabled and user.session_version == session[1] else None
 
     async def login(self, request: Request):
-        next_path = request.query_params.get("next", "")
-        next_path = next_path if SHARE_PATH.fullmatch(next_path) else "/"
+        next_path = _login_destination(request)
         if request.method == "POST":
             form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
             user = form.get("user", [""])[0]
@@ -150,15 +184,27 @@ class TestIdentityAdapter:
                     response = RedirectResponse(next_path, status_code=303, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
                     response.set_cookie(self.cookie, token, httponly=True, samesite="lax", secure=request.url.scheme == "https")
                     return response
-        invalid = "<p>Проверьте логин и пароль.</p>" if request.method == "POST" else ""
-        return HTMLResponse(
-            '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-            '<title>Вход в Fleet Console</title><main><h1>Fleet Console</h1>'
-            f'{invalid}<form method="post" action="/test-login?{urlencode({"next": next_path})}">'
-            '<p><label>Логин <input name="user" autocomplete="username" required></label></p>'
-            '<p><label>Пароль <input name="password" type="password" autocomplete="current-password" required></label></p>'
-            '<button>Войти</button></form></main></html>',
-            status_code=401 if invalid else 200,
+            return _account_form(next_path, message="Проверьте логин и пароль.", status=401, user=user)
+        message = "Заявка отправлена. Вы сможете войти после одобрения администратором." if "registered" in request.query_params else ""
+        return _account_form(next_path, message=message)
+
+    async def register(self, request: Request) -> Response:
+        next_path = _login_destination(request)
+        if request.method == "GET":
+            return _account_form(next_path, register=True)
+        form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
+        user = form.get("user", [""])[0]
+        if not re.fullmatch(r"[\w.@-]{1,100}", user) or user == LOCAL_OWNER:
+            return _account_form(next_path, register=True, status=400, user=user,
+                                 message="Выберите другой логин. До 100 символов: буквы, цифры или . _ @ -")
+        try:
+            digest = await hash_new_password(form.get("password", [""])[0])
+        except ValueError as exc:
+            return _account_form(next_path, register=True, status=400, user=user, message=str(exc))
+        if not self.store.request_registration(user, digest):
+            return _account_form(next_path, register=True, status=409, user=user, message="Этот логин уже занят.")
+        return RedirectResponse(
+            "/test-login?" + urlencode({"next": next_path, "registered": "1"}), status_code=303,
             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
         )
 
@@ -179,7 +225,7 @@ class IdentityMiddleware:
     async def __call__(self, scope, receive, send) -> None:
         test_adapter = self.adapter if isinstance(self.adapter, TestIdentityAdapter) else None
         if scope["type"] not in {"http", "websocket"} or (
-            test_adapter is not None and scope["path"] in {"/test-login", "/test-logout"}
+            test_adapter is not None and scope["path"] in {"/test-login", "/test-register", "/test-logout"}
         ):
             await self.app(scope, receive, send)
             return

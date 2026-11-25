@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 
 import fakes
@@ -22,6 +23,57 @@ def pick(user: User, label: str, value) -> None:
     field = next(item for item in user.find(kind=ui.select).elements if item.props.get("label") == label)
     with user.client:
         field.set_value(value)
+
+
+async def test_registration_requires_admin_approval(user: User) -> None:
+    store = fakes.CTX.store
+    client = user.http_client
+    password = "chosen-test-password"
+    data = {"user": "new-user", "password": password, "role": "admin", "enabled": "1"}
+    assert "Зарегистрироваться" in (await client.get("/test-login")).text
+    responses = await asyncio.gather(*(client.post("/test-register", data=data) for _ in range(2)))
+    assert sorted(r.status_code for r in responses) == [303, 409]
+    success = next(r for r in responses if r.status_code == 303)
+    assert "после одобрения" in (await client.get(success.headers["location"])).text
+    assert LoginAdapter.cookie not in client.cookies
+    account = store.user("new-user")
+    assert account.role == "user" and account.pending_approval and not account.enabled
+    assert password not in store.password_hash(account.id)
+    assert (await login(user, account.id, password)).status_code == 401
+    assert (await client.get("/measurements")).status_code == 303
+
+    await login(user, "operator")
+    await user.open("/admin")
+    field = next(item for item in user.find(kind=ui.select).elements if item.props.get("label") == "Пользователь")
+    assert "ожидает одобрения" in field.options[account.id]
+    pick(user, "Пользователь", account.id)
+    await user.should_see("Сохранить пользователя")
+    user.find("Разрешить вход", kind=ui.switch).click()
+    user.find("Сохранить пользователя").click()
+    await user.should_see("Настройки пользователя сохранены")
+    assert not store.user(account.id).pending_approval
+    assert store.admin_events()[0].actor_id == "operator"
+    client.cookies.clear()
+    assert (await login(user, account.id, password)).status_code == 303
+    assert (await client.get("/measurements")).status_code == 200
+    assert (await client.get("/admin")).status_code == 403
+
+
+async def test_registration_rejects_invalid_or_reserved_credentials(user: User) -> None:
+    store = fakes.CTX.store
+    store.register_user("existing-without-password")
+    digest = store.password_hash("operator")
+    client = user.http_client
+    for name, password, status in [
+        ("", "valid-test-password", 400), ("@local", "valid-test-password", 400),
+        ("unused", "short", 400), ("operator", "valid-test-password", 409),
+        ("existing-without-password", "valid-test-password", 409),
+    ]:
+        response = await client.post("/test-register", data={"user": name, "password": password})
+        assert response.status_code == status and password not in response.text
+    assert store.user("unused") is None and store.user("@local") is None
+    assert store.password_hash("existing-without-password") is None
+    assert store.password_hash("operator") == digest
 
 
 async def test_admin_transfers_run_and_assigns_multiple_coauthors(user: User) -> None:

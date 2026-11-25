@@ -32,6 +32,7 @@ def create_app(ctx: AppContext, identity_adapter: IdentityAdapter | None = None)
             )
             adapter.bind(ctx.store)
             app.add_api_route("/test-login", adapter.login, methods=["GET", "POST"], include_in_schema=False)
+            app.add_api_route("/test-register", adapter.register, methods=["GET", "POST"], include_in_schema=False)
             app.add_api_route("/test-logout", adapter.logout, methods=["POST"], include_in_schema=False)
             identity_adapter = adapter
         elif isinstance(identity_adapter, TestIdentityAdapter):

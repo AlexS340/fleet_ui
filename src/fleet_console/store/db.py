@@ -179,6 +179,7 @@ class UserAccount:
     gpu_limit: int | None
     session_version: int
     has_password: bool
+    pending_approval: bool
 
 
 @dataclass(frozen=True)
@@ -344,6 +345,7 @@ class Store:
                 "display_name": "TEXT NOT NULL DEFAULT ''", "enabled": "INTEGER NOT NULL DEFAULT 1",
                 "run_limit": "INTEGER", "gpu_limit": "INTEGER", "password_hash": "TEXT",
                 "session_version": "INTEGER NOT NULL DEFAULT 0", "role_managed": "INTEGER NOT NULL DEFAULT 0",
+                "pending_approval": "INTEGER NOT NULL DEFAULT 0",
             })
             self._add_columns("bench_runs", {"retry_selection": "TEXT NOT NULL DEFAULT ''", "failed_attempts": "INTEGER"})
             self._add_columns("events", {"actor_id": "TEXT NOT NULL DEFAULT ''"})
@@ -375,7 +377,7 @@ class Store:
     def _users(self, clause: str, args: tuple) -> list[UserAccount]:
         return [UserAccount(**dict(row)) for row in self.conn.execute(
             "SELECT id, role, display_name, enabled, run_limit, gpu_limit, session_version,"
-            " password_hash IS NOT NULL AS has_password FROM users " + clause, args,
+            " password_hash IS NOT NULL AS has_password, pending_approval FROM users " + clause, args,
         )]
 
     def user_limits(self, user_id: str, quotas) -> tuple[int, int]:
@@ -399,8 +401,9 @@ class Store:
                 raise ValueError("Пользователь не найден")
             self.conn.execute(
                 "UPDATE users SET role=?, enabled=?, display_name=?, run_limit=?, gpu_limit=?, role_managed=1,"
+                " pending_approval=CASE WHEN ? THEN 0 ELSE pending_approval END,"
                 " session_version=session_version+? WHERE id=?",
-                (role, enabled, display_name, run_limit, gpu_limit, int(old.enabled != enabled or old.role != role), user_id),
+                (role, enabled, display_name, run_limit, gpu_limit, enabled, int(old.enabled != enabled or old.role != role), user_id),
             )
             self._record_event("admin_user", user_id, "ok", json.dumps({
                 "role": role, "enabled": enabled, "display_name": display_name, "run_limit": run_limit, "gpu_limit": gpu_limit,
@@ -414,6 +417,13 @@ class Store:
         with self.conn:
             self.conn.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
             self.conn.execute("UPDATE users SET password_hash=? WHERE id=? AND password_hash IS NULL", (password_hash, user_id))
+
+    def request_registration(self, user_id: str, password_hash: str) -> bool:
+        with self.conn:
+            return self.conn.execute(
+                "INSERT INTO users (id, password_hash, role, enabled, pending_approval) VALUES (?, ?, 'user', 0, 1)"
+                " ON CONFLICT(id) DO NOTHING", (user_id, password_hash),
+            ).rowcount == 1
 
     def reset_password(self, actor: str, user_id: str, password_hash: str) -> None:
         with self.conn:
