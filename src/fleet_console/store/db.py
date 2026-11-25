@@ -349,6 +349,7 @@ class Store:
             })
             self._add_columns("bench_runs", {"retry_selection": "TEXT NOT NULL DEFAULT ''", "failed_attempts": "INTEGER"})
             self._add_columns("events", {"actor_id": "TEXT NOT NULL DEFAULT ''"})
+            self._add_columns("measurement_links", {"label": "TEXT NOT NULL DEFAULT ''"})
 
     def _add_columns(self, table: str, definitions: dict[str, str]) -> None:
         present = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -594,7 +595,7 @@ class Store:
 
     def measurements(self, owner_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT m.* FROM measurements m JOIN bench_runs b ON b.id=m.run_id"
+            "SELECT m.*, b.owner_id FROM measurements m JOIN bench_runs b ON b.id=m.run_id"
             " WHERE b.owner_id=? OR EXISTS (SELECT 1 FROM run_coauthors c WHERE c.run_id=b.id AND c.user_id=?)"
             " ORDER BY m.measured_at DESC", (owner_id, owner_id),
         ).fetchall()
@@ -602,13 +603,16 @@ class Store:
     def measurement(self, run_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM measurements WHERE run_id=?", (run_id,)).fetchone()
 
-    def add_measurement_link(self, digest: str, run_id: str, expires_at: str) -> None:
+    def add_measurement_link(self, digest: str, run_id: str, expires_at: str, label: str = "") -> None:
         with self.conn:
-            self.conn.execute("INSERT INTO measurement_links (digest, run_id, expires_at) VALUES (?, ?, ?)", (digest, run_id, expires_at))
+            self.conn.execute(
+                "INSERT INTO measurement_links (digest, run_id, expires_at, label) VALUES (?, ?, ?, ?)",
+                (digest, run_id, expires_at, label),
+            )
 
     def measurement_links(self, run_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT digest, expires_at, revoked_at FROM measurement_links WHERE run_id=? ORDER BY expires_at DESC", (run_id,),
+            "SELECT digest, label, expires_at, revoked_at FROM measurement_links WHERE run_id=? ORDER BY rowid DESC", (run_id,),
         ).fetchall()
 
     def revoke_measurement_link(self, run_id: str, digest: str) -> None:

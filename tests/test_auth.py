@@ -77,14 +77,23 @@ async def test_two_accounts_and_shared_summary(user: User) -> None:
     assert (await client.get("/settings")).status_code == 403
 
     alice = Access(ctx.store, Identity("alice"))
-    token = issue_link(alice, "alice-cowork", 1, now)
+    await user.open("/measurements")
+    user.find("alice-cowork", kind=ui.expansion).click()
+    user.find("Поделиться", kind=ui.button).click()
+    await user.should_see("Ссылок пока нет")
+    user.find("Пометка для себя", kind=ui.input).type("Для команды")
+    user.find("Создать ссылку").click()
+    await user.should_see("Для команды")
+    url = next(iter(user.find("Ссылка для отправки", kind=ui.input).elements)).value
+    token = url.rsplit("/", 1)[-1]
     expired = issue_link(alice, "alice-cowork", 1, now - timedelta(hours=2))
     shared = f"/measurements/shared/{token}"
     client.cookies.clear()
     response = await client.get(shared)
     assert response.status_code == 303 and "next=" in response.headers["location"]
 
-    assert (await login(client, "bob")).status_code == 303
+    signed_in = await client.post(response.headers["location"], data={"user": "bob", "password": "bob-test"})
+    assert signed_in.status_code == 303 and signed_in.headers["location"] == shared
     await user.open("/measurements")
     await user.should_see("bob-cowork")
     await user.should_not_see("alice-cowork")
@@ -95,7 +104,8 @@ async def test_two_accounts_and_shared_summary(user: User) -> None:
     await user.open(shared)
     await user.should_see("Сводка замера")
     await user.should_not_see("Открыть прогон")
-    await user.should_not_see("Поделиться сводкой")
+    await user.should_not_see("Поделиться")
+    await user.should_not_see("Для команды")
     rows = next(iter(user.find(kind=ui.table).elements)).rows
     assert rows[0]["score"] == "75.00%" and rows[0]["succeeded"] == "3/4" and rows[0]["infra_errors"] == 1
     assert (await client.get(shared)).headers["cache-control"] == "no-store"
@@ -105,8 +115,48 @@ async def test_two_accounts_and_shared_summary(user: User) -> None:
     bob = Access(ctx.store, Identity("bob"))
     with pytest.raises(AccessDenied):
         revoke_link(bob, "alice-cowork", digest)
-    revoke_link(alice, "alice-cowork", digest)
+    await login(client, "alice")
+    await user.open("/measurements")
+    user.find("alice-cowork", kind=ui.expansion).click()
+    user.find("Поделиться", kind=ui.button).click()
+    await user.should_see("Для команды")
+    await user.should_see("Истекла")
+    user.find("Отозвать").click()
+    await user.should_see("Отозвана")
+    await login(client, "bob")
     assert (await client.get(shared)).status_code == 404
+
+
+async def test_coauthor_cannot_manage_measurement_links(user: User) -> None:
+    store = fakes.CTX.store
+    run_id = "alice-cowork"
+    owner = Access(store, Identity("alice"))
+    now = datetime.now(UTC)
+    issue_link(owner, run_id, 1, now)
+    digest = store.measurement_links(run_id)[0]["digest"]
+    store.register_user("cara")
+    store.set_run_ownership("operator", run_id, "alice", ["cara"])
+    access = Access(store, Identity("cara"))
+    assert access.run(run_id)
+    with pytest.raises(AccessDenied):
+        issue_link(access, run_id, 1, now)
+    with pytest.raises(AccessDenied):
+        revoke_link(access, run_id, digest)
+
+    # Открытая у прежнего владельца форма также теряет право выдачи и отзыва.
+    await login(user.http_client, "alice")
+    await user.open("/measurements")
+    user.find(run_id, kind=ui.expansion).click()
+    user.find("Поделиться", kind=ui.button).click()
+    await user.should_see("Выданные ссылки")
+    store.set_run_ownership("operator", run_id, "cara", ["alice"])
+    user.find("Создать ссылку").click()
+    await user.should_see("Объект недоступен")
+    assert len(store.measurement_links(run_id)) == 1
+    await user.open("/measurements")
+    user.find(run_id, kind=ui.expansion).click()
+    await user.should_see("Открыть прогон")
+    await user.should_not_see("Поделиться")
 
 
 async def test_user_can_prepare_revision_for_own_launches(user: User) -> None:
