@@ -143,6 +143,21 @@ def _status_color(run: BenchRun) -> str:
     return "text-negative" if run.status in {"attention", "failed"} or (not run.active and run.failed_attempts) else ""
 
 
+def _error_text(message: str, secrets: Iterable[str]) -> str:
+    # Старые записи могли сохранить команду вместе с телом ответа MLSC.
+    command = re.search(r"kubectl exec -i [^\n]*?/api/v1/service/get_(?:configuration|last_failed_log)[^\n]*? → код (-?\d+)", message)
+    if command:
+        message = message[:command.start()] + f"ошибка запроса MLSC (код {command[1]})"
+    elif "MLSC вернул не JSON:" in message:
+        message = message.partition("MLSC вернул не JSON:")[0] + "MLSC вернул некорректный JSON"
+    return scrub(message, secrets)
+
+
+def _error_summary(message: str) -> str:
+    line = " ".join(message.split())
+    return line if len(line) <= 200 else line[:199] + "…"
+
+
 def _run_mlsc(ctx: AppContext, run: BenchRun, secrets: Iterable[str]) -> tuple[str, str]:
     if run.version_id is None:
         return "", ""
@@ -233,7 +248,7 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
             hint("Бенч — прогон задач датасета агентом на модели: от материализации до замера в Console.")
             ui.space()
             ui.button("Запустить бенч", on_click=lambda: _new_bench_dialog(ctx, render)).props("unelevated no-caps")
-        banner = ui.label().classes("w-full text-negative text-sm whitespace-pre-wrap bench-run-banner")
+        banner = ui.label().classes("w-full text-negative text-sm whitespace-pre-wrap break-words bench-run-banner")
         with ui.expansion("Фильтры", icon="filter_list").classes("w-full").props("dense") as filters:
             with ui.row().classes("w-full items-end gap-3"):
                 hidden = ui.select(
@@ -270,12 +285,12 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
         remaining = {r.id: _remaining_resources(ctx, r) for r in runs}
         runs.sort(key=lambda run: not remaining[run.id])
         secrets = list(ctx.benches.secrets().values())
+        summaries = {r.id: _error_summary(_error_text(r.error, secrets)) for r in runs}
         rows = []
         for r in runs[:50]:
             c = r.counters
             tasks = f"{c.get('running', 0)} / {c.get('queue') if c.get('queue') is not None else '—'} / {c.get('completed') if c.get('completed') is not None else '—'}"
             replicas, mlsc_error = _run_mlsc(ctx, r, secrets)
-            errors = [" ".join(err.split()) for err in (mlsc_error, scrub(r.error, secrets)) if err]
             rows.append(
                 {
                     "id": r.id,
@@ -285,7 +300,7 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
                     "status_color": _status_color(r),
                     "replicas": replicas,
                     "failed_workflows": f"Сбои workflows: {c['failed']}" if c.get("failed") else "",
-                    "errors": [err if len(err) <= 200 else err[:199] + "…" for err in errors],
+                    "errors": [err for err in (_error_summary(mlsc_error), summaries[r.id]) if err],
                     "tasks": tasks if r.status != "running" or r.stage == "execute" or c else "—",
                     "limit": r.agent_limit if r.agent_limit is not None else "—",
                     "started": _when(r.started_at),
@@ -300,11 +315,11 @@ async def benches_page(ctx: AppContext, run_id: str | None = None) -> None:
         table_hint.set_visibility(bool(rows))
         attention = [r for r in runs if r.status == "attention"]
         lines = [
-            f"⚠ {r.id}: {'проверьте ресурсы модели' if r.holds_gpu else 'задачи могут идти'} — {r.error}"
+            f"⚠ {r.id}: {'проверьте ресурсы модели' if r.holds_gpu else 'задачи могут идти'} — {summaries[r.id]}"
             + (f" · автогашение через {ctx.settings.bench.attention_minutes} мин без ответа" if r.holds_gpu and ctx.settings.bench.attention_minutes else "")
             for r in attention
         ]
-        lines.extend(f"⚠ {r.id}: {r.error}" for r in runs if r.status == "stopping" and r.error)
+        lines.extend(f"⚠ {r.id}: {summaries[r.id]}" for r in runs if r.status == "stopping" and r.error)
         banner.set_text(scrub("\n".join(lines), secrets))
         banner.set_visibility(bool(lines))
 
@@ -1284,7 +1299,7 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         readiness, deploy_error = _run_mlsc(ctx, run, secrets)
         replicas.set_text(readiness)
         mlsc_error.set_text(deploy_error)
-        run_error.set_text(scrub(run.error, secrets))
+        run_error.set_text(_error_text(run.error, secrets))
         remaining = _remaining_resources(ctx, run)
         warning = "После завершения прогона остались ресурсы. " + ", ".join(remaining) if remaining else ""
         if run.status == "attention":
@@ -1351,7 +1366,9 @@ def _run_dialog(ctx: AppContext, run_id: str, after) -> None:
         events = [e for e in ctx.store.events(300) if e.object == run_id][:15]
         journal.set_visibility(bool(events))
         journal.set_text(f"Журнал ({len(events)})")
-        event_text.set_text(scrub("\n".join(f"{_when(e.ts)} {e.action} {e.result} {e.details}" for e in events), secrets))
+        event_text.set_text("\n".join(
+            _error_text(f"{_when(e.ts)} {e.action} {e.result} {e.details}", secrets) for e in events
+        ))
 
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-4xl bench-run-card"):
         ui.label(run.id).classes("text-lg break-all")

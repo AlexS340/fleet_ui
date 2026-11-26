@@ -68,3 +68,24 @@ async def test_filters_use_visible_history_before_row_limit(user: User) -> None:
     await user.should_see("Фильтры · найдено 2", retries=45)
     assert set(owner.options) == {"alice"}
     assert {r["id"] for r in table.rows} == {"alice-cowork", "later"}
+
+
+@pytest.mark.nicegui_main_file("tests/ui_main.py")
+async def test_banner_summarizes_run_errors_and_hides_legacy_mlsc_payload(user: User) -> None:
+    store = fakes.CTX.store
+    legacy = ("Не удалось сверить остановку: kubectl exec -i -n ns pod -- sh -c "
+              "'curl https://mlsc/api/v1/service/get_configuration' → код -2\n"
+              '{"applications":[{"name":"PRIVATE"}]}')
+    for run_id, status, error in (
+        ("stop-test", "stopping", legacy),
+        ("attention-test", "attention", "Ошибка стадии\n" + "x" * 400),
+    ):
+        store.create_bench(BenchRun(run_id, status, fakes.NOW.isoformat(), error=error))
+    await user.open("/runs")
+    banner = user.find("⚠ stop-test").elements.pop().text
+    assert "Не удалось сверить остановку: ошибка запроса MLSC (код -2)" in banner
+    assert "Ошибка стадии x" in banner and "…" in banner
+    assert "PRIVATE" not in banner and "kubectl" not in banner and "x" * 200 not in banner
+    errors = {row["id"]: row["errors"] for row in user.find(marker="bench-runs").elements.pop().rows}
+    assert errors["stop-test"] == ["Не удалось сверить остановку: ошибка запроса MLSC (код -2)"]
+    assert len(errors["attention-test"][0]) == 200

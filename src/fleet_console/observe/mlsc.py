@@ -10,7 +10,7 @@ import json
 import re
 import shlex
 
-from fleet_console.runner import CommandError, Runner
+from fleet_console.runner import CommandError, Result, Runner
 
 GPU_RE = re.compile(r"(\d+)gpu")
 SERVED_MODEL_NAME = re.compile(r"--served-model-name\s+(\S+)")
@@ -139,12 +139,20 @@ async def get_configuration(runner: Runner, namespace: str, pod: str, base_url: 
     result = await runner.run(
         ["kubectl", "exec", "-i", "-n", namespace, pod, "--", "sh", "-c", script], stdin=token.strip(), timeout=60
     )
+    data = _response_json(result, "чтение конфигурации MLSC")
+    if not isinstance(data, dict):
+        raise RuntimeError("Ответ MLSC не содержит объекта конфигурации")
+    return data
+
+
+def _response_json(result: Result, operation: str) -> object:
+    # В обоих потоках может оказаться конфигурация кластера или приватный лог воркера.
     if not result.ok:
-        raise CommandError(result)
+        raise RuntimeError(f"{operation} завершилось с ошибкой (код {result.returncode})")
     try:
         return json.loads(result.stdout)
-    except ValueError as exc:
-        raise RuntimeError(f"MLSC вернул не JSON: {result.stdout[:200]!r}") from exc
+    except ValueError:
+        raise RuntimeError(f"{operation} завершилось с ошибкой (некорректный JSON)") from None
 
 
 async def get_last_failed_log(runner: Runner, namespace: str, pod: str, base_url: str, token: str, version_id: int) -> str:
@@ -152,10 +160,5 @@ async def get_last_failed_log(runner: Runner, namespace: str, pod: str, base_url
     url = base_url.rstrip("/") + f"/api/v1/service/get_last_failed_log?application_version_id={int(version_id)}"
     script = f'curl -sSf -k -H "Authorization: Bearer $(cat)" {shlex.quote(url)}'
     result = await runner.run(["kubectl", "exec", "-i", "-n", namespace, pod, "--", "sh", "-c", script], stdin=token.strip(), timeout=60)
-    if not result.ok:
-        raise CommandError(result)
-    try:
-        data = json.loads(result.stdout)
-    except ValueError as exc:
-        raise RuntimeError(f"MLSC вернул не JSON: {result.stdout[:200]!r}") from exc
+    data = _response_json(result, "чтение лога MLSC")
     return str((data or {}).get("log") or "") if isinstance(data, dict) else ""

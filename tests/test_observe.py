@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cluster_samples as samples
+import pytest
 
 from fleet_console.observe import ClusterObserver, argo, mlsc, nginx, nodes, submitter
 from fleet_console.runner import FakeRunner, Result
@@ -42,6 +43,23 @@ async def test_mlsc_token_goes_through_stdin_and_pod_is_found_by_deployment() ->
     assert "application_versions" in conf
     assert meta["stdin"] == "SECRET" and not any("SECRET" in a for a in argv)
     assert "$(cat)" in argv[-1] and "https://mlsc/mlc/api/v1/service/get_configuration" in argv[-1]
+
+
+@pytest.mark.parametrize("returncode,stderr,reason", [
+    (-2, "", "код -2"), (1, "PRIVATE-STDERR", "код 1"), (0, "", "некорректный JSON"),
+])
+async def test_mlsc_read_errors_exclude_command_and_response(returncode, stderr, reason) -> None:
+    runner = FakeRunner()
+    payload = '{"applications":[{"name":"PRIVATE-' + "x" * 16000
+    runner.on("kubectl", "exec", result=Result(("kubectl", "exec"), returncode, payload, stderr))
+    args = (runner, "namespace", "pod", "https://mlsc", "token")
+    for request, operation in (
+        (mlsc.get_configuration(*args), "чтение конфигурации MLSC"),
+        (mlsc.get_last_failed_log(*args, 42), "чтение лога MLSC"),
+    ):
+        with pytest.raises(RuntimeError) as failure:
+            await request
+        assert str(failure.value) == f"{operation} завершилось с ошибкой ({reason})"
 
 
 def test_nginx_upstreams() -> None:
@@ -91,7 +109,7 @@ async def test_observer_without_token_and_pod_rediscovery() -> None:
     assert obs.mlsc.error == "" and obs._mlsc_pod == "litellm-noauth-abc"
     fake.handlers.insert(0, (("kubectl", "exec", "-i"), Result(("x",), 1, "", "pod not found")))
     await obs.refresh()
-    assert "pod not found" in obs.mlsc.error and obs._mlsc_pod is None  # под ищется заново
+    assert "код 1" in obs.mlsc.error and obs._mlsc_pod is None  # под ищется заново
     assert obs.model_version(41) is None
 
 
