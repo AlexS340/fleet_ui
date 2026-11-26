@@ -84,6 +84,10 @@ def console_run_id(application: str) -> str:
     return name.removeprefix("fleet-console ") if name.startswith("fleet-console ") else ""
 
 
+class NoCreatedVersion(RuntimeError):
+    """Свежий список MLSC не содержит версии с точным именем прогона."""
+
+
 def created_version(configuration: dict, run_id: str, known_id: int | None = None) -> int:
     """Только полное совпадение имени заявки, включая версии с нулевым планом."""
     versions = configuration.get("application_versions")
@@ -91,6 +95,8 @@ def created_version(configuration: dict, run_id: str, known_id: int | None = Non
         raise RuntimeError("MLSC не вернул список версий; исход create_job неизвестен")
     matches = [int(key) for key, version in versions.items()
                if console_run_id(str(version.get("application_name") or "")) == run_id]
+    if not matches:
+        raise NoCreatedVersion("Исход create_job неоднозначен: MLSC не нашла версию прогона; повтор отключён")
     if len(matches) != 1 or (known_id is not None and matches[0] != known_id):
         raise RuntimeError("Исход create_job неоднозначен: нужна одна подтверждённая версия MLSC; повтор отключён")
     return matches[0]

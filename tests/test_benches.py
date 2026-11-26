@@ -399,6 +399,78 @@ async def test_resume_after_restart(h: Harness) -> None:
     assert any("пропущено: сабмиттер прогона уже жив" in s.command for s in h.store.bench_stages(relaunch.id))
 
 
+CREATE_APP_FAILURE = """Traceback (most recent call last):
+  File "/wt/fleet/mlsc.py", line 254, in create_job
+    app_name = create_application(
+  File "/wt/fleet/mlsc.py", line 238, in create_application
+    raise RuntimeError(f"Ошибка создания приложения. Выхлоп: '{stdout}'") from None
+RuntimeError: Ошибка создания приложения. Выхлоп: '<html>
+<head><title>504 Gateway Time-out</title></head>
+</html>'
+"""
+
+
+@pytest.mark.parametrize("manual", [True, False], ids=["button", "already-stopping"])
+async def test_stop_after_create_application_failed(h: Harness, manual: bool) -> None:
+    h.fail = {"create_job"}
+    h.submitter = "missing"
+    run = await h.start()
+    Path(h.mgr.stages(run.id)[-1].log_path).write_text(CREATE_APP_FAILURE)
+    assert h.store.request(run.id)["state"] == "reserved"
+    if manual:
+        await h.mgr.stop(run.id)
+    else:
+        h.store.update_bench(run.id, status="stopping")
+        h.argo_active = 1
+        await h.mgr.resume()
+        assert h.mgr.get(run.id).status == "stopping" and h.store.request(run.id)["state"] == "reserved"
+        assert "активные workflows" in h.mgr.get(run.id).error
+        h.argo_active = 0
+        await h.mgr.tick()
+    assert h.mgr.get(run.id).status == "stopped" and h.mgr.get(run.id).finished_at
+    assert h.store.request(run.id)["state"] == "released"
+    assert not h.stopped and "stop_llm" not in h.stages and h.stages.count("create_job") == 1
+
+
+async def test_manual_stop_after_create_application_checks_remaining_tasks(h: Harness) -> None:
+    h.fail = {"create_job"}
+    run = await h.start()
+    Path(h.mgr.stages(run.id)[-1].log_path).write_text(CREATE_APP_FAILURE)
+    assert (await h.mgr.stop(run.id)).status == "stopping"
+    assert h.stopped == [run.id] and h.store.request(run.id)["state"] == "reserved"
+    h.submitter = "missing"
+    await h.mgr.tick()
+    assert h.mgr.get(run.id).status == "stopped" and h.store.request(run.id)["state"] == "released"
+
+
+@pytest.mark.parametrize("case", ["version-timeout", "no-log", "multiple-attempts", "saved-id", "two-versions", "no-mlsc"])
+async def test_stop_keeps_reservation_for_uncertain_create(h: Harness, case: str) -> None:
+    h.fail = {"create_job"}
+    h.submitter = "missing"
+    run = await h.start()
+    log = Path(h.mgr.stages(run.id)[-1].log_path)
+    log.write_text(CREATE_APP_FAILURE)
+    if case == "version-timeout":
+        log.write_text(CREATE_APP_FAILURE + 'Traceback (most recent call last):\n'
+                       '  File "/wt/fleet/mlsc.py", line 283, in create_job\nRuntimeError: 504 Gateway Time-out')
+    elif case == "no-log":
+        log.unlink()
+    elif case == "multiple-attempts":
+        sid = h.store.start_bench_stage(run.id, "create_job", "cmd", str(log))
+        h.store.finish_bench_stage(sid, 1)
+    elif case == "saved-id":
+        h.spec().version_id_file.write_text("9999")
+    elif case == "two-versions":
+        for key in ("901", "902"):
+            h.configuration["application_versions"][key] = {"application_name": f"fleet-console {run.id}"}
+    elif case == "no-mlsc":
+        del h.configuration["application_versions"]
+    await h.mgr.stop(run.id)
+    await h.mgr.resume()
+    assert h.mgr.get(run.id).status == "stopping" and h.store.request(run.id)["state"] == "reserved"
+    assert not h.stopped and "stop_llm" not in h.stages
+
+
 async def test_reconcile_interrupted_stop_waits_for_all_remote_resources(h: Harness) -> None:
     h.fail = {"check"}
     run = await h.start()

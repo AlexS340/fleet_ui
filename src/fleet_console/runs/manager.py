@@ -598,24 +598,26 @@ class BenchManager:
         spec = await self.spec_of(run)
         run = self.get(run_id)
         failed: list[str] = []
+        failed_before_version = False
         if run.own_model and run.version_id is None and any(s.stage == "create_job" for s in self.stages(run_id)):
             try:
-                version_id = mlsc.created_version(await self._configuration(), run_id, spec.read_version_id())
-                self.store.update_bench(run_id, version_id=version_id)
-                spec.version_id_file.write_text(str(version_id))
+                failed_before_version = self._recover_stop_version(run, await self._configuration()) is None
                 run = self.get(run_id)
             except Exception as exc:
                 self.store.update_bench(run_id, error=str(exc))
                 return self.get(run_id)
         try:
-            report = await self.stop_tasks(run_id)
-            failed.extend(getattr(report, "failed", []))
-            if getattr(report, "remaining", None):
-                failed.append(f"В Argo ещё активны workflows: {report.remaining}")
-            if report is not None:
-                sub = await self._read_submitter(run_id)
-                if sub and sub.alive:
-                    failed.append("Сабмиттер прогона ещё работает")
+            if not failed_before_version or await self._remaining_tasks(run_id):
+                report = await self.stop_tasks(run_id)
+                failed.extend(getattr(report, "failed", []))
+                if getattr(report, "remaining", None):
+                    failed.append(f"В Argo ещё активны workflows: {report.remaining}")
+                if failed_before_version:
+                    failed.extend(await self._remaining_tasks(run_id))
+                elif report is not None:
+                    sub = await self._read_submitter(run_id)
+                    if sub and sub.alive:
+                        failed.append("Сабмиттер прогона ещё работает")
         except Exception as exc:  # noqa: BLE001 — остановку задач показываем, но модель всё равно гасим
             failed.append(f"задачи: {exc}")
         if run.own_model and run.version_id is not None:
@@ -690,6 +692,54 @@ class BenchManager:
             self.store.event("bench_resume", run.id, "ok", f"восстановление прерванной стадии {stage}")
             self._launch(run.id, spec, index, interrupted=True)
 
+    def _recover_stop_version(self, run: BenchRun, configuration: dict) -> int | None:
+        marker = Path(run.dir) / "version_id"
+        try:
+            saved_id = int(marker.read_text().strip())
+        except FileNotFoundError:
+            saved_id = None
+        try:
+            version = mlsc.created_version(configuration, run.id, saved_id)
+        except mlsc.NoCreatedVersion:
+            if saved_id is None and self._failed_before_version(run.id):
+                return None
+            raise
+        marker.write_text(str(version))
+        self.store.update_bench(run.id, version_id=version)
+        return version
+
+    def _failed_before_version(self, run_id: str) -> bool:
+        # Лог дописывается. Несколько запусков create_job или более поздняя стадия исключают этот вывод.
+        stages = [s for s in self.stages(run_id) if s.stage not in BEFORE_GPU]
+        if len(stages) != 1 or stages[0].stage != "create_job":
+            return False
+        stage = stages[0]
+        if not stage.finished_at or stage.returncode is None or stage.returncode <= 0:
+            return False
+        try:
+            log = Path(stage.log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        _, header, trace = log.rpartition("Traceback (most recent call last):")
+        if not header:
+            return False
+        # У Fleet этот RuntimeError возникает до возврата create_application в create_job.
+        _, _, frame = trace.rpartition('\n  File "')
+        return bool(re.match(r'[^"\n]*/fleet/mlsc\.py", line \d+, in create_application\n'
+                             r'(?:    [^\n]*\n)*RuntimeError: Ошибка создания приложения\.', frame))
+
+    async def _remaining_tasks(self, run_id: str) -> list[str]:
+        sub = await self._read_submitter(run_id)
+        workflows = await active_workflows(self.runner, self.settings.namespace, run_id)
+        remaining = []
+        if sub and sub.alive:
+            remaining.append("сабмиттер работает")
+        if sub and sub.pending and sub.limit != 0:
+            remaining.append("очередь сабмиттера не заблокирована нулевым лимитом")
+        if workflows:
+            remaining.append(f"активные workflows: {len(workflows)}")
+        return remaining
+
     async def _reconcile_stop(self, run_id: str) -> None:
         lock = self._actions.setdefault(run_id, asyncio.Lock())
         if lock.locked():
@@ -705,24 +755,15 @@ class BenchManager:
                     return
                 self.store.finish_bench_stage(stage.id, files.read_exit())
             try:
-                sub = await self._read_submitter(run_id)
-                workflows = await active_workflows(self.runner, self.settings.namespace, run_id)
-                remaining = []
-                if sub and sub.alive:
-                    remaining.append("сабмиттер работает")
-                if sub and sub.pending and sub.limit != 0:
-                    remaining.append("очередь сабмиттера не заблокирована нулевым лимитом")
-                if workflows:
-                    remaining.append(f"активные workflows: {len(workflows)}")
+                remaining = await self._remaining_tasks(run_id)
                 version_id = run.version_id
                 if run.own_model and (version_id is not None or any(s.stage == "create_job" for s in self.stages(run_id))):
                     configuration = await self._configuration()
                     if version_id is None:
-                        version_id = mlsc.created_version(configuration, run_id)
-                        (Path(run.dir) / "version_id").write_text(str(version_id))
-                        self.store.update_bench(run_id, version_id=version_id)
-                        self.store.adopt_run(run_id, version_id, model=run.model, note="запущен сервисом", owner_id=self.get(run_id).owner_id)
-                    if not mlsc.is_stopped(configuration, version_id):
+                        version_id = self._recover_stop_version(run, configuration)
+                        if version_id is not None:
+                            self.store.adopt_run(run_id, version_id, model=run.model, note="запущен сервисом", owner_id=run.owner_id)
+                    if version_id is not None and not mlsc.is_stopped(configuration, version_id):
                         remaining.append(f"версия MLSC {version_id} ещё активна")
                 if remaining:
                     self.store.update_bench(run_id, error="Остановка прервана: " + ", ".join(remaining))
