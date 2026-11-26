@@ -17,6 +17,7 @@ from uuid import uuid4
 import yaml
 
 from fleet_console.compose.dockerfile_images import base_images
+from fleet_console.compose.task_features import TaskFeatures
 from fleet_console.compose.task_hints import author_hints
 from fleet_console.compose.task_images import ImageIssue, check_images, manifest_target
 from fleet_console.observe.s3 import aws_env
@@ -28,6 +29,7 @@ from fleet_console.store.db import LOCAL_OWNER
 @dataclass
 class Validation:
     tasks: list[Path] = field(default_factory=list)
+    features: dict[str, TaskFeatures] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     size: int = 0
@@ -62,10 +64,10 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
             report.tasks.append(task)
             try:
                 config = tomllib.loads((task / "task.toml").read_text(encoding="utf-8"))
+                facts = TaskFeatures.from_config(config)
+                report.features[task.name] = facts
                 environment = config.get("environment", {})
                 verifier = config.get("verifier", {})
-                if not isinstance(environment, dict) or not isinstance(verifier, dict):
-                    raise TypeError("environment и verifier должны быть таблицами TOML")
                 image = environment.get("docker_image")
                 if not isinstance(image, str) or not image.strip():
                     report.errors.append(f"{task.name}: нужен environment.docker_image — основной образ собирается заранее")
@@ -76,12 +78,9 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
                         report.errors.append(f"{task.name}: нет непустого {rel}")
                 if not (task / "environment").is_dir():
                     report.errors.append(f"{task.name}: нет environment/")
-                mode = verifier.get("environment_mode")
-                if mode not in (None, "shared", "separate"):
+                if facts.verifier_mode not in ("shared", "separate"):
                     report.errors.append(f"{task.name}: неизвестный verifier.environment_mode")
                 verifier_env = verifier.get("environment")
-                if verifier_env is not None and not isinstance(verifier_env, dict):
-                    raise ValueError("verifier.environment должен быть таблицей TOML")
                 if verifier_env is not None and "docker_image" in verifier_env:
                     verifier_image = verifier_env["docker_image"]
                     if not isinstance(verifier_image, str) or not verifier_image.strip():
@@ -90,9 +89,8 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
                         report.images.setdefault(verifier_image.strip(), []).append(f"{task.name}: verifier.environment.docker_image")
                 verifier_dockerfile = task / "tests/Dockerfile"
                 needs_build = False
-                if mode == "separate" or (mode is None and verifier_env is not None):
-                    env = environment if verifier_env is None else verifier_env
-                    needs_build = not env.get("docker_image")
+                if facts.verifier_mode == "separate":
+                    needs_build = not facts.verifier_image
                     if needs_build and not verifier_dockerfile.is_file():
                         report.errors.append(f"{task.name}: отдельному verifier нужен образ или tests/Dockerfile")
                     if not config.get("artifacts"):

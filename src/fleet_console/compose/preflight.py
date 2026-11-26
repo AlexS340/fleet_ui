@@ -62,6 +62,9 @@ class Issue:
     recipe: str | None = None
     dataset: str | None = None
     harbor: str | None = None
+    feature: str | None = None
+    job_agent: str | None = None
+    buildx: dict[str, list[str]] | None = None
 
     def matches(self, agent: str, recipe: str, dataset: str, harbor: str | None) -> bool:
         pairs = ((self.agent, agent), (self.recipe, recipe), (self.dataset, dataset), (self.harbor, harbor or ""))
@@ -80,6 +83,7 @@ def load_issues(path: Path = KNOWN_ISSUES) -> list[Issue]:
                 Issue(
                     str(item["id"]), str(item["message"]), str(item.get("level", "warn")),
                     item.get("agent"), item.get("recipe"), item.get("dataset"), item.get("harbor"),
+                    item.get("feature"), item.get("job_agent"), item.get("buildx"),
                 )
             )
     return issues
@@ -205,7 +209,7 @@ def run_checks(
         checks.append(Check("session", "Сессия модели готова", "ok" if ok else "fail", session_status or "сессия не найдена"))
 
     for issue in issues:
-        if issue.matches(agent, recipe, dataset, profile.harbor_version):
+        if not issue.feature and issue.matches(agent, recipe, dataset, profile.harbor_version):
             checks.append(Check(f"issue:{issue.id}", "Известная несовместимость", issue.level if issue.level in {"warn", "fail"} else "warn", issue.message))
     checks.append(Check("quota", "Свободная квота GPU", "warn", "MLSC API квоту не отдаёт; смотрите занятые GPU в шапке"))
     return checks

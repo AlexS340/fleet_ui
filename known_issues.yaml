@@ -1,8 +1,35 @@
-# Известные несовместимости для preflight Fleet Console. Шаблоны — glob (fnmatch) по имени группы
-# harbor/agent, рецепта mlsc/model, датасета и версии Harbor ревизии; поле пропущено — не проверяется.
-# level: warn — предупреждение, которое можно принять; fail — запуск заблокирован.
+# agent, recipe, dataset, harbor — glob по группе/версии. job_agent — имя агента в JobConfig.
+# feature — признак выбранной задачи. Для Buildx точный тег или digest проверены на Ф4.
 - id: terminus2-mcp-harbor-0.22
-  agent: "terminus2*"
+  job_agent: "terminus-2"
+  feature: mcp
   harbor: "0.22.*"
   level: warn
-  message: terminus-2 на Harbor 0.22 не подключает MCP как инструменты — задачи с MCP-серверами пройдут без них
+  message: Terminus-2 на Harbor 0.22 не подключает MCP-серверы задачи как инструменты.
+- id: egress-buildx
+  feature: egress
+  harbor: "0.22.*"
+  level: fail
+  buildx:
+    missing:
+      - "registry.mlrnd.ru/docker-mlrnd/gc-cli/gc-cli-harbor:v0.3.0_260910"
+      - "*@sha256:39072d2b79e8e403910fe9213bed0b3ea4cb0ce271f52f4bd615fe263219fc3e"
+    present:
+      - "registry.mlrnd.ru/docker-mlrnd/sheet-taskgen/harbor-runner:buildx-20261102"
+      - "*@sha256:6ace1a8ef0a848ef56e90d27084fbb5501bfa2cfbbd99d6f3025644d97bc87ab"
+  message: Для сборки egress-sidecar требуется Docker Buildx.
+- id: egress-extra-hosts
+  feature: compose_conflict
+  harbor: "0.22.*"
+  level: fail
+  message: У одного Compose-сервиса одновременно заданы network_mode=service:… и extra_hosts.
+- id: egress-compose-unknown
+  feature: unknown_compose
+  harbor: "0.22.*"
+  level: warn
+  message: Проверьте итоговый Compose пода. У сервиса с network_mode=service:… не должно быть extra_hosts.
+- id: separate-verifier-image
+  feature: verifier_images
+  harbor: "0.22.*"
+  level: warn
+  message: Отдельный verifier использует готовый образ. В нём должен быть /tests/test.sh.

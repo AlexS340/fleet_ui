@@ -28,6 +28,7 @@ from fleet_console.compose import BenchSpec, Check, Preview, SessionLink, from_r
 from fleet_console.compose.local_datasets import LocalDataset
 from fleet_console.compose.model_route import model_route_problem
 from fleet_console.compose.policy import check_gpu, private_root, supports_private_measure
+from fleet_console.compose.task_issues import task_issue_checks
 from fleet_console.connect.gateway import cluster_models, parse_target
 from fleet_console.control.runs import active_workflows
 from fleet_console.fleetref.profile import DUMMY_ENV
@@ -455,6 +456,10 @@ class BenchManager:
             from urllib.parse import urlparse
             if urlparse(spec.private_s3_root).netloc == urlparse(str(system.get("bucket") or "")).netloc:
                 raise BenchError("Приватные результаты требуют отдельного закрытого S3-бакета")
+
+        issues = await task_issue_checks(self.runner, spec, resolved)
+        if failures := [c.detail for c in issues if c.level == "fail"]:
+            raise BenchError("\n".join(failures))
 
     async def dispatch(self) -> None:
         async with self._dispatch_lock:

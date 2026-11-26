@@ -195,7 +195,7 @@ def test_preflight_checks(tmp_path: Path) -> None:
     )
     checks = run_checks(secrets={"MLSC_TOKEN": "t", "AWS_ACCESS_KEY_ID_gcvmfleet": "a", "AWS_SECRET_ACCESS_KEY_gcvmfleet": "s"}, **common)
     by = {c.key: c for c in checks}
-    assert summary(checks) == (0, 2) and by["quota"].level == "warn" and by["issue:terminus2-mcp-harbor-0.22"].level == "warn"
+    assert summary(checks) == (0, 1) and by["quota"].level == "warn" and "issue:terminus2-mcp-harbor-0.22" not in by
     assert by["dataset"].level == "ok" and "tasks → birdsql_sqlite (fleet)" in by["dataset"].detail and by["model_name"].ok
 
     without_repeats = {**resolved, "experiment": {**resolved["experiment"], "repeats": 3}}
