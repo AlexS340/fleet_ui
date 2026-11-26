@@ -13,13 +13,13 @@ from fleet_console.runner import FakeRunner, Result
 from fleet_console.settings import Paths, Settings
 
 
-def task(root: Path, name: str = "one") -> Path:
+def task(root: Path, name: str = "one", image: str = "registry.mlrnd.ru/test/sheet:v2") -> Path:
     path = root / name
     for rel, text in {
-        "task.toml": 'schema_version = "1.1"\nartifacts = ["/app/data.xlsx"]\n[environment]\ndocker_image = "registry.example/sheet:v2"\n[verifier]\nenvironment_mode = "separate"\n[verifier.environment]\ncpus = 2\n',
+        "task.toml": f'schema_version = "1.1"\nartifacts = ["/app/data.xlsx"]\n[environment]\ndocker_image = "{image}"\n[verifier]\nenvironment_mode = "separate"\n[verifier.environment]\ncpus = 2\n',
         "instruction.md": "Edit /app/data.xlsx",
         "tests/test.sh": "#!/bin/sh\necho 1 > /logs/verifier/reward.txt",
-        "tests/Dockerfile": "FROM registry.example/sheet:v2\nCOPY . /tests",
+        "tests/Dockerfile": f"FROM {image}\nCOPY . /tests",
         "environment/data.xlsx": "example",
     }.items():
         p = path / rel

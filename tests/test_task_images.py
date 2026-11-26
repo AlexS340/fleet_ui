@@ -64,16 +64,16 @@ def test_external_and_invalid_references_make_no_requests():
         pytest.fail(f"unexpected request to {request.url}")
 
     with httpx.Client(transport=httpx.MockTransport(unexpected)) as client:
-        for image in ["busybox", "org/image", "registry.mlrnd.ru.evil/image", "127.0.0.1:80/image"]:
+        for image in ["busybox", "image:tag", "org/image", "docker.io/org/image", "registry.mlrnd.ru.evil/image",
+                      "127.0.0.1:80/image", "registry.mlrnd.ru:8080/image"]:
             issue = task_images._probe(client, image)
-            assert not issue.blocking and not issue.url
+            assert issue.blocking and not issue.url
         for path in ["../foo", "foo?bar", "repo@sha256:abc", "repo:"]:
             assert task_images._probe(client, "registry.mlrnd.ru/" + path).blocking
 
 
 def image_task(source: Path, name: str):
-    toml = task(source, name) / "task.toml"
-    toml.write_text(toml.read_text().replace("registry.example/sheet:v2", IMAGE + ":v2"))
+    task(source, name, IMAGE + ":v2")
 
 
 def test_duplicate_missing_image_blocks_whole_snapshot(tmp_path, monkeypatch):
@@ -88,13 +88,15 @@ def test_duplicate_missing_image_blocks_whole_snapshot(tmp_path, monkeypatch):
 
     monkeypatch.setattr(task_images, "_probe", missing)
     svc = service(tmp_path)
-    with pytest.raises(ImportValidationError, match="one, two") as exc:
+    with pytest.raises(ImportValidationError) as exc:
         svc.import_folder(source, "missing")
+    for name in ("one", "two"):
+        assert f"{name}: environment.docker_image" in str(exc.value) and f"{name}: tests/Dockerfile:1" in str(exc.value)
     assert calls == [IMAGE + ":v2"] and "/manifests/v2" in str(exc.value)
     assert not svc.all() and not list(svc.overlay.glob("datasets/*.yaml"))
     monkeypatch.setattr(task_images, "_probe", lambda *_: task_images.ImageIssue("Нет доступа"))
     assert validate_import(source).ok
-    assert "Нет доступа" in svc.import_folder(source, "offline").warnings[0]
+    assert any("Нет доступа" in warning for warning in svc.import_folder(source, "offline").warnings)
 
 
 @pytest.mark.nicegui_main_file("tests/ui_main.py")
@@ -109,7 +111,7 @@ async def test_import_dialog_links_missing_image_at_validation_and_save(user: Us
     user.find(marker="local-folder").elements.pop().set_value(str(tmp_path))
     user.find(marker="local-check").click()
     await user.should_see("Образ отсутствует")
-    await user.should_see("sales-review")
+    await user.should_see("sales-review: tests/Dockerfile:1")
     assert any(link.props.get("href") == url for link in user.find(kind=ui.link).elements)
     assert not user.find(marker="local-import").elements.pop().enabled
     monkeypatch.setattr(task_images, "_probe", lambda *_: None)

@@ -16,8 +16,9 @@ from uuid import uuid4
 
 import yaml
 
+from fleet_console.compose.dockerfile_images import base_images
 from fleet_console.compose.task_hints import author_hints
-from fleet_console.compose.task_images import ImageIssue, check_images
+from fleet_console.compose.task_images import ImageIssue, check_images, manifest_target
 from fleet_console.observe.s3 import aws_env
 from fleet_console.runner import Runner
 from fleet_console.settings import Paths, Settings, aws_secret_names, scrub, secrets_env
@@ -69,7 +70,7 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
                 if not isinstance(image, str) or not image.strip():
                     report.errors.append(f"{task.name}: нужен environment.docker_image — основной образ собирается заранее")
                 else:
-                    report.images.setdefault(image.strip(), []).append(task.name)
+                    report.images.setdefault(image.strip(), []).append(f"{task.name}: environment.docker_image")
                 for rel in ("instruction.md", "tests/test.sh"):
                     if not (task / rel).is_file() or not (task / rel).stat().st_size:
                         report.errors.append(f"{task.name}: нет непустого {rel}")
@@ -78,11 +79,21 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
                 mode = verifier.get("environment_mode")
                 if mode not in (None, "shared", "separate"):
                     report.errors.append(f"{task.name}: неизвестный verifier.environment_mode")
-                if mode == "separate" or (mode is None and verifier.get("environment")):
-                    env = verifier.get("environment") or environment
-                    if not isinstance(env, dict):
-                        raise ValueError("verifier.environment должен быть таблицей TOML")
-                    if not env.get("docker_image") and not (task / "tests/Dockerfile").is_file():
+                verifier_env = verifier.get("environment")
+                if verifier_env is not None and not isinstance(verifier_env, dict):
+                    raise ValueError("verifier.environment должен быть таблицей TOML")
+                if verifier_env is not None and "docker_image" in verifier_env:
+                    verifier_image = verifier_env["docker_image"]
+                    if not isinstance(verifier_image, str) or not verifier_image.strip():
+                        report.errors.append(f"{task.name}: verifier.environment.docker_image должен содержать имя образа")
+                    else:
+                        report.images.setdefault(verifier_image.strip(), []).append(f"{task.name}: verifier.environment.docker_image")
+                verifier_dockerfile = task / "tests/Dockerfile"
+                needs_build = False
+                if mode == "separate" or (mode is None and verifier_env is not None):
+                    env = environment if verifier_env is None else verifier_env
+                    needs_build = not env.get("docker_image")
+                    if needs_build and not verifier_dockerfile.is_file():
                         report.errors.append(f"{task.name}: отдельному verifier нужен образ или tests/Dockerfile")
                     if not config.get("artifacts"):
                         report.warnings.append(f"{task.name}: separate без artifacts — проверьте передачу результатов")
@@ -96,6 +107,13 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
                     if path.is_symlink():
                         report.errors.append(f"{task.name}: ссылка внутри задачи {path.relative_to(task)}; замените её файлом")
                     elif path.is_file():
+                        if needs_build and path == verifier_dockerfile:
+                            for line, base in base_images(path):
+                                location = f"{task.name}: tests/Dockerfile:{line}"
+                                if "$" in base:
+                                    report.warnings.append(f"{location}: не удалось разрешить ARG в образе {base}")
+                                else:
+                                    report.images.setdefault(base, []).append(location)
                         report.size += path.stat().st_size
                         digest.update(f"{task.name}/{path.relative_to(task)}\0".encode())
                         with path.open("rb") as stream:
@@ -119,6 +137,10 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
 
 def validate_import(folder: Path, *, allow_task_links: bool = True) -> Validation:
     report = validate_folder(folder, allow_task_links=allow_task_links)
+    for image in report.images:
+        target = manifest_target(image)
+        if isinstance(target, ImageIssue):
+            report.image_issues[image] = target
     if report.ok:
         report.image_issues = check_images(report.images)
     return report
@@ -293,6 +315,10 @@ class LocalDatasets:
             message, separator, image = warning.rpartition(" · ")
             if separator and image in remaining.images:
                 prefix = ", ".join(before.images[image]) + ": "
+                if not message.startswith(prefix):
+                    # В старых снимках реестр проверял только основной образ и сохранял имена задач.
+                    suffix = ": environment.docker_image"
+                    prefix = ", ".join(loc.removesuffix(suffix) for loc in before.images[image] if loc.endswith(suffix)) + ": "
                 if message.startswith(prefix):
                     remaining.warnings.append(f"{', '.join(remaining.images[image])}: {message[len(prefix):]} · {image}")
         updated = replace(dataset, tasks=[p.name for p in remaining.tasks], size=remaining.size,

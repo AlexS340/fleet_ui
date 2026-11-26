@@ -75,7 +75,7 @@ def import_dialog(ctx: AppContext, after) -> None:
         result = ui.label().classes("w-full text-sm whitespace-pre-wrap break-words").mark("local-validation")
         issues = ui.column().classes("w-full gap-2 overflow-y-auto").style("max-height: 30vh")
         issues.set_visibility(False)
-        ui.label("Проверяем файлы задач и основные образы во внутреннем реестре. Совместимость с Harbor проверяется перед выделением GPU.").classes("text-xs opacity-60")
+        ui.label("Проверяем файлы задач, основные образы и образы verifier в registry.mlrnd.ru. Совместимость с Harbor проверяется перед выделением GPU.").classes("text-xs opacity-60")
         with ui.row().classes("gap-2 flex-wrap"):
             check = ui.button("Проверить папку").props("flat no-caps").mark("local-check")
             save = ui.button("Добавить набор").props("unelevated no-caps").mark("local-import")

@@ -1,4 +1,4 @@
-"""Проверка манифестов основных образов Harbor-задач при импорте."""
+"""Образы Harbor-задач и базовые образы сборки verifier при импорте."""
 
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -26,22 +26,30 @@ class ImageIssue:
     blocking: bool = False
 
 
-def _probe(client: httpx.Client, image: str) -> ImageIssue | None:
+def manifest_target(image: str) -> tuple[str, str, str] | ImageIssue:
     host, _, path = image.partition("/")
     if host.lower() not in _HOSTS:
-        return ImageIssue(f"Проверка доступна для образов из {REGISTRY}")
+        return ImageIssue(f"Укажите образ из внутреннего реестра {REGISTRY}", blocking=True)
     ref = _REF.fullmatch(path)
     if not ref:
         return ImageIssue("Некорректное имя, тег или digest образа", blocking=True)
     manifest = ref["digest"] or ref["tag"] or "latest"
     url = f"https://{host}/v2/{ref['repo']}/manifests/{manifest}"
+    return host, ref["repo"], url
+
+
+def _probe(client: httpx.Client, image: str) -> ImageIssue | None:
+    target = manifest_target(image)
+    if isinstance(target, ImageIssue):
+        return target
+    host, repo, url = target
     headers = {"Accept": _ACCEPT}
     try:
         response = client.head(url, headers=headers)
         if response.status_code == 401 and response.headers.get("www-authenticate", "").lower().startswith("bearer "):
             # Anonymous pull on the internal Harbor. Never follow a server-provided token URL.
             auth = client.get(f"https://{host}/service/token", params={
-                "service": "harbor-registry", "scope": f"repository:{ref['repo']}:pull",
+                "service": "harbor-registry", "scope": f"repository:{repo}:pull",
             })
             auth.raise_for_status()
             token = auth.json()["token"]

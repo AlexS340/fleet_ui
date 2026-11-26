@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+import httpx
 import pytest
 
 # overlay сервиса в тестах — временный каталог: «Сохранить в overlay» не должно писать в репозиторий
@@ -61,3 +62,16 @@ def remote_repo(tmp_path: Path) -> Path:
 @pytest.fixture
 def paths(tmp_path: Path) -> Paths:
     return Paths(tmp_path / "home").ensure()
+
+
+@pytest.fixture(autouse=True)
+def offline_task_registry(monkeypatch):
+    """Обычные тесты импорта работают офлайн. Сценарии HTTP задают собственный MockTransport."""
+    original = httpx.HTTPTransport.handle_request
+
+    def handle(transport, request):
+        if request.url.host == "registry.mlrnd.ru":
+            return httpx.Response(200, headers={"Docker-Content-Digest": "sha256:" + "a" * 64})
+        return original(transport, request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle)
