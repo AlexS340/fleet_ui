@@ -693,6 +693,8 @@ def _new_bench_dialog(
                     foreign_models=foreign, model_name=spec.effective_model or draft.preview.model, agent=spec.agent, recipe=spec.recipe,
                     dataset=spec.dataset_label, issues=load_issues(), session_status=session_status, overlay_drift=[d.summary for d in draft.drift],
                 )
+                if draft.resolved is not None:
+                    draft.checks.append(await ctx.benches.check_harbor_tasks(spec, draft.resolved))
                 if not supports_private_measure(spec.worktree):
                     draft.checks.append(Check("private_measure", "Приватный замер", "fail", "Ревизия не поддерживает read_only"))
                 if spec.dataset_source:

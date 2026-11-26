@@ -24,7 +24,7 @@ from typing import Any
 import yaml
 
 from fleet_console.auth import Access, AccessDenied
-from fleet_console.compose import BenchSpec, Preview, SessionLink, from_resolved
+from fleet_console.compose import BenchSpec, Check, Preview, SessionLink, from_resolved
 from fleet_console.compose.local_datasets import LocalDataset
 from fleet_console.compose.policy import check_gpu, private_root, supports_private_measure
 from fleet_console.connect.gateway import parse_target
@@ -307,19 +307,49 @@ class BenchManager:
         env = {**DUMMY_ENV, **({"FLEET_DATASETS_ROOT": str(self.settings.datasets_root_path())} if self.settings.datasets_root_path() else {})}
         stage_id = self.store.start_bench_stage(run_id, "preflight", shlex.join(argv), str(spec.resolved)) if run_id else None
         result = await self.runner.run(argv, cwd=spec.worktree, env=env, timeout=300)
-        if stage_id is not None:
-            self.store.finish_bench_stage(stage_id, result.returncode)
         if not result.ok:
+            if stage_id is not None:
+                self.store.finish_bench_stage(stage_id, result.returncode)
             error = scrub((result.stderr or result.stdout).strip(), self.secrets().values())
             (spec.logs_dir / "preflight.log").write_text(error + "\n", encoding="utf-8")
             return None, "\n".join(error.splitlines()[-6:])
         text = scrub(result.stdout, self.secrets().values())
         spec.resolved.write_text(text, encoding="utf-8")
+        error = ""
         try:
-            data = yaml.safe_load(text) or {}
+            data = yaml.safe_load(text)
+            if not isinstance(data, dict):
+                error = "--print-config вернул пустой или некорректный конфиг"
+            elif stage_id is not None:
+                check = await self.check_harbor_tasks(spec, data)
+                if not check.ok:
+                    error = check.detail
         except yaml.YAMLError as exc:
-            return None, f"--print-config вернул не YAML: {exc}"
-        return (data if isinstance(data, dict) else None), ""
+            error = f"--print-config вернул не YAML: {exc}"
+        if stage_id is not None:
+            self.store.finish_bench_stage(stage_id, int(bool(error)))
+        if error:
+            (spec.logs_dir / "preflight.log").write_text(error + "\n", encoding="utf-8")
+            return None, error
+        return data, ""
+
+    async def check_harbor_tasks(self, spec: BenchSpec, resolved: dict) -> Check:
+        probe = Path(__file__).resolve().parents[1] / "compose" / "harbor_probe.py"
+        materialize = (resolved.get("system") or {}).get("materialize") or {}
+        try:
+            result = await self.runner.run(
+                [str(spec.worktree / ".venv/bin/python"), "-I", "-B", str(probe)],
+                cwd=spec.worktree, env=DUMMY_ENV, timeout=300, stdin=json.dumps(materialize),
+            )
+            if not result.ok:
+                raise ValueError((result.stderr or result.stdout).strip() or f"код {result.returncode}")
+            count = int(result.stdout.strip())
+            if count < 1:
+                raise ValueError("пустая выборка задач")
+        except (OSError, ValueError) as exc:
+            detail = scrub(str(exc), self.secrets().values())
+            return Check("harbor_tasks", "Состав задач Harbor", "fail", detail)
+        return Check("harbor_tasks", "Состав задач Harbor", "ok", f"Проверено задач: {count}")
 
     # --- действия ------------------------------------------------------------
     async def start(self, spec: BenchSpec, *, ref: str, preview: Preview, access: Access | None = None) -> BenchRun:
@@ -358,6 +388,9 @@ class BenchManager:
         actual = from_resolved(resolved, revision=preview.revision, context=preview.cluster.split(" · ")[0],
                                run_dir=spec.run_dir, session=spec.session.id if spec.session else "")
         self._validate_resolved(spec, resolved, actual)
+        harbor_check = await self.check_harbor_tasks(spec, resolved)
+        if not harbor_check.ok:
+            raise BenchError(harbor_check.detail)
         if source := spec.dataset_source:
             try:
                 current = LocalDataset.read(self.paths.home / "local-datasets", source["id"])

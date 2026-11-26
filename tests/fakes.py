@@ -301,6 +301,7 @@ def make_context() -> AppContext:
     kubectl.on("uv", "run", result=fake_fleet)
     kubectl.on("osascript")
     manager = FakeManager(make_worktree(root / "wt"))
+    kubectl.on(str(manager.worktree / ".venv/bin/python"), stdout="1\n")
     observer = ClusterObserver(kubectl, settings, mlsc_token=lambda: "token")
     sessions = SessionManager(store, kubectl, paths, settings, token=lambda: "token", mlsc_pod=observer.mlsc_pod, platform="linux")
     # профиль «ревизии» FakeManager — в кеш, чтобы SessionManager.spec находил заглушки harbor

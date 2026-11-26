@@ -58,6 +58,7 @@ class Harness:
         self.stopped: list[str] = []
         self.requeue_moves = False
         self.worktree = tmp_path / "wt"
+        self.runner.on(str(self.worktree / ".venv/bin/python"), stdout="3\n")
         cfg = self.worktree / CONFIGS_REL
         for rel, text in {
             "mlsc/model/glm.yaml": "# @package mlsc\nserved_model_name: GLM\n",
