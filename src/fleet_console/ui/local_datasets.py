@@ -84,12 +84,15 @@ def import_dialog(ctx: AppContext, after) -> None:
 
         def show_report(report: Validation) -> None:
             lines = [f"Задач: {len(report.tasks)} · {report.size / 1024 / 1024:.1f} МБ",
-                     *report.errors[:15], *report.warnings[:5]]
+                     *report.errors[:15]]
             lines.append("Минимальная проверка пройдена." if report.ok else "Исправьте ошибки перед добавлением.")
             result.set_text("\n".join(lines))
             issues.clear()
-            issues.set_visibility(bool(report.image_issues))
+            issues.set_visibility(bool(report.warnings or report.image_issues))
             with issues:
+                if report.warnings:
+                    with ui.expansion(f"Подсказки авторам ({len(report.warnings)})").classes("w-full"):
+                        ui.label("\n".join(report.warnings)).classes("w-full text-sm whitespace-pre-wrap break-words")
                 for image, issue in report.image_issues.items():
                     with ui.column().classes("w-full gap-0 text-sm"):
                         ui.label(issue.message).classes("font-medium")

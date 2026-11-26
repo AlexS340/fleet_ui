@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import yaml
 
+from fleet_console.compose.task_hints import author_hints
 from fleet_console.compose.task_images import ImageIssue, check_images
 from fleet_console.observe.s3 import aws_env
 from fleet_console.runner import Runner
@@ -41,6 +42,7 @@ class Validation:
 def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task: str | None = None) -> Validation:
     """Без запуска кода задач: структура, TOML, образ и входные файлы; один уровень задач."""
     report = Validation()
+    explicit_names: dict[str, list[str]] = {}
     digest = hashlib.sha256()
     try:
         folder = folder.expanduser().resolve(strict=True)
@@ -84,7 +86,13 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
                         report.errors.append(f"{task.name}: отдельному verifier нужен образ или tests/Dockerfile")
                     if not config.get("artifacts"):
                         report.warnings.append(f"{task.name}: separate без artifacts — проверьте передачу результатов")
-                for path in sorted(task.rglob("*")):
+                task_section = config.get("task")
+                name = task_section.get("name") if isinstance(task_section, dict) else None
+                if isinstance(name, str) and name.strip():
+                    explicit_names.setdefault(name, []).append(f"{task.name}/task.toml")
+                entries = sorted(task.rglob("*"))
+                report.warnings.extend(author_hints(task, entries))
+                for path in entries:
                     if path.is_symlink():
                         report.errors.append(f"{task.name}: ссылка внутри задачи {path.relative_to(task)}; замените её файлом")
                     elif path.is_file():
@@ -101,6 +109,9 @@ def validate_folder(folder: Path, *, allow_task_links: bool = True, exclude_task
             report.errors.append("в папке не найдено задач с task.toml")
     except (OSError, ValueError) as exc:
         report.errors.append(str(exc))
+    for name, files in explicit_names.items():
+        if len(files) > 1:
+            report.warnings.append(f"{', '.join(files)}: совпадает явно заданное [task].name = {name!r}.")
     report.digest = digest.hexdigest()
     report.warnings = list(dict.fromkeys(report.warnings))
     return report
@@ -194,8 +205,8 @@ class LocalDatasets:
         slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:24] or "tasks"
         dataset_id = f"local-{slug}-{uuid4().hex[:12]}"
         dest = root.expanduser().resolve() / "local" / dataset_id / "tasks"
-        warnings = report.warnings + [f"{', '.join(report.images[image])}: {issue.message} · {image}"
-                                      for image, issue in report.image_issues.items()]
+        warnings = [f"{', '.join(report.images[image])}: {issue.message} · {image}"
+                    for image, issue in report.image_issues.items()] + report.warnings
         dataset = LocalDataset(dataset_id, label, str(folder.expanduser().resolve()), str(dest), datetime.now(UTC).isoformat(),
                                [p.name for p in report.tasks], report.size, warnings, digest=report.digest, owner_id=owner_id)
         try:
