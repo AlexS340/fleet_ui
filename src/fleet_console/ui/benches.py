@@ -47,6 +47,7 @@ from fleet_console.compose.model_route import model_route_problem
 from fleet_console.compose.policy import private_root, supports_private_measure
 from fleet_console.compose.provenance import Candidate, build_index, layers, lookup, tree_nodes, value_at
 from fleet_console.compose.registry import Mapping, bench_slug, group_tasks_roots, list_mappings, registry_choices
+from fleet_console.compose.task_resources import task_resources
 from fleet_console.compose.reuse import config_path, preset_from_run
 from fleet_console.context import AppContext
 from fleet_console.fleetref.manager import PrepareError, ReadyRevision
@@ -702,6 +703,8 @@ def _new_bench_dialog(
                                               problem or f"{draft.preview.inference} · {draft.preview.model}"))
                 if draft.resolved is not None:
                     draft.checks.append(await ctx.benches.check_harbor_tasks(spec, draft.resolved))
+                if draft.resolved:
+                    draft.checks.append(await task_resources(ctx.benches.runner, spec.worktree, draft.resolved, ctx.kube_status))
                 if not supports_private_measure(spec.worktree):
                     draft.checks.append(Check("private_measure", "Приватный замер", "fail", "Ревизия не поддерживает read_only"))
                 if spec.dataset_source:
@@ -739,11 +742,13 @@ def _new_bench_dialog(
                 ui.label(f"Preflight: ✗ {fails} · ⚠ {warns}").classes("text-base mt-2")
                 for c in draft.checks:
                     icon, color = LEVEL_ICON[c.level]
-                    with ui.row().classes("items-start gap-2 no-wrap"):
+                    wrap = "sm:flex-nowrap" if c.key == "task_resources" else "no-wrap"
+                    with ui.row().classes(f"items-start gap-2 {wrap}"):
                         ui.icon(icon).classes(f"{color} text-base mt-0.5")
                         ui.label(c.title).classes("text-sm whitespace-nowrap")
                         with ui.column().classes("gap-0 min-w-0"):
-                            ui.label(c.detail).classes("text-xs opacity-70 break-all")
+                            word_wrap = "break-words" if c.key == "task_resources" else "break-all"
+                            ui.label(c.detail).classes(f"text-xs opacity-70 {word_wrap}")
                             if admin and c.action and c.action.get("kind") == "fetch_dataset":
                                 ui.button("Скачать из S3", on_click=lambda a=c.action: _fetch_dataset_dialog(ctx, draft, rebuild, a)).props("flat dense no-caps").classes(
                                     "self-start"

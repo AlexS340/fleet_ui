@@ -355,7 +355,9 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     (draft_dir,) = fakes.CTX.paths.runs.iterdir()
     assert "job_priority_class=" not in (draft_dir / "overrides.txt").read_text()
     assert "queue_name=" not in (draft_dir / "overrides.txt").read_text()
-    await user.should_see("Preflight: ✗ 0 · ⚠ 2")  # квота GPU и terminus-2 на Harbor 0.22
+    await user.should_see("CPU и память задачи")
+    await user.should_see("Оценка недоступна")  # в тестовой ревизии нет билдера DinD
+    await user.should_see("Preflight: ✗ 0 · ⚠")
     await user.should_see("tasks → cowork (fleet)")
     start = user.find(marker="start-bench").elements.pop()
     assert not start.enabled  # предупреждения не приняты

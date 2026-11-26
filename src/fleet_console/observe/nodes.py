@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
+from decimal import Decimal
 
 from fleet_console.runner import CommandError, Runner
 
@@ -12,14 +13,20 @@ NODES_JSONPATH = (
     '{.status.conditions[?(@.type=="Ready")].status}{"\\t"}{.status.allocatable.cpu}{"\\t"}'
     '{.status.allocatable.memory}{"\\n"}{end}'
 )
-QUANTITY = re.compile(r"^(?P<num>[0-9.]+)(?P<suffix>[A-Za-z]*)$")
+QUANTITY = re.compile(r"(?P<num>[+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)(?P<suffix>[A-Za-z]*)")
 MULTIPLIERS = {
     "": 1,
-    "m": 1e-3,
-    "k": 1e3,
-    "M": 1e6,
-    "G": 1e9,
-    "T": 1e12,
+    "n": Decimal("1e-9"),
+    "u": Decimal("1e-6"),
+    "m": Decimal("1e-3"),
+    "k": 10**3,
+    "M": 10**6,
+    "G": 10**9,
+    "T": 10**12,
+    "P": 10**15,
+    "E": 10**18,
+    "Pi": 2**50,
+    "Ei": 2**60,
     "Ki": 2**10,
     "Mi": 2**20,
     "Gi": 2**30,
@@ -27,12 +34,16 @@ MULTIPLIERS = {
 }
 
 
+def quantity(text: str) -> Decimal | None:
+    m = QUANTITY.fullmatch(text.strip())
+    if m and m["suffix"] in MULTIPLIERS:
+        return Decimal(m["num"]) * MULTIPLIERS[m["suffix"]]
+    return None
+
+
 def parse_quantity(text: str) -> float:
     """Kubernetes quantity («95500m», «1456Gi») → число базовых единиц; неизвестный формат → 0."""
-    m = QUANTITY.match(text.strip())
-    if not m:
-        return 0.0
-    return float(m.group("num")) * MULTIPLIERS.get(m.group("suffix"), 0)
+    return float(quantity(text) or 0)
 
 
 @dataclass(frozen=True)
