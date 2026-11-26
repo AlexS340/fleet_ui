@@ -26,8 +26,9 @@ import yaml
 from fleet_console.auth import Access, AccessDenied
 from fleet_console.compose import BenchSpec, Check, Preview, SessionLink, from_resolved
 from fleet_console.compose.local_datasets import LocalDataset
+from fleet_console.compose.model_route import model_route_problem
 from fleet_console.compose.policy import check_gpu, private_root, supports_private_measure
-from fleet_console.connect.gateway import parse_target
+from fleet_console.connect.gateway import cluster_models, parse_target
 from fleet_console.control.runs import active_workflows
 from fleet_console.fleetref.profile import DUMMY_ENV
 from fleet_console.models import SessionManager
@@ -373,6 +374,8 @@ class BenchManager:
                 raise BenchError("сессия модели не готова")
             if session.owner_id != (access.id if access else LOCAL_OWNER):
                 raise BenchError("Для прогона нужна сессия того же владельца")
+            if session.model != spec.session.model:
+                raise BenchError(f"Модель сессии {session.model!r} расходится с моделью черновика {spec.session.model!r}")
         try:
             root = private_root(self.settings)
         except ValueError as exc:
@@ -387,7 +390,7 @@ class BenchManager:
             raise BenchError(error)
         actual = from_resolved(resolved, revision=preview.revision, context=preview.cluster.split(" · ")[0],
                                run_dir=spec.run_dir, session=spec.session.id if spec.session else "")
-        self._validate_resolved(spec, resolved, actual)
+        await self._validate_resolved(spec, resolved, actual)
         harbor_check = await self.check_harbor_tasks(spec, resolved)
         if not harbor_check.ok:
             raise BenchError(harbor_check.detail)
@@ -423,7 +426,7 @@ class BenchManager:
             id=spec.run_id, status="queued", created_at=_iso(now), preset=spec.preset, ref=ref, sha=spec.sha,
             worktree=str(spec.worktree), dir=str(spec.run_dir), recipe=spec.recipe, model=spec.effective_model or preview.model,
             agent=spec.agent, dataset=spec.dataset if isinstance(spec.dataset, str) else spec.dataset.model_dump_json(),
-            jobs=spec.effective_jobs, agents_per_replica=spec.agents_per_replica, task_limit=spec.task_limit, inference=spec.inference,
+            jobs=spec.effective_jobs, agents_per_replica=spec.agents_per_replica, task_limit=spec.task_limit, inference=actual.inference,
             session_id=spec.session.id if spec.session else None, stage="preflight", preview_json=preview.to_json(),
             version_id=spec.session.version_id if spec.session else None,
             owner_id=access.id if access else LOCAL_OWNER,
@@ -434,10 +437,12 @@ class BenchManager:
         await self.dispatch()
         return self.get(run.id)
 
-    def _validate_resolved(self, spec: BenchSpec, resolved: dict, preview: Preview) -> None:
+    async def _validate_resolved(self, spec: BenchSpec, resolved: dict, preview: Preview) -> None:
         system = resolved.get("system") or {}
-        if preview.run_id != spec.run_id or preview.model != spec.effective_model:
-            raise BenchError("Итоговый конфиг меняет ID прогона или маршрут модели")
+        if preview.run_id != spec.run_id:
+            raise BenchError("Итоговый конфиг меняет ID прогона")
+        if problem := await model_route_problem(spec, resolved, preview, self.runner, self.settings, session_ready=True):
+            raise BenchError(problem)
         if not spec.session and (problem := job_priority_problem(preview.queue, preview.job_priority)):
             raise BenchError(problem)
         if spec.read_only_measure and (system.get("measure_run") or {}).get("read_only") is not True:
@@ -517,11 +522,8 @@ class BenchManager:
             if not base:
                 namespace, service, port = parse_target(self.settings.cluster.litellm_gateway)
                 base = f"http://{service}.{namespace}.svc:{port}"
-            url = base + ("/models" if base.endswith("/v1") else "/v1/models")
-            response = await self.runner.run(
-                ["kubectl", "exec", "-n", self.settings.namespace, self.settings.cluster.submitter_pod,
-                 "--", "curl", "-fsS", "--proto", "=http,https", "--max-time", "15", "--", url], timeout=25)
-            if not response.ok or run.model not in {m.get("id") for m in json.loads(response.stdout)["data"]}:
+            models = await cluster_models(self.runner, self.settings.namespace, self.settings.cluster.submitter_pod, base)
+            if run.model not in {m.id for m in models}:
                 raise BenchError(f"Шлюз LiteLLM не подтвердил доступность модели {run.model}")
         limit = live * spec.agents_per_replica
         await self.agent_limit(run.id, limit)
@@ -802,7 +804,7 @@ class BenchManager:
                     ok = resolved is not None
                     if ok and self.store.request(run_id):
                         actual = from_resolved(resolved)
-                        self._validate_resolved(spec, resolved, actual)
+                        await self._validate_resolved(spec, resolved, actual)
                         if not spec.session and actual.gpu_total != self.store.request(run_id)["gpu"]:
                             raise BenchError("Число GPU изменилось после принятия заявки; создайте новый прогон")
                     if not ok:

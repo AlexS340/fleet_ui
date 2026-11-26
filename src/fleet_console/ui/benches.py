@@ -43,6 +43,7 @@ from fleet_console.compose import (
     validate_yaml,
 )
 from fleet_console.compose.local_datasets import LocalDataset
+from fleet_console.compose.model_route import model_route_problem
 from fleet_console.compose.policy import private_root, supports_private_measure
 from fleet_console.compose.provenance import Candidate, build_index, layers, lookup, tree_nodes, value_at
 from fleet_console.compose.registry import Mapping, bench_slug, group_tasks_roots, list_mappings, registry_choices
@@ -693,6 +694,12 @@ def _new_bench_dialog(
                     foreign_models=foreign, model_name=spec.effective_model or draft.preview.model, agent=spec.agent, recipe=spec.recipe,
                     dataset=spec.dataset_label, issues=load_issues(), session_status=session_status, overlay_drift=[d.summary for d in draft.drift],
                 )
+                if draft.resolved is not None:
+                    problem = await model_route_problem(
+                        spec, draft.resolved, draft.preview, ctx.benches.runner, ctx.settings, session_ready=session_status == "ready",
+                    )
+                    draft.checks.append(Check("model_route", "Маршрут модели", "fail" if problem else "ok",
+                                              problem or f"{draft.preview.inference} · {draft.preview.model}"))
                 if draft.resolved is not None:
                     draft.checks.append(await ctx.benches.check_harbor_tasks(spec, draft.resolved))
                 if not supports_private_measure(spec.worktree):

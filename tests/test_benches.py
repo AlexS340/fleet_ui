@@ -80,6 +80,10 @@ class Harness:
                 data = yaml.safe_load(RESOLVED_YAML)
                 data["experiment"]["run_id"] = _override(argv, "experiment.run_id")
                 data["experiment"]["model_name"] = _override(argv, "mlsc.served_model_name")
+                model = data["experiment"]["model_name"]
+                data["mlsc"]["served_model_name"] = model
+                data["harbor_job"]["agents"][0]["model_name"] = _override(argv, "harbor_job.agents.0.model_name") or f"openai/{model}"
+                data["system"]["polar"] = {"topology": {"gateway": {"nodes": [{"inference": {"base_url": "http://litellm.test/v1"}}]}}}
                 data["experiment"]["jobs"] = int(_override(argv, "experiment.jobs") or 1)
                 data["system"]["measure_run"] = {"read_only": True}
                 data["system"]["s3_base_directory"] = _override(argv, "system.s3_base_directory") or f"s3://b/ns/{data['experiment']['model_name']}/{data['experiment']['run_id']}"
@@ -253,6 +257,7 @@ async def test_bench_on_session_skips_model_stages_and_writes_limit_from_live_re
     h.session()
     h.submitter = "done"
     link = SessionLink("console-glm-1", "GLM-s", "glm", 3, 41)
+    h.runner.on("kubectl", "exec", "-n", NS, "fleet-submitter-python", "--", "curl", stdout='{"data":[{"id":"GLM-s"}]}')
     run = await h.start(session=link, model_name="")
     assert run.status == "done" and run.session_id == "console-glm-1" and run.model == "GLM-s" and run.jobs == 3 and run.version_id == 41
     assert h.stages == ["preflight", "preflight", "materialize", "upload", "launch", "measure"]  # без create_job/start_llm/check/stop_llm

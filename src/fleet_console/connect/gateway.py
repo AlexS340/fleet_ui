@@ -11,11 +11,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import socket
+from dataclasses import dataclass
 
 import httpx
+
+from fleet_console.runner import CommandError, Runner
 
 GATEWAY_KEYS = ("litellm", "nginx")
 
@@ -85,8 +87,28 @@ def free_port(preferred: int) -> int:
 async def list_models(http: httpx.AsyncClient, base_url: str) -> list[Model]:
     response = await http.get(f"{base_url}/models", timeout=10)
     response.raise_for_status()
-    data = response.json().get("data") or []
-    return [Model(str(m["id"]), m.get("max_input_tokens")) for m in data if m.get("id")]
+    return parse_models(response.json())
+
+
+def parse_models(payload: object) -> list[Model]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"] for item in data
+    ):
+        raise ValueError("ожидался список data с идентификаторами моделей")
+    return [Model(item["id"], item.get("max_input_tokens")) for item in data]
+
+
+async def cluster_models(runner: Runner, namespace: str, pod: str, base_url: str) -> list[Model]:
+    """Читаем тот же список из сети кластера, без локального port-forward."""
+    base = base_url.rstrip("/")
+    url = base + ("/models" if base.endswith("/v1") else "/v1/models")
+    response = await runner.run(
+        ["kubectl", "exec", "-n", namespace, pod, "--", "curl", "-fsS", "--globoff",
+         "--proto", "=http,https", "--max-time", "15", "--", url], timeout=25)
+    if not response.ok:
+        raise CommandError(response)
+    return parse_models(json.loads(response.stdout))
 
 
 async def probe(http: httpx.AsyncClient, url: str) -> bool:

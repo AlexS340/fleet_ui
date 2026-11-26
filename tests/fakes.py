@@ -241,6 +241,8 @@ def fake_fleet(argv: tuple[str, ...]) -> Result:
         data["experiment"]["run_id"] = overrides.get("experiment.run_id", "bench")
         data["experiment"]["model_name"] = overrides.get("mlsc.served_model_name", "GLM")
         data["mlsc"]["served_model_name"] = data["experiment"]["model_name"]
+        data["harbor_job"]["agents"][0]["model_name"] = overrides.get(
+            "harbor_job.agents.0.model_name", "openai/" + data["experiment"]["model_name"])
         data["experiment"]["jobs"] = int(overrides.get("experiment.jobs", 1))
         exp = next((Path(arg) for arg in argv if Path(arg).name == "exp.yaml"), None)
         if exp is not None:

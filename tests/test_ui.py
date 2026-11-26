@@ -367,6 +367,11 @@ async def test_benches_page_form_preview_and_run(user: User) -> None:
     await user.should_see("задайте целое число от 1")
     repeats.set_value(3)
     extra = next(e for e in user.find(kind=ui.textarea).elements if e.props.get("label", "").startswith("overrides fleet"))
+    extra.set_value("harbor_job.agents.0.model_name=openai/Other")
+    user.find("Превью и preflight").click()
+    await user.should_see("harbor_job.agents[0].model_name='openai/Other'")
+    user.find("Принимаю предупреждения").click()
+    assert not start.enabled
     extra.set_value("++mlsc.create_job.job.queue_name=shared\n++mlsc.create_job.job.job_priority_class=low")
     user.find("Превью и preflight").click()
     await user.should_see("Очередь shared не принимает приоритет low")
