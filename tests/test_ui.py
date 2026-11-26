@@ -639,7 +639,6 @@ async def test_local_tasks_import_upload_and_run_form(user: User, tmp_path: Path
         "AWS_ACCESS_KEY_ID_gcvmfleet": "test-key", "AWS_SECRET_ACCESS_KEY_gcvmfleet": "test-secret",
     })
     fakes.CTX.runner.handlers.insert(0, (("aws", "s3", "cp"), fakes.Result((), 0, "uploaded")))
-    fakes.CTX.runner.handlers.insert(0, (("aws", "s3", "ls"), fakes.Result((), 0, "2026-10-30 12:00:00 123 task.toml")))
     await fakes.CTX.manager.prepare("master")
     await user.open("/runs")
     user.find(marker="local-add").click()
@@ -672,8 +671,16 @@ async def test_local_tasks_import_upload_and_run_form(user: User, tmp_path: Path
     await user.should_see("Из локальной папки:")
     selected = _select(user, "Датасет · группа или реестр")
     assert "из локальной папки" in selected.options[selected.value]
+    prefix = f"harbor_datasets/local/{item.id}/tasks/"
+    listing = ("aws", "s3api", "list-objects-v2", "--bucket", "bucket", "--prefix", prefix)
+    fakes.CTX.runner.on(*listing, stdout="[]")
     user.find("Превью и preflight").click()
-    await user.should_see("Локальные задачи в S3")
+    await user.should_see("Отсутствуют в S3: one")
+    user.find(marker="accept-warnings").elements.pop().set_value(True)
+    assert not user.find(marker="start-bench").elements.pop().enabled
+    fakes.CTX.runner.handlers.insert(0, (listing, Result((), 0, json.dumps([prefix + "one/task.toml"]))))
+    user.find("Превью и preflight").click()
+    await user.should_not_see("Отсутствуют в S3: one")
     draft = next(fakes.CTX.paths.runs.glob("*/spec.json"))
     from fleet_console.compose import BenchSpec
     assert BenchSpec.from_json(draft.read_text()).dataset_source["source"] == str(source)

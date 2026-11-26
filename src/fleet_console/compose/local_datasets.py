@@ -346,14 +346,33 @@ class LocalDatasets:
         if len(values) != 2:
             return f"нет ключей профиля S3 {profile} для проверки загруженных задач"
         env = aws_env(values, self.paths.home / "aws-read.cfg", self.settings.s3_endpoint, self.settings.s3_region, profile=profile)
-        uri = dataset.s3_uri.rstrip("/") + f"/{dataset.tasks[0]}/task.toml"
+        bucket, _, prefix = dataset.s3_uri.removeprefix("s3://").rstrip("/").partition("/")
+        prefix += "/"
+        # AWS CLI собирает все страницы ListObjectsV2 перед применением JSON-запроса.
+        argv = ["aws", "s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix,
+                "--output", "json", "--query", "Contents[].Key || `[]`"]
         try:
-            result = await self.runner.run(["aws", "s3", "ls", uri], env=env, timeout=120)
-            if result.ok and result.stdout.strip():
-                return ""
-            return scrub((result.stderr or result.stdout).strip(), values.values()) or f"в S3 нет {uri}; повторите отправку"
+            result = await self.runner.run(argv, env=env, timeout=120)
         except OSError as exc:
-            return scrub(str(exc), values.values())
+            return f"Не удалось прочитать список объектов S3: {scrub(str(exc), values.values())}"
+        if not result.ok:
+            detail = (result.stderr or result.stdout).strip() or f"код {result.returncode}"
+            return f"Не удалось прочитать список объектов S3: {scrub(detail, values.values())}"
+        try:
+            keys = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            keys = None
+        if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+            return "AWS CLI вернул некорректный список ключей S3"
+        marker = re.compile(re.escape(prefix) + r"([^/]+)/task\.toml")
+        published = {match[1] for key in keys if (match := marker.fullmatch(key))}
+        expected = set(dataset.tasks)
+        problems = []
+        if missing := sorted(expected - published):
+            problems.append("Отсутствуют в S3: " + ", ".join(missing))
+        if extra := sorted(published - expected):
+            problems.append("Лишние в S3: " + ", ".join(extra))
+        return "\n".join(problems)
 
     async def _upload(self, dataset: LocalDataset, argv: list[str]) -> None:
         values: dict[str, str] = {}

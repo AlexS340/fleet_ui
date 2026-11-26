@@ -1,5 +1,6 @@
 """Свои задачи: только tmp_path и FakeRunner, без Harbor, S3 и кластера."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -133,26 +134,52 @@ async def test_repeated_upload_errors_are_short_and_full_log_is_redacted(tmp_pat
     assert "secret-token" not in log and "<secret>" in log
 
 
-async def test_preflight_checks_remote_task_and_redacts_errors(tmp_path: Path, monkeypatch) -> None:
+@pytest.fixture
+def publication(tmp_path: Path, monkeypatch):
     svc = service(tmp_path)
-    task(tmp_path / "source")
+    monkeypatch.setattr(local_module, "validate_import", validate_folder)
+    task(tmp_path / "source", "A")
+    task(tmp_path / "source", "B")
     item = svc.import_folder(tmp_path / "source", "sheet")
-    item.s3_uri, item.uploaded_at = "s3://bucket/harbor/local/tasks/", "now"
+    prefix = f"harbor/local/{item.id}/revisions/{item.digest}/tasks/"
+    item.s3_uri, item.uploaded_at = f"s3://bucket/{prefix}", "now"
     svc.save(item)
     svc.settings.s3_read_profile = "read"
     monkeypatch.setattr(local_module, "secrets_env", lambda *args: {
         "AWS_ACCESS_KEY_ID_read": "read-key", "AWS_SECRET_ACCESS_KEY_read": "read-token",
     })
-    svc.runner.on("aws", returncode=1)
-    assert "в S3 нет" in await svc.remote_ready(item.id)
-    svc.runner.handlers.clear()
-    svc.runner.on("aws", stdout="2026-10-30 12:00:00 123 task.toml")
-    assert await svc.remote_ready(item.id) == ""
-    assert svc.runner.calls[-1][0][-1] == "s3://bucket/harbor/local/tasks/one/task.toml"
-    assert svc.runner.calls[-1][1]["env"]["AWS_SECRET_ACCESS_KEY"] == "read-token"
-    svc.runner.handlers.clear()
-    svc.runner.on("aws", result=Result((), 1, "", "AccessDenied read-token"))
-    assert await svc.remote_ready(item.id) == "AccessDenied <secret>"
+    return svc, item, prefix
+
+
+@pytest.mark.parametrize(("markers", "problem"), [
+    (["A/task.toml", "B/task.toml"], ""),
+    (["A/task.toml", "C/task.toml"], "Отсутствуют в S3: B\nЛишние в S3: C"),
+    ([], "Отсутствуют в S3: A, B"),
+])
+async def test_preflight_compares_published_task_names(publication, markers, problem) -> None:
+    svc, item, prefix = publication
+    incidental = ["task.toml", "C/tests/task.toml", "B/task.toml.bak", "dir/", "A/instruction.md"]
+    keys = [prefix + name for name in markers + incidental]
+    svc.runner.on("aws", "s3api", "list-objects-v2", stdout=json.dumps(keys))
+    assert await svc.remote_ready(item.id) == problem
+    argv, meta = svc.runner.calls[-1]
+    assert argv[argv.index("--bucket") + 1] == "bucket"
+    assert argv[argv.index("--prefix") + 1] == prefix
+    assert "--no-paginate" not in argv and "--max-items" not in argv
+    assert meta["env"]["AWS_SECRET_ACCESS_KEY"] == "read-token"
+
+
+async def test_preflight_reports_listing_failure_separately(publication) -> None:
+    svc, item, prefix = publication
+    partial = json.dumps([prefix + "A/task.toml"])
+    svc.runner.on("aws", result=Result((), 1, partial, "AccessDenied read-token"))
+    assert await svc.remote_ready(item.id) == "Не удалось прочитать список объектов S3: AccessDenied <secret>"
+
+
+async def test_preflight_rejects_invalid_listing(publication) -> None:
+    svc, item, _ = publication
+    svc.runner.on("aws", stdout="invalid JSON")
+    assert "некорректный список ключей" in await svc.remote_ready(item.id)
 
 
 async def test_concurrent_upload_and_bad_destination(tmp_path: Path, monkeypatch) -> None:
