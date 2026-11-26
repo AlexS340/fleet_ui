@@ -823,3 +823,17 @@ async def test_closed_run_opens_failed_retry_confirmation(user: User):
     await user.should_see("резерв 8 GPU")
     user.find("Отмена").click()
     assert ctx.store.request(run.id)["state"] == "released"
+
+
+async def test_admin_argo_history_finds_deleted_workflow(user: User) -> None:
+    ctx = fakes.CTX
+    ctx.argo_history.save(ctx.history_scope, [cluster_samples.completed_workflow("deleted-from-argo", age=4000)], "20")
+    await user.open("/cluster")
+    user.find("Обновить").click()
+    user.find("История Workflow", kind=ui.expansion).click()
+    user.find("Имя Workflow из алерта", kind=ui.input).type("workflow/deleted-from-argo")
+    user.find("Найти", kind=ui.button).click()
+    await user.should_see("Прогон run-a")
+    await user.should_see("Argo · backoff")
+    await user.should_see("Workflow в работе 1, в ожидании 1")
+    await user.should_see("Сабмиттер работает, в очереди 12")

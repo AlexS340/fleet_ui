@@ -277,3 +277,13 @@ async def test_socket_guard_requires_matching_identity_and_room(user: User, monk
     assert not socket_allowed("bob", page.id, joined=False)
     monkeypatch.setattr(core.sio, "rooms", lambda sid: [])
     assert not socket_allowed("alice", page.id, joined=True)
+
+
+async def test_cluster_history_is_admin_only(user: User) -> None:
+    await login(user.http_client, "alice")
+    await user.open("/cluster")
+    await user.should_not_see("История Workflow")
+    await user.should_not_see("Имя Workflow из алерта")
+    await login(user.http_client, "operator")
+    await user.open("/cluster")
+    await user.should_see("История Workflow")

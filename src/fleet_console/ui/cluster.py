@@ -17,6 +17,7 @@ from fleet_console.observe.argo import argo_ui_url
 from fleet_console.observe.mlsc import console_run_id
 from fleet_console.observe.submitter import ROOT
 from fleet_console.settings import scrub
+from fleet_console.ui.argo_history import history_panel
 from fleet_console.ui.common import confirm_dialog, hint
 from fleet_console.ui.header import build_header
 
@@ -143,6 +144,9 @@ async def cluster_page(ctx: AppContext) -> None:
         runs = _Card(obs.runs, RUN_COLUMNS, "run")
         runs.table.add_slot("body-cell-argo", LINK_SLOT)
         runs.table.on("rowClick", lambda e: _run_dialog(ctx, e.args[1], render))
+        if ctx.access.admin:
+            with runs.container:
+                history_panel(ctx)
         mlsc = _Card(obs.mlsc, MLSC_COLUMNS, "id")
         route = _Card(obs.nginx, NGINX_COLUMNS, "model")
         sub = _Card(obs.submitter, SUBMITTER_COLUMNS, "run")

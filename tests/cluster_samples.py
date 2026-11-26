@@ -1,6 +1,8 @@
 """Образцы ответов kubectl для тестов слоя observe и UI-страницы «Кластер»."""
 
 import json
+import time
+from datetime import UTC, datetime
 
 from fleet_console.runner import Result
 
@@ -87,3 +89,13 @@ def install(fake, namespace: str = "swe-bench-v2-20260308") -> None:
     fake.on("aws", "s3", "ls", stdout="                           PRE t1/\n                           PRE t2/\n                           PRE t3/\n                           PRE t4/\n")
     fake.on("aws", "s3", "sync", stdout="download: s3://b/x/t1/task.toml to t1/task.toml\ndownload: s3://b/x/t2/task.toml to t2/task.toml\n")
     fake.on("sh", "-c", stdout="runner log line 1\nrunner log line 2\n")  # aws s3 cp <uri> - | head -c N
+
+
+def completed_workflow(name="wf-x", *, age=8, phase="Failed"):
+    end = datetime.fromtimestamp(time.time() - age, UTC).isoformat()
+    return {
+        "metadata": {"uid": name, "name": name, "resourceVersion": "22", "labels": {"fleet/run-name": "run-a"},
+                     "annotations": {"fleet/results-s3": "s3://b/run-a/bench/agent/results/task"}},
+        "status": {"phase": phase, "finishedAt": end, "message": "backoff",
+                   "nodes": {"pod": {"type": "Pod", "phase": phase, "message": "token=not-for-sqlite"}}},
+    }

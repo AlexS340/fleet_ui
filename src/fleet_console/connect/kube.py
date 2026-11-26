@@ -14,6 +14,7 @@ def required_checks(namespace: str) -> list[Check]:
     """Права, без которых сервис не сможет работать (Ф0–Ф2)."""
     return [
         ("list", "workflows.argoproj.io", namespace),
+        ("watch", "workflows.argoproj.io", namespace),
         ("patch", "workflows.argoproj.io", namespace),
         ("create", "pods/exec", namespace),
         ("create", "pods/exec", "vllm-proxy"),

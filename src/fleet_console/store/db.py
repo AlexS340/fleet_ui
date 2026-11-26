@@ -12,6 +12,18 @@ from typing import Any
 LOCAL_OWNER = "@local"
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS argo_watch (
+    scope TEXT PRIMARY KEY, rv TEXT NOT NULL, since INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS argo_history (
+    scope TEXT NOT NULL, uid TEXT NOT NULL, name TEXT NOT NULL, run TEXT NOT NULL,
+    phase TEXT NOT NULL, finished INTEGER NOT NULL, message TEXT NOT NULL,
+    node_error TEXT NOT NULL, results_uri TEXT NOT NULL, pipeline TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(scope, uid)
+);
+CREATE INDEX IF NOT EXISTS argo_history_time ON argo_history(scope, finished);
+CREATE INDEX IF NOT EXISTS argo_history_name ON argo_history(scope, name);
+CREATE INDEX IF NOT EXISTS argo_history_run ON argo_history(scope, run, finished);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,

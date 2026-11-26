@@ -27,6 +27,7 @@ from fleet_console.compose.local_datasets import LocalDatasets
 from fleet_console.guard import SleepGuard, SleepReport
 from fleet_console.models import SessionManager
 from fleet_console.observe import ClusterObserver
+from fleet_console.observe.argo_history import ArgoHistory
 from fleet_console.runner import CommandError, Runner, SubprocessRunner
 from fleet_console.runs import BenchManager
 from fleet_console.settings import OVERLAY_DIR, SECRET_NAMES, Paths, Settings, aws_secret_names, read_secret, secrets_env
@@ -135,6 +136,26 @@ class AppContext:
                 status.error = "нет прав: " + ", ".join(status.missing_permissions)
         self.kube_status = status
 
+    @cached_property
+    def argo_history(self) -> ArgoHistory:
+        return ArgoHistory(self.store.conn, self.runner, self.benches.secrets)
+
+    @property
+    def history_scope(self) -> str:
+        context = self.kube_status.context or next(iter(self.settings.allowed_contexts), "")
+        return f"{context}/{self.settings.namespace}"
+
+    async def _argo_history_loop(self) -> None:
+        while True:
+            if self.kube_status.ready and self.kube_status.context:
+                try:
+                    await self.argo_history.collect(self.kube_status.context, self.settings.namespace)
+                    self.argo_history.error = ""
+                    continue
+                except Exception as exc:  # noqa: BLE001 — один отказ API не завершает наблюдение
+                    self.argo_history.error = str(exc)
+            await asyncio.sleep(KUBE_RETRY_SEC)
+
     async def startup(self) -> None:
         self.observer.ready = lambda: self.kube_status.ready  # без API-сервера kubectl только плодит ошибки
         self._tasks = [
@@ -142,6 +163,7 @@ class AppContext:
             asyncio.create_task(self._kube_loop(), name="kube"),
             asyncio.create_task(self._mirror_init(), name="mirror"),
             asyncio.create_task(self.observer.loop(), name="observer"),
+            asyncio.create_task(self._argo_history_loop(), name="argo-history"),
             asyncio.create_task(self._guard_loop(), name="guard"),
             asyncio.create_task(self._sessions_loop(), name="sessions"),
             asyncio.create_task(self._benches_loop(), name="benches"),
