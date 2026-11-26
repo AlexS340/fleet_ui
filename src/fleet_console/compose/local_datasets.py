@@ -36,6 +36,7 @@ class Validation:
     digest: str = ""
     images: dict[str, list[str]] = field(default_factory=dict)
     image_issues: dict[str, ImageIssue] = field(default_factory=dict)
+    image_digests: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -140,7 +141,7 @@ def validate_import(folder: Path, *, allow_task_links: bool = True) -> Validatio
         if isinstance(target, ImageIssue):
             report.image_issues[image] = target
     if report.ok:
-        report.image_issues = check_images(report.images)
+        report.image_issues, report.image_digests = check_images(report.images)
     return report
 
 
@@ -167,6 +168,7 @@ class LocalDataset:
     error: str = ""
     digest: str = ""
     owner_id: str = LOCAL_OWNER
+    image_digests: dict[str, str] = field(default_factory=dict)
 
     @property
     def s3_root(self) -> str:
@@ -228,7 +230,8 @@ class LocalDatasets:
         warnings = [f"{', '.join(report.images[image])}: {issue.message} · {image}"
                     for image, issue in report.image_issues.items()] + report.warnings
         dataset = LocalDataset(dataset_id, label, str(folder.expanduser().resolve()), str(dest), datetime.now(UTC).isoformat(),
-                               [p.name for p in report.tasks], report.size, warnings, digest=report.digest, owner_id=owner_id)
+                               [p.name for p in report.tasks], report.size, warnings, digest=report.digest,
+                               owner_id=owner_id, image_digests=report.image_digests)
         try:
             dest.mkdir(parents=True, exist_ok=False)
             for task in report.tasks:
@@ -320,7 +323,8 @@ class LocalDatasets:
                 if message.startswith(prefix):
                     remaining.warnings.append(f"{', '.join(remaining.images[image])}: {message[len(prefix):]} · {image}")
         updated = replace(dataset, tasks=[p.name for p in remaining.tasks], size=remaining.size,
-                          warnings=remaining.warnings, digest=remaining.digest, uploaded_at="", error="")
+                          warnings=remaining.warnings, digest=remaining.digest, uploaded_at="", error="",
+                          image_digests={ref: digest for ref, digest in dataset.image_digests.items() if ref in remaining.images})
         if dataset.s3_uri:
             if not dataset.s3_root:
                 raise ValueError("Не удалось определить S3-префикс набора.")

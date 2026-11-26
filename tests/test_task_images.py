@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import httpx
@@ -29,10 +30,12 @@ def test_harbor_anonymous_manifest_check(suffix, reference):
         if "authorization" not in request.headers:
             return httpx.Response(401, headers={"WWW-Authenticate": 'Bearer realm="https://registry.mlrnd.ru/service/token"'})
         assert request.headers["authorization"] == "Bearer anonymous-token"
-        return httpx.Response(200)
+        return httpx.Response(200, headers={"Docker-Content-Digest": DIGEST})
 
     with httpx.Client(transport=httpx.MockTransport(registry)) as client:
-        assert task_images._probe(client, IMAGE + suffix) is None
+        assert task_images._probe(client, IMAGE + suffix) == task_images.Manifest(
+            f"https://registry.mlrnd.ru/v2/{REPO}/manifests/{reference}", DIGEST,
+        )
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 429, 502, 302])
@@ -76,6 +79,56 @@ def image_task(source: Path, name: str):
     task(source, name, IMAGE + ":v2")
 
 
+@pytest.mark.parametrize(("suffix", "mutable"), [(":v2", True), ("", True), (f":v2@{DIGEST}", False)])
+@pytest.mark.parametrize("header", [DIGEST, ""])
+def test_import_records_manifest_observed_at_save(tmp_path, monkeypatch, suffix, mutable, header):
+    source = tmp_path / "source"
+    image = IMAGE + suffix
+    task(source, "one", image)
+    task(source, "two", image)
+    preview_digest = "sha256:" + "b" * 64 if mutable else DIGEST
+    headers = iter([{"Docker-Content-Digest": preview_digest}, {"Docker-Content-Digest": header} if header else {}])
+
+    def head(client, url, **kwargs):
+        return httpx.Response(200, headers=next(headers), request=httpx.Request("HEAD", url))
+
+    monkeypatch.setattr(httpx.Client, "head", head)
+    preview = validate_import(source)
+    assert preview.ok and preview.image_digests == {image: preview_digest}
+    svc = service(tmp_path)
+    item = svc.import_folder(source, "snapshot")
+    saved = service(tmp_path).get(item.id)
+    assert saved.image_digests == ({image: header} if header else {})
+    assert saved.digest == preview.digest
+    assert (Path(saved.path) / "one/task.toml").read_bytes() == (source / "one/task.toml").read_bytes()
+    assert any("Тег может измениться" in w and "one" in w and "two" in w for w in saved.warnings) == mutable
+    assert any("не вернул Docker-Content-Digest" in w for w in saved.warnings) == (not header)
+
+
+def test_read_dataset_record_without_image_digests(tmp_path):
+    svc = service(tmp_path)
+    record = {"id": "local-old", "name": "old", "source": "src", "path": "dst", "imported_at": "then",
+              "tasks": ["one"], "size": 42, "warnings": [], "digest": "f" * 64}
+    svc.directory.mkdir(parents=True, exist_ok=True)
+    (svc.directory / "local-old.json").write_text(json.dumps(record))
+    old = svc.get("local-old")
+    assert old.image_digests == {} and old.digest == record["digest"] and svc.all() == [old]
+
+
+async def test_remove_task_keeps_import_digests_for_remaining_references(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    kept = IMAGE + ":keep"
+    task(source, "one", kept)
+    task(source, "two", IMAGE + ":remove")
+    monkeypatch.setattr(task_images, "_probe", lambda _, image: task_images.Manifest(image, DIGEST))
+    svc = service(tmp_path)
+    item = svc.import_folder(source, "snapshot")
+    assert len(item.image_digests) == 2
+    monkeypatch.setattr(task_images, "_probe", lambda *_: pytest.fail("unexpected registry request"))
+    await svc.remove_task(item.id, "two", owner_id=item.owner_id)
+    assert svc.get(item.id).image_digests == {kept: DIGEST}
+
+
 def test_duplicate_missing_image_blocks_whole_snapshot(tmp_path, monkeypatch):
     source = tmp_path / "source"
     for name in ["one", "two"]:
@@ -114,9 +167,10 @@ async def test_import_dialog_links_missing_image_at_validation_and_save(user: Us
     await user.should_see("sales-review: tests/Dockerfile:1")
     assert any(link.props.get("href") == url for link in user.find(kind=ui.link).elements)
     assert not user.find(marker="local-import").elements.pop().enabled
-    monkeypatch.setattr(task_images, "_probe", lambda *_: None)
+    monkeypatch.setattr(task_images, "_probe", lambda *_: task_images.Manifest(url, DIGEST))
     user.find(marker="local-check").click()
     await user.should_see("Минимальная проверка пройдена")
+    await user.should_see("Тег может измениться")
     await user.should_not_see("Образ отсутствует")
     monkeypatch.setattr(task_images, "_probe", lambda *_: missing)
     user.find(marker="local-import").click()

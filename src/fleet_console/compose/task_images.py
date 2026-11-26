@@ -26,6 +26,12 @@ class ImageIssue:
     blocking: bool = False
 
 
+@dataclass(frozen=True)
+class Manifest:
+    url: str
+    digest: str
+
+
 def manifest_target(image: str) -> tuple[str, str, str] | ImageIssue:
     host, _, path = image.partition("/")
     if host.lower() not in _HOSTS:
@@ -38,7 +44,7 @@ def manifest_target(image: str) -> tuple[str, str, str] | ImageIssue:
     return host, ref["repo"], url
 
 
-def _probe(client: httpx.Client, image: str) -> ImageIssue | None:
+def _probe(client: httpx.Client, image: str) -> ImageIssue | Manifest:
     target = manifest_target(image)
     if isinstance(target, ImageIssue):
         return target
@@ -61,14 +67,30 @@ def _probe(client: httpx.Client, image: str) -> ImageIssue | None:
         response.raise_for_status()
         if response.status_code != 200:
             return ImageIssue(f"Не удалось проверить образ (HTTP {response.status_code})", url)
-        return None
+        return Manifest(url, response.headers.get("Docker-Content-Digest", "").strip())
     except httpx.HTTPStatusError as exc:
         return ImageIssue(f"Не удалось проверить образ (HTTP {exc.response.status_code})", url)
     except (httpx.RequestError, KeyError, ValueError, TypeError):
         return ImageIssue("Не удалось проверить образ. Проверьте доступ к реестру и повторите проверку", url)
 
 
-def check_images(images: dict[str, list[str]]) -> dict[str, ImageIssue]:
+def check_images(images: dict[str, list[str]]) -> tuple[dict[str, ImageIssue], dict[str, str]]:
+    issues: dict[str, ImageIssue] = {}
+    digests: dict[str, str] = {}
     with httpx.Client(timeout=5, follow_redirects=False) as client, ThreadPoolExecutor(max_workers=6) as workers:
         results = workers.map(lambda image: _probe(client, image), images)
-        return {image: issue for image, issue in zip(images, results) if issue is not None}
+        for image, result in zip(images, results):
+            messages = []
+            blocking = False
+            if isinstance(result, ImageIssue):
+                messages.append(result.message)
+                blocking = result.blocking
+            elif result.digest:
+                digests[image] = result.digest
+            else:
+                messages.append("Реестр не вернул Docker-Content-Digest.")
+            if result.url and "@" not in image:
+                messages.append("Тег может измениться. Чтобы закрепить образ для запуска, укажите ссылку с @sha256:…")
+            if messages:
+                issues[image] = ImageIssue(" ".join(messages), result.url, blocking)
+    return issues, digests
